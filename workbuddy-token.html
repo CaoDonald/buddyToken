@@ -188,6 +188,11 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
   display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;
   background:#e7f8f1;color:#0b8a63;
 }
+
+/* ---------- 可排序表头 ---------- */
+.tbl th.sortable{cursor:pointer;user-select:none;white-space:nowrap}
+.tbl th.sortable:hover{color:var(--accent)}
+.tbl th.sortable.on{color:var(--accent);font-weight:700}
 .pill{display:inline-block;padding:2px 9px;border-radius:6px;font-size:11.5px;font-weight:600;
   background:#eef2fd;color:#4a63c9}
 .pill.g{background:#e6f8f1;color:#0f9b6c}
@@ -675,7 +680,8 @@ const state = {
   charts: {},
   tokenLoaded: false,   // token-usage-data.js 是否成功加载
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
-  detail: { mode:'all', q:'', page:0 }   // 完整明细卡的筛选状态
+  detail: { mode:'all', q:'', page:0 },   // 完整明细卡的筛选状态
+  rank: { sort:'perPoint', dir:'desc' }   // 模型性价比卡的表头排序
 };
 
 /* =========================================================
@@ -782,7 +788,6 @@ function computeStats(d){
       if(a.free && b.free)  return b.tk - a.tk;
       return b.perPoint - a.perPoint;                 // 其余按每积分 Token 降序
     });
-  const maxPerPoint = Math.max(0, ...modelRank.filter(m => !m.free).map(m => m.perPoint || 0));
 
   return {
     total, count, byModel, byClient, byDate, byHour, hourArr,
@@ -798,7 +803,7 @@ function computeStats(d){
     freeRows: freeRows.length, freeToken,
     byTool, topToken, toolSteps, hasDetail: toolSteps > 0,
     toolKinds: byTool.length,
-    modelRank, maxPerPoint,
+    modelRank,
     tokenPerPoint:   tokenPts > 0 ? tokenTot / tokenPts : 0,        // 每 1 积分产出多少 token
     pointsPerMToken: tokenTot > 0 ? tokenPts / tokenTot * 1e6  : 0, // 每 M token 花多少积分
     cacheHitRate:    tokenIn  > 0 ? tokenCr / tokenIn : 0,
@@ -1397,36 +1402,55 @@ function renderTables(d){
 /* =========================================================
  *  8.4 模型性价比
  * =======================================================*/
+/* 模型性价比表的列定义（num=右对齐；k 对应 modelRank 里的字段名） */
+const RANK_COLS = [
+  { k:'key',       t:'模型' },
+  { k:'count',     t:'请求数',       num:1 },
+  { k:'pts',       t:'积分',         num:1 },
+  { k:'tk',        t:'Token',        num:1 },
+  { k:'perPoint',  t:'每积分 Token', num:1 },
+  { k:'perReq',    t:'单次积分',     num:1 },
+  { k:'cacheRate', t:'缓存率',       num:1 },
+];
+
 function renderModelRank(d){
   const s = computeStats(d);
   const card = $('rankCard');
   if(card) card.hidden = !state.all.length || !s.modelRank.length;
   if(!s.modelRank.length) return;
 
-  const rows = s.modelRank.map(m => {
-    const perPointTxt = m.free ? '<span class="free-tag">免费</span>' : fmtTok(m.perPoint);
-    // 免费模型给满格条；其余按最大值归一化，最小值也留一点可见宽度
-    const barPct = m.free ? 100
-      : (s.maxPerPoint > 0 ? Math.max(2, m.perPoint / s.maxPerPoint * 100) : 0);
-    return `<tr>
+  // 按 state.rank 排序。免费的「每积分 Token」视为无穷大，
+  // 这样降序排在最前、升序排在最后，符合数值直觉。
+  const { sort, dir } = state.rank;
+  const sign = dir === 'desc' ? -1 : 1;
+  const list = [...s.modelRank].sort((a, b) => {
+    let va = a[sort], vb = b[sort];
+    if(sort === 'perPoint'){
+      va = a.free ? Infinity : (va || 0);
+      vb = b.free ? Infinity : (vb || 0);
+    }
+    if(typeof va === 'string') return sign * String(va).localeCompare(String(vb));
+    return sign * ((va || 0) - (vb || 0));
+  });
+
+  const head = RANK_COLS.map(c => {
+    const on = sort === c.k;
+    return `<th class="sortable${on ? ' on' : ''}${c.num ? ' num' : ''}" data-k="${c.k}" title="点击排序">` +
+           `${c.t}${on ? (dir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`;
+  }).join('');
+
+  const rows = list.map(m => `<tr>
       <td><span class="pill">${esc(m.key)}</span></td>
       <td class="num" style="color:#6b7891">${fmt0(m.count)}</td>
       <td class="num">${fmt2(m.pts)}</td>
       <td class="num">${fmtTok(m.tk)}</td>
-      <td class="num" style="font-weight:600">${perPointTxt}</td>
+      <td class="num" style="font-weight:600">${
+        m.free ? '<span class="free-tag">免费</span>' : fmtTok(m.perPoint)}</td>
       <td class="num" style="color:#6b7891">${fmt2(m.perReq)}</td>
       <td class="num" style="color:#6b7891">${(m.cacheRate*100).toFixed(1)}%</td>
-      <td><div class="bar-mini" style="width:120px"><i style="width:${barPct.toFixed(1)}%"></i></div></td>
-    </tr>`;
-  }).join('');
+    </tr>`).join('');
 
-  $('tblRank').innerHTML = `
-    <thead><tr>
-      <th>模型</th><th class="num">请求数</th><th class="num">积分</th><th class="num">Token</th>
-      <th class="num">每积分 Token</th><th class="num">单次积分</th><th class="num">缓存率</th>
-      <th style="width:132px">性价比</th>
-    </tr></thead>
-    <tbody>${rows}</tbody>`;
+  $('tblRank').innerHTML = `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody>`;
 }
 
 /* =========================================================
@@ -2604,6 +2628,20 @@ async function loadFile(file){
       state.detail.page = 0;
       renderDetail(getFiltered());
     }, 200);
+  });
+
+  /* ---- 模型性价比：点表头排序（同列再点切换升降序） ---- */
+  $('tblRank').addEventListener('click', e => {
+    const th = e.target.closest('th.sortable');
+    if(!th) return;
+    const k = th.dataset.k;
+    if(state.rank.sort === k){
+      state.rank.dir = state.rank.dir === 'desc' ? 'asc' : 'desc';
+    }else{
+      state.rank.sort = k;
+      state.rank.dir = 'desc';     // 换列时默认降序
+    }
+    renderModelRank(getFiltered());
   });
 
   $('btnDetailExport').addEventListener('click', () => {
