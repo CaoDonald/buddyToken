@@ -586,10 +586,22 @@ const ALIAS = {
   id:     ['requestid','request_id','请求id','id','请求标识'],
   points: ['积分消耗','积分','消耗','points','cost','credits','费用'],
   model:  ['模型','model','模型名称'],
-  client: ['客户端','client','来源','渠道','端'],
+  client: ['客户端','client','来源','渠道','端','使用端','终端','端类型','clienttype'],
   time:   ['时间','time','datetime','日期','创建时间','发生时间']
 };
 const norm = s => String(s ?? '').trim().toLowerCase().replace(/[\s_\-]/g,'');
+
+/**
+ * 定位某一列。先精确匹配别名；没中再放宽为「表头包含别名」，
+ * 以应对导出侧改列名（已出现过的：客户端 → 使用端）。
+ * 放宽时只认长度 >= 3 的别名，避免「端」这类单字误伤其他列。
+ */
+function findCol(header, key){
+  const as = ALIAS[key].map(norm);
+  let i = header.findIndex(h => as.includes(h));
+  if(i >= 0) return i;
+  return header.findIndex(h => h && as.some(a => a.length >= 3 && h.includes(a)));
+}
 
 function findHeaderRow(rows){
   for(let i=0; i<Math.min(rows.length, 15); i++){
@@ -609,7 +621,7 @@ function parseSheetRows(rows){
   const header = (rows[hIdx]||[]).map(norm);
   const col = {};
   for(const key of Object.keys(ALIAS)){
-    col[key] = header.findIndex(h => ALIAS[key].some(a => norm(a) === h));
+    col[key] = findCol(header, key);
   }
   if(col.points < 0) return [];
 
