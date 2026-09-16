@@ -894,7 +894,11 @@ function renderKPIs(d){
       {label:'免费模型 Token', value: fmtTok(s.freeToken), small:true,
        sub:`${fmt0(s.freeRows)} 条 0 积分记录 · 占总 Token ${pct(s.freeToken, s.tokenTot)}`},
       {label:'积分覆盖', value: pct(s.tokenPts, s.total),
-       sub:`${s.tkRows} / ${s.count} 条已关联 · ${fmt0(s.tokenReq)} 次 API 请求`}
+       sub:`${s.tkRows} / ${s.count} 条已关联 · ${fmt0(s.tokenReq)} 次 API 请求`},
+      {label:'Session 数', value: fmt0(s.bySession.length),
+       sub: s.bySession.length
+         ? `平均 <b>${(s.bySession.reduce((a,b) => a + b.count, 0) / s.bySession.length).toFixed(1)}</b> 回合 · 最长 <b>${Math.max(...s.bySession.map(b => b.count))}</b> 回合`
+         : '—'}
     );
   }else if(state.tokenLoaded){
     items.push({label:'Token 数据', value:'无匹配', small:true,
