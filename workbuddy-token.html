@@ -294,6 +294,7 @@ table.cal td.cal-cell.has:hover{
     <button class="btn" id="btnPrint" hidden>🖨 打印 / PDF</button>
     <button class="btn" id="btnMd" hidden>⬇ Markdown</button>
     <button class="btn" id="btnCsv" hidden>⬇ CSV</button>
+    <button class="btn" id="btnFull" hidden title="逐条导出全部记录，未关联 Token 的也保留">⬇ 完整明细</button>
     <button class="btn" id="btnReset" hidden>🗑 清空重来</button>
   </div>
 </div>
@@ -1565,7 +1566,38 @@ function buildCSV(d){
 }
 
 /* =========================================================
- * 10.5 Token 数据通道（token-usage-data.js）
+ * 10.5 完整明细导出（逐条，未关联的也保留）
+ * =======================================================*/
+/** 与 buildCSV 互补：buildCSV 导出聚合维度，这里导出逐条记录 */
+function buildFullDetail(rows){
+  const esc2 = v => {
+    const t = v === null || v === undefined ? '' : String(v);
+    return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+  };
+  const head = ['RequestID','关联状态','积分消耗','模型','客户端','时间',
+                'Token合计','输入token','输出token','缓存读token','请求数','回合时长(秒)','是否免费'];
+  const out = [head.join(',')];
+  // 最新的排在前面
+  [...rows].sort((a,b) => b.time - a.time).forEach(r => {
+    const t = r.token;
+    const dur = (t && t.t1 && t.t0) ? Math.round((t.t1 - t.t0) / 1000) : '';
+    out.push([
+      r.id,
+      t ? '已关联' : '未关联',
+      r.points,
+      r.model,
+      r.client,
+      `${r.date} ${pad(r.hour)}:${pad(r.min)}:00`,
+      t ? t.tot : '', t ? t.in : '', t ? t.out : '',
+      t ? t.cr : '', t ? t.n : '', dur,
+      r.points === 0 ? '是' : ''
+    ].map(esc2).join(','));
+  });
+  return '\ufeff' + out.join('\r\n') + '\r\n';
+}
+
+/* =========================================================
+ * 10.6 Token 数据通道（token-usage-data.js）
  *
  * 由 token-usage-report.js --emit-js 生成，内容是 window.__TOKEN_DATA__，
  * 按 conversationRequestId（回合 ID）聚合——一次用户提问 = 一个回合 =
@@ -1887,7 +1919,7 @@ function applyDataset(rows, sheet, fileName){
 
   $('uploader').hidden = true;
   $('dash').hidden = false;
-  ['btnPrint','btnMd','btnCsv','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
+  ['btnPrint','btnMd','btnCsv','btnFull','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
     .forEach(id => { const el = $(id); if(el) el.hidden = false; });
 
   // 无条件重算 token 关联：覆盖「首次导入 / 追加合并 / 快照恢复」全部路径
@@ -2125,6 +2157,14 @@ async function loadFile(file){
       buildCSV(d), 'text/csv');
   });
 
+  $('btnFull').addEventListener('click', () => {
+    const d = getFiltered();
+    if(!d.length){ toast('当前无数据'); return; }
+    const linked = d.filter(x => x.token).length;
+    download(`积分Token完整明细_${d.length}条.csv`, buildFullDetail(d), 'text/csv');
+    toast(`已导出 ${d.length} 条（已关联 ${linked}，未关联 ${d.length - linked}）`);
+  });
+
   /* ★ 新增：追加数据 */
   $('btnAppend').addEventListener('click', () => {
     $('fileInput').click();
@@ -2150,7 +2190,7 @@ async function loadFile(file){
     $('dash').hidden = true;
     $('banner').hidden = true;
     $('mergeInfo').classList.remove('show');
-    ['btnPrint','btnMd','btnCsv','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
+    ['btnPrint','btnMd','btnCsv','btnFull','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
       .forEach(id => { const el = $(id); if(el) el.hidden = true; });
     $('srcName').textContent = '';
     window.scrollTo({top:0, behavior:'smooth'});
