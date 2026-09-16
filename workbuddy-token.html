@@ -155,6 +155,28 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .tbl .num{text-align:right;font-weight:600}
 .tbl .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:#8a96ad}
 .tbl-scroll{max-height:340px;overflow:auto;border-radius:8px}
+
+/* ---------- 完整明细 ---------- */
+.detail-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.detail-q{
+  border:1px solid var(--line);background:#fff;border-radius:9px;
+  padding:6px 11px;font-size:13px;color:var(--text);font-family:inherit;min-width:240px;
+}
+.detail-q:focus{outline:none;border-color:var(--accent)}
+.detail-q::placeholder{color:#a8b3c8}
+.detail-pager{
+  display:flex;align-items:center;gap:10px;justify-content:flex-end;
+  margin-top:10px;font-size:12.5px;color:var(--muted);
+}
+.detail-pager button{
+  border:1px solid var(--line);background:#fff;border-radius:7px;padding:4px 11px;
+  cursor:pointer;font-size:12.5px;font-family:inherit;color:var(--text);transition:.15s;
+}
+.detail-pager button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.detail-pager button:disabled{opacity:.35;cursor:default}
+.stat-mark{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap}
+.stat-hit{background:#e7f8f1;color:#0b8a63}
+.stat-miss{background:#f2f5fc;color:#8b98b3}
 .pill{display:inline-block;padding:2px 9px;border-radius:6px;font-size:11.5px;font-weight:600;
   background:#eef2fd;color:#4a63c9}
 .pill.g{background:#e6f8f1;color:#0f9b6c}
@@ -407,6 +429,22 @@ table.cal td.cal-cell.has:hover{
         <div class="tbl-scroll"><table class="tbl" id="tblDay"></table></div>
       </div>
 
+      <div class="card c12" id="detailCard" hidden>
+        <h3><span class="dot"></span>完整明细 <span class="tag" id="detailTag"></span></h3>
+        <div class="detail-bar">
+          <div class="chips" id="detailSeg">
+            <button class="chip on" data-mode="all">全部</button>
+            <button class="chip" data-mode="hit">已关联</button>
+            <button class="chip" data-mode="miss">未关联</button>
+          </div>
+          <input class="detail-q" id="detailQ" placeholder="搜索 RequestID / 模型 / 客户端…">
+          <div class="spacer"></div>
+          <button class="btn" id="btnDetailExport">⬇ 导出当前结果</button>
+        </div>
+        <div class="tbl-scroll" style="max-height:520px"><table class="tbl" id="tblDetail"></table></div>
+        <div class="detail-pager" id="detailPager"></div>
+      </div>
+
       <div class="card c12">
         <h3><span class="dot"></span>📝 分析报告 <span class="tag">自动生成</span></h3>
         <div class="report" id="report"></div>
@@ -613,7 +651,8 @@ const state = {
   filters: { from:'', to:'', models:new Set(), clients:new Set() },
   charts: {},
   tokenLoaded: false,   // token-usage-data.js 是否成功加载
-  tokenMatch: null      // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
+  tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
+  detail: { mode:'all', q:'', page:0 }   // 完整明细卡的筛选状态
 };
 
 /* =========================================================
@@ -1311,6 +1350,80 @@ function renderTables(d){
 }
 
 /* =========================================================
+ *  8.5 完整明细（逐条，未关联的也列出）
+ * =======================================================*/
+const DETAIL_PAGE = 100;   // 每页条数：全量行数可能上千，分页渲染保证流畅
+
+/** 按当前筛选条件取出明细列表（供渲染与导出共用） */
+function getDetailList(){
+  const f = state.detail;
+  const q = f.q.trim().toLowerCase();
+  let list = getFiltered();
+  if(f.mode === 'hit')  list = list.filter(x => x.token);
+  if(f.mode === 'miss') list = list.filter(x => !x.token);
+  if(q) list = list.filter(x =>
+    String(x.id).toLowerCase().includes(q) ||
+    String(x.model).toLowerCase().includes(q) ||
+    String(x.client).toLowerCase().includes(q));
+  return [...list].sort((a, b) => b.time - a.time);   // 最新的在前
+}
+
+function renderDetail(d){
+  const card = $('detailCard');
+  if(card) card.hidden = !state.all.length;
+  if(!state.all.length) return;
+
+  const list = getDetailList();
+
+  // 计数：这里是「当前筛选范围」内的关联情况，与状态栏（全量）口径不同
+  const hitN = d.filter(x => x.token).length;
+  $('detailTag').textContent = `当前 ${d.length} 条 · 已关联 ${hitN} · 未关联 ${d.length - hitN}`;
+
+  const f = state.detail;
+  const pages = Math.max(1, Math.ceil(list.length / DETAIL_PAGE));
+  if(f.page >= pages) f.page = pages - 1;
+  const start = f.page * DETAIL_PAGE;
+  const rows = list.slice(start, start + DETAIL_PAGE);
+
+  $('tblDetail').innerHTML = `
+    <thead><tr>
+      <th style="width:74px">状态</th><th>RequestID</th><th>模型</th>
+      <th>客户端</th><th>时间</th><th class="num">积分</th>
+      <th class="num">Token</th><th class="num">请求数</th><th class="num">时长</th>
+    </tr></thead>
+    <tbody>${ rows.length ? rows.map(x => {
+      const t = x.token;
+      const dur = (t && t.t1 && t.t0) ? (t.t1 - t.t0) / 1000 : 0;
+      return `<tr>
+        <td><span class="stat-mark ${t ? 'stat-hit' : 'stat-miss'}">${t ? '已关联' : '未关联'}</span></td>
+        <td class="mono" title="${esc(x.id)}">${esc(x.id.length > 22 ? x.id.slice(0, 20) + '…' : x.id)}</td>
+        <td><span class="pill">${esc(x.model)}</span></td>
+        <td style="color:#6b7891">${esc(x.client)}</td>
+        <td class="mono">${x.date} ${pad(x.hour)}:${pad(x.min)}</td>
+        <td class="num">${fmt2(x.points)}</td>
+        <td class="num">${t ? fmtTok(t.tot) : '<span style="color:#c8d1e2">—</span>'}</td>
+        <td class="num" style="color:#6b7891">${t ? t.n : '<span style="color:#c8d1e2">—</span>'}</td>
+        <td class="num" style="color:#6b7891">${
+          t ? (dur >= 60 ? (dur / 60).toFixed(1) + ' 分' : dur.toFixed(0) + ' 秒')
+            : '<span style="color:#c8d1e2">—</span>'}</td>
+      </tr>`;
+    }).join('')
+      : `<tr><td colspan="9" style="text-align:center;color:#93a0b8;padding:28px">
+           没有符合条件的记录</td></tr>`
+    }</tbody>`;
+
+  $('detailPager').innerHTML = list.length
+    ? `<span>第 ${start + 1}–${Math.min(start + DETAIL_PAGE, list.length)} 条 / 共 ${list.length} 条</span>
+       <button id="dPrev" ${f.page === 0 ? 'disabled' : ''}>‹ 上一页</button>
+       <span>${f.page + 1} / ${pages}</span>
+       <button id="dNext" ${f.page >= pages - 1 ? 'disabled' : ''}>下一页 ›</button>`
+    : '';
+  const pv = $('dPrev'), nx = $('dNext');
+  if(pv) pv.onclick = () => { state.detail.page--; renderDetail(getFiltered()); };
+  if(nx) nx.onclick = () => { state.detail.page++; renderDetail(getFiltered()); };
+}
+
+/* =========================================================
  *  9. 报告
  * =======================================================*/
 function renderReport(d){
@@ -1726,6 +1839,7 @@ function render(){
   renderCharts(d);
   renderHeatmap(d);
   renderTables(d);
+  renderDetail(d);
   renderReport(d);
 
   // 匹配率是数据质量指标，基于全量 state.all，不随筛选变化
@@ -2163,6 +2277,34 @@ async function loadFile(file){
     const linked = d.filter(x => x.token).length;
     download(`积分Token完整明细_${d.length}条.csv`, buildFullDetail(d), 'text/csv');
     toast(`已导出 ${d.length} 条（已关联 ${linked}，未关联 ${d.length - linked}）`);
+  });
+
+  /* ---- 完整明细卡：三态筛选 + 搜索 + 分页 ---- */
+  $('detailSeg').addEventListener('click', e => {
+    const b = e.target.closest('.chip');
+    if(!b) return;
+    [...e.currentTarget.children].forEach(c => c.classList.toggle('on', c === b));
+    state.detail.mode = b.dataset.mode;
+    state.detail.page = 0;          // 换筛选条件后回到第一页
+    renderDetail(getFiltered());
+  });
+
+  let _dqTimer = null;
+  $('detailQ').addEventListener('input', e => {
+    clearTimeout(_dqTimer);
+    _dqTimer = setTimeout(() => {   // 防抖，避免每敲一个字都重排全表
+      state.detail.q = e.target.value;
+      state.detail.page = 0;
+      renderDetail(getFiltered());
+    }, 200);
+  });
+
+  $('btnDetailExport').addEventListener('click', () => {
+    const list = getDetailList();
+    if(!list.length){ toast('当前筛选结果为空'); return; }
+    const linked = list.filter(x => x.token).length;
+    download(`积分Token明细_${list.length}条.csv`, buildFullDetail(list), 'text/csv');
+    toast(`已导出 ${list.length} 条（已关联 ${linked}，未关联 ${list.length - linked}）`);
   });
 
   /* ★ 新增：追加数据 */
