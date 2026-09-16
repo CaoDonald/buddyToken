@@ -340,16 +340,16 @@ table.cal td.cal-cell.has:hover{
     <div class="brand">📊 积分消耗看板 <small id="srcName"></small></div>
     <div class="spacer"></div>
     <div class="save-dot" id="saveDot" hidden><i></i><span id="saveTxt">已自动保存</span></div>
-    <button class="btn" id="btnScan" title="授权 ~/.workbuddy 或 ~/.codebuddy 目录，让页面直接读取本地会话">📁 连接本地会话</button>
-    <button class="btn" id="btnSync" title="重新同步一次数据：已连接本地目录时重扫会话记录，否则重读 token-usage-data.js">🔄 同步 Token</button>
-    <button class="btn primary" id="btnAppend" hidden>➕ 追加数据</button>
-    <button class="btn" id="btnSnap" hidden>💾 手动快照</button>
-    <button class="btn" id="btnHist" hidden>📂 历史</button>
-    <button class="btn" id="btnWipe" hidden>🗑 清空本地</button>
-    <button class="btn" id="btnPrint" hidden>🖨 打印 / PDF</button>
-    <button class="btn" id="btnMd" hidden>⬇ Markdown</button>
-    <button class="btn" id="btnCsv" hidden>⬇ CSV</button>
-    <button class="btn" id="btnReset" hidden>🗑 清空重来</button>
+    <button class="btn" id="btnScan" title="授权本地会话目录（~/.workbuddy 或 ~/.codebuddy），让页面自己扫描会话记录。只需授权一次，之后导入账单会自动匹配">📁 连接本地会话</button>
+    <button class="btn" id="btnSync" title="重新同步一次数据。已连接本地目录时＝重扫会话记录；未连接时＝重读 token-usage-data.js（bat 生成的那个文件）">🔄 同步 Token</button>
+    <button class="btn" id="btnAppend" hidden title="再选一份积分账单 Excel 合并进来。按 RequestID 去重，已存在的记录会自动跳过">➕ 追加数据</button>
+    <button class="btn" id="btnSnap" hidden title="立刻把当前数据集存一份快照到浏览器本地，用于以后恢复">💾 手动快照</button>
+    <button class="btn" id="btnHist" hidden title="查看历史快照列表，可恢复到任意一次保存过的状态">📂 历史</button>
+    <button class="btn" id="btnWipe" hidden title="清除浏览器本地保存的全部数据：快照、筛选条件、自动保存的草稿">🗑 清空本地</button>
+    <button class="btn" id="btnPrint" hidden title="打印当前看板，或另存为 PDF（浏览器打印时会自动隐藏按钮和输入框）">🖨 打印 / PDF</button>
+    <button class="btn" id="btnMd" hidden title="导出分析报告为 Markdown 文件，可直接贴到文档或提交到仓库">⬇ Markdown</button>
+    <button class="btn" id="btnCsv" hidden title="导出聚合维度的汇总表：模型 / 客户端 / 日期 / 时段 / 工具。要逐条明细请用「完整明细」卡片里的导出">⬇ CSV</button>
+    <button class="btn" id="btnReset" hidden title="清空当前数据集，回到上传界面重新开始（本地快照不会被删除）">🗑 清空重来</button>
   </div>
 </div>
 
@@ -378,9 +378,9 @@ table.cal td.cal-cell.has:hover{
         <input type="date" id="dateFrom">
         <span style="color:var(--muted)">~</span>
         <input type="date" id="dateTo">
-        <button class="btn" id="qToday" style="padding:5px 10px;font-size:12px">今日</button>
-        <button class="btn" id="q7" style="padding:5px 10px;font-size:12px">近7日</button>
-        <button class="btn" id="qAll" style="padding:5px 10px;font-size:12px">全部</button>
+        <button class="btn" id="qToday" style="padding:5px 10px;font-size:12px" title="把日期范围设为今天">今日</button>
+        <button class="btn" id="q7" style="padding:5px 10px;font-size:12px" title="把日期范围设为最近 7 天">近7日</button>
+        <button class="btn" id="qAll" style="padding:5px 10px;font-size:12px" title="清除日期限制，显示全部数据">全部</button>
       </div>
       <div class="fgroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
@@ -482,13 +482,13 @@ table.cal td.cal-cell.has:hover{
         <h3><span class="dot"></span>完整明细 <span class="tag" id="detailTag"></span></h3>
         <div class="detail-bar">
           <div class="chips" id="detailSeg">
-            <button class="chip on" data-mode="all">全部</button>
-            <button class="chip" data-mode="hit">已关联</button>
-            <button class="chip" data-mode="miss">未关联</button>
+            <button class="chip on" data-mode="all" title="显示全部记录">全部</button>
+            <button class="chip" data-mode="hit" title="只看能关联到本地 Token 的记录">已关联</button>
+            <button class="chip" data-mode="miss" title="只看关联不到 Token 的记录，用于排查">未关联</button>
           </div>
           <input class="detail-q" id="detailQ" placeholder="搜索 RequestID / 模型 / 客户端…">
           <div class="spacer"></div>
-          <button class="btn" id="btnDetailExport">⬇ 导出当前结果</button>
+          <button class="btn" id="btnDetailExport" title="导出下面这张表的内容为 CSV，跟随当前的筛选与搜索条件">⬇ 导出当前结果</button>
         </div>
         <div class="tbl-scroll" style="max-height:520px"><table class="tbl" id="tblDetail"></table></div>
         <div class="detail-pager" id="detailPager"></div>
@@ -1678,9 +1678,9 @@ function renderDetail(d){
 
   $('detailPager').innerHTML = list.length
     ? `<span>第 ${start + 1}–${Math.min(start + DETAIL_PAGE, list.length)} 条 / 共 ${list.length} 条</span>
-       <button id="dPrev" ${f.page === 0 ? 'disabled' : ''}>‹ 上一页</button>
+       <button id="dPrev" title="上一页" ${f.page === 0 ? 'disabled' : ''}>‹ 上一页</button>
        <span>${f.page + 1} / ${pages}</span>
-       <button id="dNext" ${f.page >= pages - 1 ? 'disabled' : ''}>下一页 ›</button>`
+       <button id="dNext" title="下一页" ${f.page >= pages - 1 ? 'disabled' : ''}>下一页 ›</button>`
     : '';
   const pv = $('dPrev'), nx = $('dNext');
   if(pv) pv.onclick = () => { state.detail.page--; renderDetail(getFiltered()); };
@@ -2584,9 +2584,9 @@ async function openHistory(){
         </div>
       </div>
       <div class="ops">
-        ${isAuto ? '' : '<button data-act="load">恢复</button>'}
-        <button data-act="export">导出</button>
-        ${isAuto ? '' : '<button data-act="del" class="danger">删除</button>'}
+        ${isAuto ? '' : '<button data-act="load" title="把看板恢复到这一份快照的数据">恢复</button>'}
+        <button data-act="export" title="把这一份快照导出为文件下载">导出</button>
+        ${isAuto ? '' : '<button data-act="del" class="danger" title="删除这一份快照，不可撤销">删除</button>'}
       </div>
     </div>`;
 
