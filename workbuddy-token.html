@@ -193,6 +193,22 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .tbl th.sortable{cursor:pointer;user-select:none;white-space:nowrap}
 .tbl th.sortable:hover{color:var(--accent)}
 .tbl th.sortable.on{color:var(--accent);font-weight:700}
+
+/* ---------- 回合步骤明细（点「请求数」展开） ---------- */
+.req-count{
+  color:var(--accent);cursor:pointer;font-weight:600;
+  border-bottom:1px dashed currentColor;padding-bottom:1px;
+}
+.req-count:hover{color:var(--accent2)}
+.req-count.on{color:var(--accent2)}
+tr.expand-row>td{background:#f7f9fd;padding:0 !important;border-bottom:1px solid var(--line)}
+.steps{padding:10px 14px}
+.steps table{width:100%;border-collapse:collapse;font-size:12px}
+.steps th,.steps td{padding:4px 9px;border-bottom:1px solid #e9eef8;text-align:left;white-space:nowrap}
+.steps th{color:var(--muted);font-weight:600;background:#f2f6fd}
+.steps td.num,.steps th.num{text-align:right}
+.steps tbody tr:last-child td{border-bottom:none}
+.steps .empty{color:#93a0b8;font-size:12.5px}
 .pill{display:inline-block;padding:2px 9px;border-radius:6px;font-size:11.5px;font-weight:600;
   background:#eef2fd;color:#4a63c9}
 .pill.g{background:#e6f8f1;color:#0f9b6c}
@@ -680,7 +696,7 @@ const state = {
   charts: {},
   tokenLoaded: false,   // token-usage-data.js 是否成功加载
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
-  detail: { mode:'all', q:'', page:0 },   // 完整明细卡的筛选状态
+  detail: { mode:'all', q:'', page:0, expanded:null },   // expanded = 展开步骤明细的回合 ID
   rank: { sort:'perPoint', dir:'desc' }   // 模型性价比卡的表头排序
 };
 
@@ -1472,6 +1488,35 @@ function getDetailList(){
   return [...list].sort((a, b) => b.time - a.time);   // 最新的在前
 }
 
+/** 渲染单个回合的每一步（点「请求数」展开） */
+function renderSteps(t){
+  if(!t || !t.d || !t.d.length){
+    return '<div class="steps"><span class="empty">该回合没有步骤明细（可能由 --light 模式生成）</span></div>';
+  }
+  const rows = t.d.map((s, i) => {
+    const ms = s[0], tool = s[1], inTok = s[2] || 0, outTok = s[3] || 0, cr = s[4] || 0;
+    const time = ms ? new Date(ms).toLocaleTimeString('zh-CN', { hour12:false }) : '—';
+    return `<tr>
+      <td style="color:#a8b3c8">${i + 1}</td>
+      <td class="mono">${time}</td>
+      <td>${tool ? esc(tool) : '<span style="color:#c8d1e2">(无工具)</span>'}</td>
+      <td class="num">${fmt0(inTok)}</td>
+      <td class="num">${fmt0(outTok)}</td>
+      <td class="num" style="color:#6b7891">${fmt0(cr)}</td>
+      <td class="num"><b>${fmt0(inTok + outTok)}</b></td>
+    </tr>`;
+  }).join('');
+  return `<div class="steps">
+    <table>
+      <thead><tr>
+        <th style="width:34px">#</th><th>时间</th><th>工具</th>
+        <th class="num">输入</th><th class="num">输出</th><th class="num">缓存读</th><th class="num">合计</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
 function renderDetail(d){
   const card = $('detailCard');
   if(card) card.hidden = !state.all.length;
@@ -1498,7 +1543,14 @@ function renderDetail(d){
     <tbody>${ rows.length ? rows.map(x => {
       const t = x.token;
       const dur = (t && t.t1 && t.t0) ? (t.t1 - t.t0) / 1000 : 0;
-      return `<tr>
+      const open = f.expanded === x.id;
+      const hasSteps = !!(t && t.d && t.d.length);
+      // 请求数可点：有步骤明细时展开该回合的每一步
+      const reqCell = hasSteps
+        ? `<td class="num"><span class="req-count${open ? ' on' : ''}" data-expand="${esc(x.id)}"
+             title="点击查看该回合的每一步">${t.n}${open ? ' ▲' : ' ▾'}</span></td>`
+        : `<td class="num" style="color:#6b7891">${t ? t.n : '<span style="color:#c8d1e2">—</span>'}</td>`;
+      const main = `<tr>
         <td><span class="stat-mark ${t ? 'stat-hit' : 'stat-miss'}">${t ? '已关联' : '未关联'}</span></td>
         <td class="mono" title="${esc(x.id)}">${esc(x.id.length > 22 ? x.id.slice(0, 20) + '…' : x.id)}</td>
         <td><span class="pill">${esc(x.model)}</span></td>
@@ -1506,11 +1558,14 @@ function renderDetail(d){
         <td class="mono">${x.date} ${pad(x.hour)}:${pad(x.min)}</td>
         <td class="num">${fmt2(x.points)}</td>
         <td class="num">${t ? fmtTok(t.tot) : '<span style="color:#c8d1e2">—</span>'}</td>
-        <td class="num" style="color:#6b7891">${t ? t.n : '<span style="color:#c8d1e2">—</span>'}</td>
+        ${reqCell}
         <td class="num" style="color:#6b7891">${
           t ? (dur >= 60 ? (dur / 60).toFixed(1) + ' 分' : dur.toFixed(0) + ' 秒')
             : '<span style="color:#c8d1e2">—</span>'}</td>
       </tr>`;
+      const steps = open
+        ? `<tr class="expand-row"><td colspan="9">${renderSteps(t)}</td></tr>` : '';
+      return main + steps;
     }).join('')
       : `<tr><td colspan="9" style="text-align:center;color:#93a0b8;padding:28px">
            没有符合条件的记录</td></tr>`
@@ -2608,6 +2663,19 @@ async function loadFile(file){
     const d = getFiltered();
     download(`积分汇总_${state.filters.from}_${state.filters.to}.csv`,
       buildCSV(d), 'text/csv');
+  });
+
+  /* ---- 完整明细：点「请求数」展开该回合的每一步 ---- */
+  $('tblDetail').addEventListener('click', e => {
+    const el = e.target.closest('.req-count');
+    if(!el) return;
+    const id = el.dataset.expand;
+    // 记住滚动位置，否则重渲染后会跳回顶部
+    const box = e.currentTarget.closest('.tbl-scroll');
+    const top = box ? box.scrollTop : 0;
+    state.detail.expanded = (state.detail.expanded === id) ? null : id;
+    renderDetail(getFiltered());
+    if(box) box.scrollTop = top;
   });
 
   /* ---- 完整明细卡：三态筛选 + 搜索 + 分页 ---- */
