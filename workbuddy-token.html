@@ -473,6 +473,11 @@ table.cal td.cal-cell.has:hover{
         </p>
       </div>
 
+      <div class="card c12" id="sessCard" hidden>
+        <h3><span class="dot"></span>Session 消耗 <span class="tag">按会话聚合 · 点表头排序</span></h3>
+        <div class="tbl-scroll" style="max-height:460px"><table class="tbl" id="tblSess"></table></div>
+      </div>
+
       <div class="card c12" id="detailCard" hidden>
         <h3><span class="dot"></span>完整明细 <span class="tag" id="detailTag"></span></h3>
         <div class="detail-bar">
@@ -697,7 +702,8 @@ const state = {
   tokenLoaded: false,   // token-usage-data.js 是否成功加载
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
   detail: { mode:'all', q:'', page:0, expanded:null },   // expanded = 展开步骤明细的回合 ID
-  rank: { sort:'perPoint', dir:'desc' }   // 模型性价比卡的表头排序
+  rank: { sort:'perPoint', dir:'desc' },  // 模型性价比卡的表头排序
+  sess: { sort:'pts', dir:'desc' }        // Session 消耗卡的表头排序
 };
 
 /* =========================================================
@@ -786,6 +792,35 @@ function computeStats(d){
   // ---- 最烧 token 的回合 ----
   const topToken = [...tkRows].sort((a,b) => b.token.tot - a.token.tot).slice(0, 10);
 
+  // ---- Session 维度 ----
+  // token 数据里每个回合带 sessionId(s) 与工作目录(p)，按此聚合到会话粒度。
+  // 未关联的行没有 session 信息，因此这里只统计已关联的部分。
+  const sessMap = new Map();
+  for(const x of tkRows){
+    const t = x.token;
+    if(!t || !t.s) continue;
+    let o = sessMap.get(t.s);
+    if(!o){
+      o = { key:t.s, cwd:t.p || '', count:0, reqs:0, pts:0,
+            tk:0, tkIn:0, tkOut:0, tkCr:0, t0:0, t1:0, models:new Set() };
+      sessMap.set(t.s, o);
+    }
+    o.count++;
+    o.pts  += x.points;
+    o.reqs += t.n || 0;
+    o.tk += t.tot; o.tkIn += t.in; o.tkOut += t.out; o.tkCr += t.cr;
+    if(t.t0 && (!o.t0 || t.t0 < o.t0)) o.t0 = t.t0;
+    if(t.t1 > o.t1) o.t1 = t.t1;
+    if(t.m) o.models.add(t.m);
+  }
+  const bySession = [...sessMap.values()].map(o => ({
+    ...o,
+    perPoint:  o.pts > 0 ? o.tk / o.pts : null,
+    perReq:    o.reqs ? o.pts / o.reqs : 0,
+    cacheRate: o.tkIn ? o.tkCr / o.tkIn : 0,
+    modelList: [...o.models],
+  }));
+
   // ---- 模型性价比 ----
   // 每积分 Token 是唯一能把 token 与积分拉到同一尺度的指标，越高越划算。
   // 注意：低不代表模型差——复杂任务才会用强模型，它天然 token 多、积分高。
@@ -820,6 +855,7 @@ function computeStats(d){
     byTool, topToken, toolSteps, hasDetail: toolSteps > 0,
     toolKinds: byTool.length,
     modelRank,
+    bySession,
     tokenPerPoint:   tokenPts > 0 ? tokenTot / tokenPts : 0,        // 每 1 积分产出多少 token
     pointsPerMToken: tokenTot > 0 ? tokenPts / tokenTot * 1e6  : 0, // 每 M token 花多少积分
     cacheHitRate:    tokenIn  > 0 ? tokenCr / tokenIn : 0,
@@ -1467,6 +1503,71 @@ function renderModelRank(d){
     </tr>`).join('');
 
   $('tblRank').innerHTML = `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody>`;
+}
+
+/* =========================================================
+ *  8.45 Session 消耗（按会话聚合）
+ * =======================================================*/
+const SESS_COLS = [
+  { k:'key',       t:'Session' },
+  { k:'cwd',       t:'工作目录' },
+  { k:'t0',        t:'时间范围' },
+  { k:'count',     t:'回合',        num:1 },
+  { k:'reqs',      t:'请求数',      num:1 },
+  { k:'pts',       t:'积分',        num:1 },
+  { k:'tk',        t:'Token',       num:1 },
+  { k:'perPoint',  t:'每积分 Token', num:1 },
+  { k:'cacheRate', t:'缓存率',      num:1 },
+];
+
+function renderSessionRank(d){
+  const s = computeStats(d);
+  const card = $('sessCard');
+  if(card) card.hidden = !state.all.length || !s.bySession.length;
+  if(!s.bySession.length) return;
+
+  const { sort, dir } = state.sess;
+  const sign = dir === 'desc' ? -1 : 1;
+  const list = [...s.bySession].sort((a, b) => {
+    const va = a[sort], vb = b[sort];
+    if(typeof va === 'string') return sign * String(va).localeCompare(String(vb));
+    // perPoint 可能是 null（免费会话），排序时按 -Infinity 处理
+    const na = va === null ? -Infinity : (va || 0);
+    const nb = vb === null ? -Infinity : (vb || 0);
+    return sign * (na - nb);
+  });
+
+  const head = SESS_COLS.map(c => {
+    const on = sort === c.k;
+    return `<th class="sortable${on ? ' on' : ''}${c.num ? ' num' : ''}" data-k="${c.k}" title="点击排序">` +
+           `${c.t}${on ? (dir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`;
+  }).join('');
+
+  const fmtMD = ms => {
+    const t = new Date(ms);
+    return `${t.getMonth() + 1}/${t.getDate()} ` +
+           `${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}`;
+  };
+
+  const rows = list.map(o => {
+    const dur = (o.t0 && o.t1) ? `${fmtMD(o.t0)} ~ ${fmtMD(o.t1)}` : '—';
+    const cwd = o.cwd || '';
+    // 目录常很长，保留尾部（尾部信息量最大）
+    const cwdShort = cwd.length > 34 ? '…' + cwd.slice(-33) : cwd;
+    return `<tr>
+      <td class="mono" title="${esc(o.key)}">${esc(o.key.slice(0, 8))}…</td>
+      <td class="mono" style="color:#6b7891" title="${esc(cwd)}">${esc(cwdShort) || '—'}</td>
+      <td class="mono" style="color:#6b7891;font-size:12px">${dur}</td>
+      <td class="num" style="color:#6b7891">${fmt0(o.count)}</td>
+      <td class="num" style="color:#6b7891">${fmt0(o.reqs)}</td>
+      <td class="num">${fmt2(o.pts)}</td>
+      <td class="num"><b>${fmtTok(o.tk)}</b></td>
+      <td class="num">${o.perPoint === null ? '—' : fmtTok(o.perPoint)}</td>
+      <td class="num" style="color:#6b7891">${(o.cacheRate*100).toFixed(1)}%</td>
+    </tr>`;
+  }).join('');
+
+  $('tblSess').innerHTML = `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody>`;
 }
 
 /* =========================================================
@@ -2229,6 +2330,7 @@ function render(){
   renderHeatmap(d);
   renderTables(d);
   renderModelRank(d);
+  renderSessionRank(d);
   renderDetail(d);
   renderReport(d);
 
@@ -2663,6 +2765,20 @@ async function loadFile(file){
     const d = getFiltered();
     download(`积分汇总_${state.filters.from}_${state.filters.to}.csv`,
       buildCSV(d), 'text/csv');
+  });
+
+  /* ---- Session 消耗：点表头排序 ---- */
+  $('tblSess').addEventListener('click', e => {
+    const th = e.target.closest('th.sortable');
+    if(!th) return;
+    const k = th.dataset.k;
+    if(state.sess.sort === k){
+      state.sess.dir = state.sess.dir === 'desc' ? 'asc' : 'desc';
+    }else{
+      state.sess.sort = k;
+      state.sess.dir = 'desc';
+    }
+    renderSessionRank(getFiltered());
   });
 
   /* ---- 完整明细：点「请求数」展开该回合的每一步 ---- */
