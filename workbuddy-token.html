@@ -177,6 +177,17 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .stat-mark{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap}
 .stat-hit{background:#e7f8f1;color:#0b8a63}
 .stat-miss{background:#f2f5fc;color:#8b98b3}
+
+/* ---------- 模型性价比 ---------- */
+.rank-note{
+  margin:12px 0 0;font-size:12px;line-height:1.75;color:var(--muted);
+  background:#f7f9fd;border-radius:8px;padding:10px 13px;
+}
+.rank-note b{color:var(--text);font-weight:600}
+.free-tag{
+  display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;
+  background:#e7f8f1;color:#0b8a63;
+}
 .pill{display:inline-block;padding:2px 9px;border-radius:6px;font-size:11.5px;font-weight:600;
   background:#eef2fd;color:#4a63c9}
 .pill.g{background:#e6f8f1;color:#0f9b6c}
@@ -429,6 +440,18 @@ table.cal td.cal-cell.has:hover{
         <div class="tbl-scroll"><table class="tbl" id="tblDay"></table></div>
       </div>
 
+      <div class="card c12" id="rankCard" hidden>
+        <h3><span class="dot"></span>模型性价比 <span class="tag">每积分 Token 越高越划算</span></h3>
+        <div class="tbl-scroll" style="max-height:420px"><table class="tbl" id="tblRank"></table></div>
+        <p class="rank-note">
+          口径：<b>每积分 Token = 该模型 Token 合计 ÷ 积分合计</b>，即「花 1 积分能换到多少 Token」。
+          含免费额度（0 积分）在内的模型会单独标注，不参与比率排序。
+          <br>
+          <b>解读提醒</b>：这个数字低不代表模型差——复杂任务才会用强模型，它天然 Token 多、积分高。
+          要横向比性价比，请结合「单次积分」和「缓存率」一起看。
+        </p>
+      </div>
+
       <div class="card c12" id="detailCard" hidden>
         <h3><span class="dot"></span>完整明细 <span class="tag" id="detailTag"></span></h3>
         <div class="detail-bar">
@@ -663,13 +686,14 @@ function agg(list, keyFn){
   for(const x of list){
     const k = keyFn(x);
     let o = m.get(k);
-    if(!o){ o = {key:k, sum:0, count:0, max:0, tk:0, tkIn:0, tkOut:0, tkCnt:0}; m.set(k, o); }
+    if(!o){ o = {key:k, sum:0, count:0, max:0, tk:0, tkIn:0, tkOut:0, tkCr:0, tkCnt:0}; m.set(k, o); }
     o.sum += x.points; o.count++;
     if(x.points > o.max) o.max = x.points;
     if(x.token){                       // 已关联 token 的行才计入
       o.tk    += x.token.tot;
       o.tkIn  += x.token.in;
       o.tkOut += x.token.out;
+      o.tkCr  += x.token.cr;
       o.tkCnt += 1;
     }
   }
@@ -740,6 +764,26 @@ function computeStats(d){
   // ---- 最烧 token 的回合 ----
   const topToken = [...tkRows].sort((a,b) => b.token.tot - a.token.tot).slice(0, 10);
 
+  // ---- 模型性价比 ----
+  // 每积分 Token 是唯一能把 token 与积分拉到同一尺度的指标，越高越划算。
+  // 注意：低不代表模型差——复杂任务才会用强模型，它天然 token 多、积分高。
+  const modelRank = s.byModel
+    .filter(m => m.tk > 0)                       // 有 token 数据的才参与比较
+    .map(m => ({
+      key: m.key, count: m.count, pts: m.sum,
+      tk: m.tk, tkIn: m.tkIn, tkOut: m.tkOut, tkCr: m.tkCr,
+      free: m.sum === 0,
+      perPoint: m.sum > 0 ? m.tk / m.sum : null, // null = 免费，无法算比率
+      perReq:   m.count  ? m.sum / m.count : 0,  // 单次均值积分
+      cacheRate: m.tkIn  ? m.tkCr / m.tkIn : 0,
+    }))
+    .sort((a, b) => {
+      if(a.free !== b.free) return a.free ? -1 : 1;   // 免费的排最前
+      if(a.free && b.free)  return b.tk - a.tk;
+      return b.perPoint - a.perPoint;                 // 其余按每积分 Token 降序
+    });
+  const maxPerPoint = Math.max(0, ...modelRank.filter(m => !m.free).map(m => m.perPoint || 0));
+
   return {
     total, count, byModel, byClient, byDate, byHour, hourArr,
     top, zeroCnt, dates, peakHour, peakDay, top10Sum, maxReq,
@@ -754,6 +798,7 @@ function computeStats(d){
     freeRows: freeRows.length, freeToken,
     byTool, topToken, toolSteps, hasDetail: toolSteps > 0,
     toolKinds: byTool.length,
+    modelRank, maxPerPoint,
     tokenPerPoint:   tokenPts > 0 ? tokenTot / tokenPts : 0,        // 每 1 积分产出多少 token
     pointsPerMToken: tokenTot > 0 ? tokenPts / tokenTot * 1e6  : 0, // 每 M token 花多少积分
     cacheHitRate:    tokenIn  > 0 ? tokenCr / tokenIn : 0,
@@ -1347,6 +1392,41 @@ function renderTables(d){
         </tr>` : ''
       }</tbody>`;
   }
+}
+
+/* =========================================================
+ *  8.4 模型性价比
+ * =======================================================*/
+function renderModelRank(d){
+  const s = computeStats(d);
+  const card = $('rankCard');
+  if(card) card.hidden = !state.all.length || !s.modelRank.length;
+  if(!s.modelRank.length) return;
+
+  const rows = s.modelRank.map(m => {
+    const perPointTxt = m.free ? '<span class="free-tag">免费</span>' : fmtTok(m.perPoint);
+    // 免费模型给满格条；其余按最大值归一化，最小值也留一点可见宽度
+    const barPct = m.free ? 100
+      : (s.maxPerPoint > 0 ? Math.max(2, m.perPoint / s.maxPerPoint * 100) : 0);
+    return `<tr>
+      <td><span class="pill">${esc(m.key)}</span></td>
+      <td class="num" style="color:#6b7891">${fmt0(m.count)}</td>
+      <td class="num">${fmt2(m.pts)}</td>
+      <td class="num">${fmtTok(m.tk)}</td>
+      <td class="num" style="font-weight:600">${perPointTxt}</td>
+      <td class="num" style="color:#6b7891">${fmt2(m.perReq)}</td>
+      <td class="num" style="color:#6b7891">${(m.cacheRate*100).toFixed(1)}%</td>
+      <td><div class="bar-mini" style="width:120px"><i style="width:${barPct.toFixed(1)}%"></i></div></td>
+    </tr>`;
+  }).join('');
+
+  $('tblRank').innerHTML = `
+    <thead><tr>
+      <th>模型</th><th class="num">请求数</th><th class="num">积分</th><th class="num">Token</th>
+      <th class="num">每积分 Token</th><th class="num">单次积分</th><th class="num">缓存率</th>
+      <th style="width:132px">性价比</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>`;
 }
 
 /* =========================================================
@@ -2069,6 +2149,7 @@ function render(){
   renderCharts(d);
   renderHeatmap(d);
   renderTables(d);
+  renderModelRank(d);
   renderDetail(d);
   renderReport(d);
 
