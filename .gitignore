@@ -1,0 +1,22 @@
+# 本地数据与产物：含真实会话记录、项目路径，切勿提交
+token-usage-data.js
+token-usage-detail.csv
+token-usage-summary.md
+
+# 自己导出的账单文件
+*.xlsx
+*.xls
+
+# 临时调研脚本
+_probe*.js
+_check*.js
+_scan.js
+_timerange.js
+_verify*.py
+_analyze*.py
+_timematch.py
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store

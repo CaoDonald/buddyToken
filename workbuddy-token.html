@@ -1,0 +1,2185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>积分消耗看板</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root{
+  --bg:#f4f6fb; --card:#fff; --text:#182135; --muted:#6b7891;
+  --line:#e6eaf2; --accent:#4f6ef7; --accent2:#7c5cff;
+  --ok:#12b886; --warn:#f59f00; --danger:#f0475f;
+  --shadow:0 1px 2px rgba(24,33,53,.04), 0 8px 24px rgba(24,33,53,.06);
+}
+*{box-sizing:border-box}
+[hidden]{display:none !important}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1320px;margin:0 auto;padding:0 20px 60px}
+
+/* ---------- 顶栏 ---------- */
+.topbar{
+  position:sticky; top:0; z-index:50; background:rgba(255,255,255,.86);
+  backdrop-filter:saturate(180%) blur(12px); border-bottom:1px solid var(--line);
+}
+.topbar-in{max-width:1320px;margin:0 auto;padding:12px 20px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.brand{font-size:17px;font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:8px}
+.brand small{font-weight:500;color:var(--muted);font-size:12px}
+.spacer{flex:1}
+.btn{
+  border:1px solid var(--line); background:#fff; color:var(--text);
+  padding:7px 13px; border-radius:9px; cursor:pointer; font-size:13px;
+  transition:.15s; font-weight:500; white-space:nowrap; font-family:inherit;
+}
+.btn:hover{border-color:var(--accent);color:var(--accent);box-shadow:0 2px 8px rgba(79,110,247,.12)}
+.btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border-color:transparent}
+.btn.primary:hover{filter:brightness(1.08);color:#fff}
+
+/* ---------- 保存状态 ---------- */
+.save-dot{
+  display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted);
+  background:#f5f7fd;padding:3px 10px;border-radius:999px;white-space:nowrap;
+}
+.save-dot i{width:6px;height:6px;border-radius:50%;background:var(--ok);display:block;flex:none}
+.save-dot.saving i{background:var(--warn);animation:pulse .9s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+
+/* ---------- 上传 ---------- */
+.uploader{padding:60px 20px}
+.drop{
+  max-width:620px;margin:0 auto;border:2px dashed #c9d3e8;border-radius:18px;
+  background:#fff; padding:56px 32px; text-align:center; cursor:pointer;
+  transition:.2s; box-shadow:var(--shadow);
+}
+.drop:hover,.drop.over{border-color:var(--accent);background:#f7f9ff;transform:translateY(-2px)}
+.drop .ico{font-size:46px;line-height:1}
+.drop h2{margin:14px 0 6px;font-size:19px}
+.drop p{margin:0;color:var(--muted);font-size:13px}
+.drop .hint{margin-top:18px;font-size:12px;color:#9aa5bb}
+
+/* ---------- 提示条 ---------- */
+.banner{
+  background:linear-gradient(135deg,#eef3ff,#f6f1ff);border:1px solid #dbe3fb;
+  border-radius:12px;padding:11px 16px;margin:20px 0 0;
+  display:flex;align-items:center;gap:12px;font-size:13px;color:#3b4a68;
+  box-shadow:var(--shadow);
+}
+.banner b{color:#1f2b45}
+.banner .x{margin-left:auto;cursor:pointer;color:#8b98b3;font-size:18px;line-height:1;
+  padding:2px 7px;border-radius:6px;flex:none}
+.banner .x:hover{background:#e4eafc;color:var(--text)}
+
+/* ---------- 合并统计卡 ---------- */
+.merge-info{
+  display:none;align-items:center;gap:14px;flex-wrap:wrap;
+  background:linear-gradient(135deg,#e9f9f1,#f0fbf7);border:1px solid #c8eedd;
+  border-radius:12px;padding:11px 18px;margin:20px 0 0;font-size:13px;color:#1f5b46;
+  box-shadow:var(--shadow);
+}
+.merge-info.show{display:flex}
+.merge-info b{color:#0d6b4d}
+.merge-info .tag{padding:2px 10px;background:#fff;border-radius:999px;font-size:12px;
+  color:#1f5b46;font-weight:600;border:1px solid #c8eedd}
+
+/* ---------- 筛选 ---------- */
+.filters{
+  background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:14px 16px;margin:20px 0;box-shadow:var(--shadow);
+  display:flex;gap:18px;flex-wrap:wrap;align-items:center;
+}
+.fgroup{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.fgroup>label{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.3px}
+input[type=date]{
+  border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px;
+  color:var(--text);font-family:inherit;background:#fff;
+}
+input[type=date]:focus{outline:none;border-color:var(--accent)}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{
+  border:1px solid var(--line);background:#fbfcfe;border-radius:999px;
+  padding:4px 12px;font-size:12px;cursor:pointer;color:var(--muted);
+  transition:.15s;font-family:inherit;
+}
+.chip:hover{border-color:#b9c5e6;color:var(--text)}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.statline{font-size:12px;color:var(--muted);margin-left:auto}
+
+/* ---------- KPI ---------- */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px}
+.kpi{
+  background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:16px 18px;box-shadow:var(--shadow);position:relative;overflow:hidden;
+}
+.kpi::after{content:"";position:absolute;left:0;top:0;height:3px;width:100%;
+  background:linear-gradient(90deg,var(--accent),var(--accent2));opacity:.85}
+.kpi-label{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.3px}
+.kpi-value{font-size:26px;font-weight:800;letter-spacing:-.5px;margin:6px 0 2px;
+  font-variant-numeric:tabular-nums}
+.kpi-value.small{font-size:19px;margin-top:10px}
+.kpi-sub{font-size:12px;color:#93a0b8}
+.kpi-sub b{color:var(--text);font-weight:600}
+
+/* ---------- 网格 ---------- */
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;margin-bottom:16px}
+.card{
+  background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:16px 18px 14px;box-shadow:var(--shadow);min-width:0;
+}
+.card h3{margin:0 0 12px;font-size:14px;font-weight:700;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card h3 .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+.card h3 .tag{font-weight:500;font-size:11px;color:var(--muted);background:#f2f5fc;
+  padding:1px 8px;border-radius:6px}
+.c3{grid-column:span 3}.c4{grid-column:span 4}.c5{grid-column:span 5}
+.c6{grid-column:span 6}.c7{grid-column:span 7}.c8{grid-column:span 8}.c12{grid-column:span 12}
+.chart-box{position:relative;height:260px}
+.chart-box.tall{height:300px}
+@media(max-width:1080px){
+  .c3,.c4,.c5,.c6,.c7,.c8{grid-column:span 12}
+}
+
+/* ---------- 表格 ---------- */
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{
+  text-align:left;font-size:11px;color:var(--muted);font-weight:700;letter-spacing:.4px;
+  padding:8px 10px;border-bottom:1px solid var(--line);text-transform:uppercase;
+  position:sticky;top:0;background:#fff;z-index:1;
+}
+.tbl td{padding:9px 10px;border-bottom:1px solid #f2f5fa;font-variant-numeric:tabular-nums}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tbody tr:hover{background:#fafbff}
+.tbl .num{text-align:right;font-weight:600}
+.tbl .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:#8a96ad}
+.tbl-scroll{max-height:340px;overflow:auto;border-radius:8px}
+.pill{display:inline-block;padding:2px 9px;border-radius:6px;font-size:11.5px;font-weight:600;
+  background:#eef2fd;color:#4a63c9}
+.pill.g{background:#e6f8f1;color:#0f9b6c}
+.pill.o{background:#fff4e0;color:#c47d00}
+.pill.p{background:#f3edff;color:#7048d6}
+.pill.r{background:#ffefef;color:#d93350}
+.bar-mini{height:6px;border-radius:3px;background:#eef2fd;overflow:hidden;min-width:60px}
+.bar-mini i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2))}
+
+/* ---------- 模型 × 时段热力图 ---------- */
+.heat-scroll{overflow-x:auto;padding-bottom:6px}
+.heat{border-collapse:separate;border-spacing:3px;font-size:11px}
+.heat th{font-weight:600;color:var(--muted);padding:2px 4px;text-align:center;font-size:10.5px}
+.heat td.mname{font-size:11.5px;font-weight:600;color:#455172;padding-right:8px;
+  white-space:nowrap;text-align:right;max-width:150px;overflow:hidden;text-overflow:ellipsis}
+.heat td.cell{
+  width:34px;height:26px;border-radius:5px;text-align:center;color:#fff;
+  font-size:10.5px;font-variant-numeric:tabular-nums;
+}
+.heat td.cell.empty{background:#f4f6fb;color:#c8d1e2}
+.legend-row{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:11.5px;
+  color:var(--muted);flex-wrap:wrap}
+.legend-scale{display:flex;gap:3px}
+.legend-scale i{width:24px;height:11px;border-radius:3px;display:block}
+
+/* ---------- 日期日历热力图 ---------- */
+.cal-grid{
+  display:grid;gap:26px;
+  grid-template-columns:repeat(auto-fit,minmax(400px,1fr));
+}
+.cal-unit{min-width:0}
+.cal-unit-title{
+  font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.3px;
+  margin:0 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+}
+.cal-unit-title .swatch{width:10px;height:10px;border-radius:3px;flex:none}
+.cal-unit-title .total{
+  margin-left:auto;font-weight:600;color:var(--text);font-size:12px;
+  background:#f5f7fd;padding:2px 9px;border-radius:6px;font-variant-numeric:tabular-nums;
+}
+.cal-scroll{overflow-x:auto;padding-bottom:6px}
+table.cal{border-collapse:separate;border-spacing:3px;font-size:10.5px}
+table.cal th.month{
+  font-weight:700;color:#7c88a3;font-size:10.5px;text-align:left;
+  padding:0 0 5px 0;white-space:nowrap;
+}
+table.cal th.rowlbl{
+  font-weight:600;color:var(--muted);font-size:10.5px;text-align:right;
+  padding-right:7px;white-space:nowrap;width:22px;
+}
+table.cal td.cal-cell{
+  width:15px;height:15px;min-width:15px;border-radius:3.5px;
+  background:#f0f3fa;transition:transform .12s, box-shadow .12s;cursor:default;
+}
+table.cal td.cal-cell.out{background:transparent;pointer-events:none}
+table.cal td.cal-cell.has:hover{
+  transform:scale(1.28);box-shadow:0 2px 8px rgba(24,33,53,.22);z-index:5;position:relative;
+}
+.cal-legend{
+  display:flex;align-items:center;gap:8px;margin-top:12px;
+  font-size:11px;color:var(--muted);flex-wrap:wrap;
+}
+.cal-legend .scale{display:flex;gap:3px;align-items:center}
+.cal-legend .scale i{width:15px;height:15px;border-radius:3.5px;display:block}
+
+/* ---------- 报告 ---------- */
+.report{font-size:13.5px;line-height:1.85;color:#2c3853}
+.report h4{margin:18px 0 6px;font-size:13px;font-weight:800;color:var(--text);
+  display:flex;align-items:center;gap:7px}
+.report h4:first-child{margin-top:0}
+.report h4::before{content:"";width:3px;height:13px;border-radius:2px;
+  background:linear-gradient(180deg,var(--accent),var(--accent2))}
+.report ul{margin:4px 0 0;padding-left:20px}
+.report li{margin:3px 0}
+.report b{color:#0f1a2e;font-weight:700}
+.hl{background:linear-gradient(180deg,transparent 62%,#d9e2ff 62%);padding:0 2px;font-weight:700}
+.report .note{background:#f8faff;border-left:3px solid var(--accent);border-radius:0 8px 8px 0;
+  padding:9px 14px;margin:10px 0;font-size:12.5px;color:#41506e}
+
+/* ---------- 历史快照弹窗 ---------- */
+.modal{position:fixed;inset:0;z-index:200;background:rgba(20,28,45,.42);
+  display:flex;align-items:center;justify-content:center;padding:24px;backdrop-filter:blur(3px)}
+.modal-box{background:#fff;border-radius:16px;width:min(720px,100%);max-height:82vh;
+  display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(20,28,45,.28);overflow:hidden}
+.modal-head{padding:16px 20px;border-bottom:1px solid var(--line);
+  display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px;flex-wrap:wrap}
+.modal-head .x{margin-left:auto;cursor:pointer;color:#8b98b3;font-size:20px;
+  line-height:1;padding:0 6px;border-radius:6px}
+.modal-head .x:hover{background:#f0f3fa;color:var(--text)}
+.modal-body{padding:8px 12px 16px;overflow:auto}
+.snap{display:flex;align-items:center;gap:14px;padding:12px;border-radius:10px;transition:.14s}
+.snap:hover{background:#f7f9ff}
+.snap+.snap{border-top:1px solid #f2f5fa}
+.snap .ico{width:38px;height:38px;border-radius:9px;display:flex;align-items:center;justify-content:center;
+  font-size:17px;flex:none;background:#eef2fd;color:#4f6ef7}
+.snap .ico.manual{background:#f3edff;color:#7048d6}
+.snap .info{min-width:0;flex:1}
+.snap .nm{font-weight:600;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.snap .mt{font-size:11.5px;color:var(--muted);margin-top:2px}
+.snap .ops{display:flex;gap:6px;flex:none}
+.snap .ops button{border:1px solid var(--line);background:#fff;border-radius:7px;
+  padding:4px 11px;font-size:12px;cursor:pointer;color:var(--muted);
+  font-family:inherit;transition:.14s}
+.snap .ops button:hover{border-color:var(--accent);color:var(--accent)}
+.snap .ops button.danger:hover{border-color:var(--danger);color:var(--danger)}
+.empty-tip{padding:40px 20px;text-align:center;color:#a8b3c8;font-size:13px;line-height:1.9}
+.sec-title{padding:14px 12px 6px;font-size:12px;font-weight:700;color:var(--muted);
+  letter-spacing:.4px;text-transform:uppercase}
+
+/* ---------- 打印 ---------- */
+@media print{
+  body{background:#fff}
+  .no-print{display:none !important}
+  .topbar{position:static;background:#fff}
+  .wrap{max-width:none;padding:0}
+  .card,.kpi{break-inside:avoid;box-shadow:none;border:1px solid #dfe4ee}
+  .grid{display:block}
+  .card{margin-bottom:12px}
+  .tbl-scroll,.heat-scroll,.cal-scroll{max-height:none;overflow:visible}
+  .chart-box{height:220px}
+  @page{margin:12mm}
+}
+</style>
+</head>
+<body>
+
+<div class="topbar no-print">
+  <div class="topbar-in">
+    <div class="brand">📊 积分消耗看板 <small id="srcName"></small></div>
+    <div class="spacer"></div>
+    <div class="save-dot" id="saveDot" hidden><i></i><span id="saveTxt">已自动保存</span></div>
+    <button class="btn" id="btnSync" title="重新加载本地 token-usage-data.js 并关联到当前数据">🔄 同步 Token</button>
+    <button class="btn primary" id="btnAppend" hidden>➕ 追加数据</button>
+    <button class="btn" id="btnSnap" hidden>💾 手动快照</button>
+    <button class="btn" id="btnHist" hidden>📂 历史</button>
+    <button class="btn" id="btnWipe" hidden>🗑 清空本地</button>
+    <button class="btn" id="btnPrint" hidden>🖨 打印 / PDF</button>
+    <button class="btn" id="btnMd" hidden>⬇ Markdown</button>
+    <button class="btn" id="btnCsv" hidden>⬇ CSV</button>
+    <button class="btn" id="btnReset" hidden>🗑 清空重来</button>
+  </div>
+</div>
+
+<div class="wrap">
+  <!-- ============ 上传 ============ -->
+  <section class="uploader" id="uploader">
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" hidden>
+    <div class="drop" id="drop">
+      <div class="ico">📥</div>
+      <h2>拖入 Excel 文件，或点击选择</h2>
+      <p>支持 .xlsx / .xls / .csv，自动识别「积分消耗 / 模型 / 客户端 / 时间」列</p>
+      <div class="hint">按 RequestID 去重合并，多次导入可累积；文件仅在浏览器本地解析</div>
+    </div>
+  </section>
+
+  <!-- 恢复 / 合并提示条 -->
+  <div class="banner" id="banner" hidden></div>
+  <div class="merge-info" id="mergeInfo"></div>
+
+  <!-- ============ 看板 ============ -->
+  <main id="dash" hidden>
+
+    <section class="filters no-print">
+      <div class="fgroup">
+        <label>日期</label>
+        <input type="date" id="dateFrom">
+        <span style="color:var(--muted)">~</span>
+        <input type="date" id="dateTo">
+        <button class="btn" id="qToday" style="padding:5px 10px;font-size:12px">今日</button>
+        <button class="btn" id="q7" style="padding:5px 10px;font-size:12px">近7日</button>
+        <button class="btn" id="qAll" style="padding:5px 10px;font-size:12px">全部</button>
+      </div>
+      <div class="fgroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
+      <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
+      <div class="statline" id="statLine"></div>
+    </section>
+
+    <section class="kpis" id="kpis"></section>
+
+    <section class="grid">
+      <div class="card c4">
+        <h3><span class="dot"></span>模型消耗占比</h3>
+        <div class="chart-box"><canvas id="cModel"></canvas></div>
+      </div>
+      <div class="card c4">
+        <h3><span class="dot"></span>客户端消耗占比</h3>
+        <div class="chart-box"><canvas id="cClient"></canvas></div>
+      </div>
+      <div class="card c4">
+        <h3><span class="dot"></span>分时消耗分布 <span class="tag">0–23 时</span></h3>
+        <div class="chart-box"><canvas id="cHour"></canvas></div>
+      </div>
+
+      <div class="card c12">
+        <h3>
+          <span class="dot"></span>每日日历热力图
+          <span class="tag">行=星期 · 列=周 · 悬停查看明细</span>
+        </h3>
+        <div class="cal-grid" id="calGrid"></div>
+      </div>
+
+      <div class="card c12">
+        <h3><span class="dot"></span>每日趋势 <span class="tag">柱=积分 · 线=请求数</span></h3>
+        <div class="chart-box tall"><canvas id="cDaily"></canvas></div>
+      </div>
+
+      <div class="card c12" id="tokenChartCard" hidden>
+        <h3><span class="dot"></span>每日 Token 与积分 <span class="tag">柱=积分 · 线=Token</span></h3>
+        <div class="chart-box tall"><canvas id="cTokenDaily"></canvas></div>
+      </div>
+
+      <div class="card c7" id="tokenTopCard" hidden>
+        <h3><span class="dot"></span>Token 消耗 Top 10 回合 <span class="tag">按回合汇总</span></h3>
+        <div class="tbl-scroll"><table class="tbl" id="tblTokTop"></table></div>
+      </div>
+
+      <div class="card c5" id="toolCard" hidden>
+        <h3><span class="dot"></span>工具 Token 消耗 <span class="tag">区间内</span></h3>
+        <div class="tbl-scroll"><table class="tbl" id="tblTool"></table></div>
+      </div>
+
+      <div class="card c12">
+        <h3><span class="dot"></span>各模型每日消耗 <span class="tag">堆叠</span></h3>
+        <div class="chart-box tall"><canvas id="cStack"></canvas></div>
+      </div>
+
+      <div class="card c12">
+        <h3><span class="dot"></span>模型 × 时段 热力图</h3>
+        <div id="heatWrap"></div>
+      </div>
+
+      <div class="card c7">
+        <h3><span class="dot"></span>Top 10 高消耗请求</h3>
+        <div class="tbl-scroll"><table class="tbl" id="tblTop"></table></div>
+      </div>
+
+      <div class="card c5">
+        <h3><span class="dot"></span>模型明细</h3>
+        <div class="tbl-scroll"><table class="tbl" id="tblModel"></table></div>
+      </div>
+
+      <div class="card c5">
+        <h3><span class="dot"></span>客户端明细</h3>
+        <table class="tbl" id="tblClient"></table>
+      </div>
+
+      <div class="card c7">
+        <h3><span class="dot"></span>每日汇总</h3>
+        <div class="tbl-scroll"><table class="tbl" id="tblDay"></table></div>
+      </div>
+
+      <div class="card c12">
+        <h3><span class="dot"></span>📝 分析报告 <span class="tag">自动生成</span></h3>
+        <div class="report" id="report"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="modalRoot"></div>
+
+<script>
+/* =========================================================
+ *  0. 基础工具
+ * =======================================================*/
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt2 = n => (Math.round(n*100)/100).toLocaleString('zh-CN',
+  {minimumFractionDigits:2, maximumFractionDigits:2});
+const fmt0 = n => Math.round(n).toLocaleString('zh-CN');
+/** token 数量统一按 K / M 显示：量级普遍到亿，一长串数字既难读也容易数错位 */
+const fmtTok = n => {
+  const v = Number(n) || 0;
+  if(Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1).replace(/\.0$/, '') + ' M';
+  if(Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1).replace(/\.0$/, '') + ' K';
+  return String(Math.round(v));
+};
+const pct = (v,t) => t>0 ? (v/t*100).toFixed(1)+'%' : '0%';
+const pad = n => String(n).padStart(2,'0');
+const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const parseDs = s => new Date(s.replace(/-/g,'/'));
+const PALETTE = ['#4f6ef7','#7c5cff','#12b886','#f59f00','#f0475f','#3bb2e8',
+                 '#9b8cff','#5ad1a0','#ff8a65','#26c6da','#ab47bc','#8d9bb5'];
+
+function parseTime(v){
+  if(v == null || v === '') return null;
+  if(v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  if(typeof v === 'number' && v > 20000 && v < 80000){
+    const d = XLSX.SSF.parse_date_code(v);
+    if(d) return new Date(d.y, d.m-1, d.d, d.H||0, d.M||0, d.S||0);
+  }
+  const s = String(v).trim();
+  const m = s.match(/(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  if(m) return new Date(+m[1], +m[2]-1, +m[3], +(m[4]||0), +(m[5]||0), +(m[6]||0));
+  const d = new Date(s.replace(/-/g,'/'));
+  return isNaN(d.getTime()) ? null : d;
+}
+function toNum(v){
+  if(v == null || v === '') return 0;
+  if(typeof v === 'number') return isFinite(v) ? v : 0;
+  const n = parseFloat(String(v).replace(/[,\s￥$]/g,''));
+  return isFinite(n) ? n : 0;
+}
+function download(name, text, mime='text/plain'){
+  const blob = new Blob([text], {type: mime+';charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
+}
+function timeAgo(ts){
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if(s < 60)    return '刚刚';
+  if(s < 3600)  return Math.floor(s/60) + ' 分钟前';
+  if(s < 86400) return Math.floor(s/3600) + ' 小时前';
+  return Math.floor(s/86400) + ' 天前';
+}
+function toast(msg){
+  let t = document.getElementById('toast');
+  if(!t){
+    t = document.createElement('div');
+    t.id = 'toast';
+    t.style.cssText = 'position:fixed;left:50%;bottom:32px;transform:translateX(-50%);'
+      + 'background:#1f2b45;color:#fff;padding:10px 20px;border-radius:10px;font-size:13px;'
+      + 'z-index:999;box-shadow:0 8px 24px rgba(20,28,45,.3);opacity:0;'
+      + 'transition:.22s;pointer-events:none;white-space:nowrap';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  requestAnimationFrame(() => { t.style.opacity = '1'; t.style.bottom = '40px'; });
+  clearTimeout(t._tm);
+  t._tm = setTimeout(() => { t.style.opacity = '0'; t.style.bottom = '32px'; }, 1800);
+}
+
+/* =========================================================
+ *  1. Excel 解析
+ * =======================================================*/
+const ALIAS = {
+  id:     ['requestid','request_id','请求id','id','请求标识'],
+  points: ['积分消耗','积分','消耗','points','cost','credits','费用'],
+  model:  ['模型','model','模型名称'],
+  client: ['客户端','client','来源','渠道','端'],
+  time:   ['时间','time','datetime','日期','创建时间','发生时间']
+};
+const norm = s => String(s ?? '').trim().toLowerCase().replace(/[\s_\-]/g,'');
+
+function findHeaderRow(rows){
+  for(let i=0; i<Math.min(rows.length, 15); i++){
+    const cells = (rows[i]||[]).map(norm);
+    const filled = cells.filter(Boolean).length;
+    if(filled < 2) continue;
+    const hit = k => cells.some(c => ALIAS[k].some(a => norm(a) === c));
+    if((hit('points') && hit('model')) || (hit('points') && hit('time')) ||
+       (hit('model')  && hit('time'))) return i;
+  }
+  return 0;
+}
+
+function parseSheetRows(rows){
+  if(!rows || !rows.length) return [];
+  const hIdx = findHeaderRow(rows);
+  const header = (rows[hIdx]||[]).map(norm);
+  const col = {};
+  for(const key of Object.keys(ALIAS)){
+    col[key] = header.findIndex(h => ALIAS[key].some(a => norm(a) === h));
+  }
+  if(col.points < 0) return [];
+
+  const out = [];
+  for(let i = hIdx+1; i < rows.length; i++){
+    const r = rows[i];
+    if(!r || !r.length) continue;
+    const time = col.time >= 0 ? parseTime(r[col.time]) : null;
+    if(!time) continue;
+    const points = col.points >= 0 ? toNum(r[col.points]) : 0;
+    const model  = col.model  >= 0 ? String(r[col.model]  ?? '').trim() : '';
+    const client = col.client >= 0 ? String(r[col.client] ?? '').trim() : '';
+    const id     = col.id     >= 0 ? String(r[col.id]     ?? '').trim() : '';
+    if(!id && !model && !client && points === 0 && !time) continue;
+    out.push({
+      id: id || '-', points,
+      model:  model  || '未知模型',
+      client: client || '未知客户端',
+      time, date: fmtDate(time), hour: time.getHours(), min: time.getMinutes()
+    });
+  }
+  return out;
+}
+
+function readWorkbook(wb){
+  const names = wb.SheetNames || [];
+  const preferred = names.find(n => /usage/i.test(n));
+  const order = preferred ? [preferred, ...names.filter(n => n !== preferred)] : names;
+  for(const name of order){
+    const ws = wb.Sheets[name];
+    if(!ws) continue;
+    const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null, blankrows:false});
+    const parsed = parseSheetRows(rows);
+    if(parsed.length) return {rows: parsed, sheet: name};
+  }
+  return {rows: [], sheet: ''};
+}
+
+/* =========================================================
+ *  1.5 ★ 按 RequestID 合并去重
+ * =======================================================*/
+function mergeByRequestId(oldRows, newRows){
+  const map = new Map();     // RequestID -> 记录
+  const noId = [];           // 无 RequestID 的记录，全部保留
+
+  for(const r of oldRows){
+    const key = (r.id && r.id !== '-') ? r.id : null;
+    if(key) map.set(key, r);
+    else noId.push(r);
+  }
+
+  let added = 0, updated = 0, duplicate = 0;
+  for(const r of newRows){
+    const key = (r.id && r.id !== '-') ? r.id : null;
+    if(key){
+      if(map.has(key)){
+        const old = map.get(key);
+        // 内容完全相同视为重复，避免 updated 虚高
+        if(old.points === r.points && old.model === r.model &&
+           old.client === r.client && old.time.getTime() === r.time.getTime()){
+          duplicate++;
+        }else{
+          updated++;
+        }
+        map.set(key, r);
+      }else{
+        added++;
+        map.set(key, r);
+      }
+    }else{
+      noId.push(r);
+      added++;
+    }
+  }
+
+  return {
+    rows: [...map.values(), ...noId],
+    added, updated, duplicate,
+    total: map.size + noId.length
+  };
+}
+
+/* =========================================================
+ *  2. 状态
+ * =======================================================*/
+const state = {
+  all: [], fileName: '', sheetName: '',
+  filters: { from:'', to:'', models:new Set(), clients:new Set() },
+  charts: {},
+  tokenLoaded: false,   // token-usage-data.js 是否成功加载
+  tokenMatch: null      // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
+};
+
+/* =========================================================
+ *  3. 聚合
+ * =======================================================*/
+function agg(list, keyFn){
+  const m = new Map();
+  for(const x of list){
+    const k = keyFn(x);
+    let o = m.get(k);
+    if(!o){ o = {key:k, sum:0, count:0, max:0, tk:0, tkIn:0, tkOut:0, tkCnt:0}; m.set(k, o); }
+    o.sum += x.points; o.count++;
+    if(x.points > o.max) o.max = x.points;
+    if(x.token){                       // 已关联 token 的行才计入
+      o.tk    += x.token.tot;
+      o.tkIn  += x.token.in;
+      o.tkOut += x.token.out;
+      o.tkCnt += 1;
+    }
+  }
+  return [...m.values()].sort((a,b) => b.sum - a.sum);
+}
+
+function getFiltered(){
+  const f = state.filters;
+  return state.all.filter(x => {
+    if(f.from && x.date < f.from) return false;
+    if(f.to   && x.date > f.to)   return false;
+    if(f.models.size  && !f.models.has(x.model))   return false;
+    if(f.clients.size && !f.clients.has(x.client)) return false;
+    return true;
+  });
+}
+
+function computeStats(d){
+  const total = d.reduce((s,x) => s + x.points, 0);
+  const count = d.length;
+  const byModel  = agg(d, x => x.model);
+  const byClient = agg(d, x => x.client);
+  const byDate   = agg(d, x => x.date);
+  const byHour   = agg(d, x => x.hour);
+  const top      = [...d].sort((a,b) => b.points - a.points).slice(0, 10);
+  const zeroCnt  = d.filter(x => x.points === 0).length;
+  byDate.sort((a,b) => a.key.localeCompare(b.key));
+  const dates = byDate.map(x => x.key);
+  const hourArr = new Array(24).fill(0);
+  for(const h of byHour) hourArr[h.key] = h.sum;
+  const peakHour = byHour[0] || {key:0, sum:0};
+  const peakDay  = [...byDate].sort((a,b) => b.sum - a.sum)[0] || {key:'-', sum:0};
+  const top10Sum = top.reduce((s,x) => s + x.points, 0);
+  const maxReq   = top[0] || null;
+
+  // ---- Token 关联：只统计已匹配上的行 ----
+  const tkRows   = d.filter(x => x.token);
+  const tokenReq = tkRows.reduce((a,x) => a + x.token.n, 0);
+  const tokenIn  = tkRows.reduce((a,x) => a + x.token.in, 0);
+  const tokenOut = tkRows.reduce((a,x) => a + x.token.out, 0);
+  const tokenCr  = tkRows.reduce((a,x) => a + x.token.cr, 0);
+  const tokenCc  = tkRows.reduce((a,x) => a + x.token.cc, 0);
+  const tokenTot = tkRows.reduce((a,x) => a + x.token.tot, 0);
+  const tokenPts = tkRows.reduce((a,x) => a + x.points, 0);
+  // 免费额度：0 积分但确实消耗了 token 的记录（如 hy3、hy4-preview 这类免费模型）
+  const freeRows  = tkRows.filter(x => x.points === 0);
+  const freeToken = freeRows.reduce((a,x) => a + x.token.tot, 0);
+
+  // ---- 工具维度 ----
+  // 步骤明细是 [时间, 工具名, input, output, cacheRead]，Σ(input+output) 正好等于
+  // 该回合的 token 总量，是它的构成拆解，不是额外增量。
+  const toolMap = new Map();
+  let toolSteps = 0;
+  for(const x of tkRows){
+    const det = x.token.d;
+    if(!det) continue;
+    for(const st of det){
+      const k = st[1] || '(无工具)';
+      let o = toolMap.get(k);
+      if(!o){ o = {key:k, tk:0, steps:0}; toolMap.set(k, o); }
+      o.tk += (st[2] || 0) + (st[3] || 0);
+      o.steps++;
+      toolSteps++;
+    }
+  }
+  const byTool = [...toolMap.values()].sort((a,b) => b.tk - a.tk);
+
+  // ---- 最烧 token 的回合 ----
+  const topToken = [...tkRows].sort((a,b) => b.token.tot - a.token.tot).slice(0, 10);
+
+  return {
+    total, count, byModel, byClient, byDate, byHour, hourArr,
+    top, zeroCnt, dates, peakHour, peakDay, top10Sum, maxReq,
+    days: byDate.length,
+    avg: count ? total / count : 0,
+    dailyAvg: byDate.length ? total / byDate.length : 0,
+    max: maxReq ? maxReq.points : 0,
+    from: dates[0] || '-', to: dates[dates.length-1] || '-',
+    // Token 指标（注意 cr 是 in 的子集，两者不可相加）
+    tkRows: tkRows.length, hasToken: tkRows.length > 0,
+    tokenReq, tokenIn, tokenOut, tokenCr, tokenCc, tokenTot, tokenPts,
+    freeRows: freeRows.length, freeToken,
+    byTool, topToken, toolSteps, hasDetail: toolSteps > 0,
+    toolKinds: byTool.length,
+    tokenPerPoint:   tokenPts > 0 ? tokenTot / tokenPts : 0,        // 每 1 积分产出多少 token
+    pointsPerMToken: tokenTot > 0 ? tokenPts / tokenTot * 1e6  : 0, // 每 M token 花多少积分
+    cacheHitRate:    tokenIn  > 0 ? tokenCr / tokenIn : 0,
+    stepsPerTurn:    tkRows.length ? tokenReq / tkRows.length : 0
+  };
+}
+
+/* =========================================================
+ *  4. KPI
+ * =======================================================*/
+function renderKPIs(d){
+  const s = computeStats(d);
+  const mainModel = s.byModel[0];
+  const mainClient = s.byClient[0];
+  const items = [
+    {label:'总积分消耗', value: fmt2(s.total), sub:`${s.count} 次请求`},
+    {label:'日均消耗',   value: fmt2(s.dailyAvg), sub:`覆盖 <b>${s.days}</b> 天`},
+    {label:'平均单次',   value: fmt2(s.avg), sub:`中位区间 0.01 ~ 1 积分`},
+    {label:'单次最高',   value: s.max ? fmt2(s.max) : '0',
+     sub: s.maxReq ? `${esc(s.maxReq.model)} · ${s.maxReq.time.getHours()}:${pad(s.maxReq.time.getMinutes())}` : '-'},
+    {label:'主力模型', value: mainModel ? esc(mainModel.key) : '-', small:true,
+     sub: mainModel ? `占 <b>${pct(mainModel.sum, s.total)}</b> · ${mainModel.count} 次` : '-'},
+    {label:'主力客户端', value: mainClient ? esc(mainClient.key) : '-', small:true,
+     sub: mainClient ? `占 <b>${pct(mainClient.sum, s.total)}</b> · ${mainClient.count} 次` : '-'}
+  ];
+
+  // ---- Token 关联卡片：无数据时优雅降级，不留 0 / NaN ----
+  if(s.hasToken){
+    items.push(
+      {label:'Token 总量', value: fmtTok(s.tokenTot),
+       sub:`输入 ${fmtTok(s.tokenIn)} · 输出 ${fmtTok(s.tokenOut)}`},
+      {label:'缓存命中率', value:`${(s.cacheHitRate*100).toFixed(1)}%`,
+       sub:`缓存读 ${fmtTok(s.tokenCr)} / 输入 ${fmtTok(s.tokenIn)}`},
+      {label:'每积分 Token', value: fmtTok(s.tokenPerPoint), small:true,
+       sub:`每 M token <b>${fmt2(s.pointsPerMToken)}</b> 积分`},
+      {label:'免费模型 Token', value: fmtTok(s.freeToken), small:true,
+       sub:`${fmt0(s.freeRows)} 条 0 积分记录 · 占总 Token ${pct(s.freeToken, s.tokenTot)}`},
+      {label:'积分覆盖', value: pct(s.tokenPts, s.total),
+       sub:`${s.tkRows} / ${s.count} 条已关联 · ${fmt0(s.tokenReq)} 次 API 请求`}
+    );
+  }else if(state.tokenLoaded){
+    items.push({label:'Token 数据', value:'无匹配', small:true,
+      sub:'已加载 token-usage-data.js，但没有 RequestID 能对上'});
+  }else{
+    items.push({label:'Token 数据', value:'未同步', small:true,
+      sub:'运行「同步Token.bat」，或点顶栏「🔄 同步 Token」'});
+  }
+
+  $('kpis').innerHTML = items.map(i => `
+    <div class="kpi">
+      <div class="kpi-label">${i.label}</div>
+      <div class="kpi-value${i.small?' small':''}">${i.value}</div>
+      <div class="kpi-sub">${i.sub}</div>
+    </div>`).join('');
+}
+
+/* =========================================================
+ *  5. 图表
+ * =======================================================*/
+Chart.defaults.font.family = '-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
+Chart.defaults.font.size = 11.5;
+Chart.defaults.color = '#6b7891';
+
+function upsert(id, config){
+  if(state.charts[id]) state.charts[id].destroy();
+  const el = $(id);
+  if(!el) return;
+  state.charts[id] = new Chart(el, config);
+}
+const doughnutOpts = {
+  responsive:true, maintainAspectRatio:false, cutout:'62%',
+  plugins:{
+    legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10, padding:10,
+      usePointStyle:true, pointStyle:'circle'}},
+    tooltip:{callbacks:{label(ctx){
+      const total = ctx.dataset.data.reduce((a,b)=>a+b,0);
+      return ` ${ctx.label}：${fmt2(ctx.parsed)} 积分 (${pct(ctx.parsed,total)})`;
+    }}}
+  }
+};
+
+function renderCharts(d){
+  const s = computeStats(d);
+
+  upsert('cModel', {
+    type:'doughnut',
+    data:{
+      labels: s.byModel.map(x => x.key),
+      datasets:[{data: s.byModel.map(x => Math.round(x.sum*100)/100),
+        backgroundColor: s.byModel.map((_,i) => PALETTE[i % PALETTE.length]),
+        borderWidth:2, borderColor:'#fff', hoverOffset:6}]
+    },
+    options: doughnutOpts
+  });
+
+  upsert('cClient', {
+    type:'doughnut',
+    data:{
+      labels: s.byClient.map(x => x.key),
+      datasets:[{data: s.byClient.map(x => Math.round(x.sum*100)/100),
+        backgroundColor: s.byClient.map((_,i) => PALETTE[(i+3) % PALETTE.length]),
+        borderWidth:2, borderColor:'#fff', hoverOffset:6}]
+    },
+    options: doughnutOpts
+  });
+
+  upsert('cHour', {
+    type:'bar',
+    data:{
+      labels: s.hourArr.map((_,i) => pad(i)),
+      datasets:[{
+        label:'积分', data: s.hourArr.map(v => Math.round(v*100)/100),
+        backgroundColor: s.hourArr.map(v => {
+          const mx = Math.max(...s.hourArr, 1);
+          const t = v / mx;
+          return t > 0.75 ? '#4f6ef7' : t > 0.4 ? '#7c8ffa' : t > 0.1 ? '#b3c0fd' : '#e2e8fb';
+        }),
+        borderRadius:4, barPercentage:0.82
+      }]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:false},
+        tooltip:{callbacks:{label:c => ` ${fmt2(c.parsed.y)} 积分`}}},
+      scales:{
+        x:{grid:{display:false}, ticks:{font:{size:10}}},
+        y:{beginAtZero:true, grid:{color:'#f0f3fa'}, ticks:{callback:v => fmt0(v)}}
+      }
+    }
+  });
+
+  const dayLabels = s.byDate.map(x => x.key);
+  upsert('cDaily', {
+    type:'bar',
+    data:{
+      labels: dayLabels,
+      datasets:[
+        {type:'bar', label:'积分消耗', data: s.byDate.map(x => Math.round(x.sum*100)/100),
+         yAxisID:'y', backgroundColor:'rgba(79,110,247,.72)', borderRadius:5,
+         barPercentage:.6, order:2},
+        {type:'line', label:'请求数', data: s.byDate.map(x => x.count),
+         yAxisID:'y1', borderColor:'#12b886', backgroundColor:'#12b886',
+         borderWidth:2, tension:.35, pointRadius:3, pointHoverRadius:5, order:1}
+      ]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{mode:'index', intersect:false},
+      plugins:{
+        legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
+          usePointStyle:true, pointStyle:'circle', padding:12}},
+        tooltip:{callbacks:{label(c){
+          return c.dataset.type === 'line'
+            ? ` 请求数：${c.parsed.y} 次`
+            : ` 积分：${fmt2(c.parsed.y)}`;
+        }}}
+      },
+      scales:{
+        x:{grid:{display:false}, ticks:{maxTicksLimit:20, autoSkip:true, maxRotation:0}},
+        y:{beginAtZero:true, position:'left', grid:{color:'#f0f3fa'},
+           title:{display:true, text:'积分', font:{size:10.5}}, ticks:{callback:v => fmt0(v)}},
+        y1:{beginAtZero:true, position:'right', grid:{display:false},
+            title:{display:true, text:'请求数', font:{size:10.5}}, ticks:{precision:0}}
+      }
+    }
+  });
+
+  const topModels = s.byModel.slice(0, 6).map(x => x.key);
+  const datasets = topModels.map((m, i) => ({
+    label: m,
+    data: s.byDate.map(day => {
+      const rows = d.filter(x => x.date === day.key && x.model === m);
+      return Math.round(rows.reduce((a,b) => a + b.points, 0) * 100) / 100;
+    }),
+    backgroundColor: PALETTE[i % PALETTE.length],
+    borderRadius:3, barPercentage:.72
+  }));
+  const others = s.byModel.slice(6);
+  if(others.length){
+    const names = new Set(others.map(x => x.key));
+    datasets.push({
+      label: `其他 (${others.length})`,
+      data: s.byDate.map(day => {
+        const rows = d.filter(x => x.date === day.key && names.has(x.model));
+        return Math.round(rows.reduce((a,b) => a + b.points, 0) * 100) / 100;
+      }),
+      backgroundColor:'#c8d1e2', borderRadius:3, barPercentage:.72
+    });
+  }
+  upsert('cStack', {
+    type:'bar',
+    data:{ labels: dayLabels, datasets },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{mode:'index', intersect:false},
+      plugins:{
+        legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
+          usePointStyle:true, pointStyle:'circle', padding:10}},
+        tooltip:{filter:it => it.parsed.y > 0,
+          callbacks:{label:c => ` ${c.dataset.label}：${fmt2(c.parsed.y)}`}}
+      },
+      scales:{
+        x:{stacked:true, grid:{display:false},
+           ticks:{maxTicksLimit:20, autoSkip:true, maxRotation:0}},
+        y:{stacked:true, beginAtZero:true, grid:{color:'#f0f3fa'},
+           ticks:{callback:v => fmt0(v)}}
+      }
+    }
+  });
+
+  /* ---- 每日 Token 与积分：柱=积分（左轴）· 线=Token（右轴）---- */
+  const tokCard = $('tokenChartCard');
+  if(tokCard) tokCard.hidden = !s.hasToken;
+  if(s.hasToken){
+    // 注意顺序：必须先把容器取消 hidden，再 upsert。
+    // Chart.js 在隐藏容器上初始化会量到 0 尺寸，图会画不出来。
+    upsert('cTokenDaily', {
+      type:'bar',
+      data:{
+        labels: dayLabels,
+        datasets:[
+          {type:'bar', label:'积分', data: s.byDate.map(x => Math.round(x.sum*100)/100),
+           yAxisID:'y', backgroundColor:'rgba(79,110,247,.72)', borderRadius:5,
+           barPercentage:.6, order:2},
+          {type:'line', label:'Token', data: s.byDate.map(x => x.tk),
+           yAxisID:'y1', borderColor:'#f59f00', backgroundColor:'rgba(245,159,0,.14)',
+           fill:true, borderWidth:2, tension:.35, pointRadius:3, pointHoverRadius:5, order:1}
+        ]
+      },
+      options:{
+        responsive:true, maintainAspectRatio:false,
+        interaction:{mode:'index', intersect:false},
+        plugins:{
+          legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
+            usePointStyle:true, pointStyle:'circle', padding:12}},
+          tooltip:{callbacks:{label(c){
+            return c.dataset.type === 'line'
+              ? ` Token：${fmt0(c.parsed.y)}`
+              : ` 积分：${fmt2(c.parsed.y)}`;
+          }}}
+        },
+        scales:{
+          x:{grid:{display:false}, ticks:{maxTicksLimit:20, autoSkip:true, maxRotation:0}},
+          y:{beginAtZero:true, position:'left', grid:{color:'#f0f3fa'},
+             title:{display:true, text:'积分', font:{size:10.5}}, ticks:{callback:v => fmt0(v)}},
+          y1:{beginAtZero:true, position:'right', grid:{display:false},
+              title:{display:true, text:'Token', font:{size:10.5}}, ticks:{callback:v => fmt0(v)}}
+        }
+      }
+    });
+  }
+}
+
+/* =========================================================
+ *  6. 模型 × 时段 热力图
+ * =======================================================*/
+function renderHeatmap(d){
+  const s = computeStats(d);
+  const models = s.byModel.slice(0, 8).map(x => x.key);
+  if(!models.length){ $('heatWrap').innerHTML = '<p style="color:#93a0b8">无数据</p>'; return; }
+
+  const mat = new Map();
+  for(const m of models) mat.set(m, new Array(24).fill(0));
+  for(const x of d){
+    if(!mat.has(x.model)) continue;
+    mat.get(x.model)[x.hour] += x.points;
+  }
+  let max = 0;
+  for(const arr of mat.values()) for(const v of arr) if(v > max) max = v;
+  if(max === 0) max = 1;
+
+  const hours = Array.from({length:24}, (_,i) => i);
+  let html = '<div class="heat-scroll"><table class="heat"><thead><tr><th></th>';
+  html += hours.map(h => `<th>${pad(h)}</th>`).join('');
+  html += '</tr></thead><tbody>';
+
+  for(const m of models){
+    const arr = mat.get(m);
+    html += `<tr><td class="mname" title="${esc(m)}">${esc(m)}</td>`;
+    for(const h of hours){
+      const v = arr[h];
+      if(v <= 0){
+        html += '<td class="cell empty">·</td>';
+      } else {
+        const t = Math.pow(v / max, 0.62);
+        const alpha = 0.12 + 0.86 * t;
+        html += `<td class="cell" style="background:rgba(79,110,247,${alpha.toFixed(3)})"
+          title="${esc(m)} · ${pad(h)}:00 · ${fmt2(v)} 积分">${
+          v >= 10 ? fmt0(v) : (Math.round(v*10)/10)
+        }</td>`;
+      }
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+  html += `<div class="legend-row">强度
+    <span class="legend-scale">${
+      [0.12,0.3,0.5,0.72,0.95].map(a => `<i style="background:rgba(79,110,247,${a})"></i>`).join('')
+    }</span>
+    <span>低 → 高 &nbsp;·&nbsp; 峰值单元格 <b style="color:#182135">${fmt2(max)}</b> 积分</span>
+  </div>`;
+
+  $('heatWrap').innerHTML = html;
+}
+
+/* =========================================================
+ *  7. 日期日历热力图
+ * =======================================================*/
+function buildCalendar(d){
+  const map = new Map();
+  for(const x of d){
+    let o = map.get(x.date);
+    if(!o){ o = {date:x.date, points:0, count:0}; map.set(x.date, o); }
+    o.points += x.points;
+    o.count  += 1;
+  }
+  const keys = [...map.keys()].sort();
+  if(!keys.length) return null;
+
+  const first = parseDs(keys[0]);
+  const last  = parseDs(keys[keys.length-1]);
+
+  const start = new Date(first);
+  const dow = (start.getDay() + 6) % 7;
+  start.setDate(start.getDate() - dow);
+
+  const end = new Date(last);
+  const edow = (end.getDay() + 6) % 7;
+  end.setDate(end.getDate() + (6 - edow));
+
+  const weeks = [];
+  const cur = new Date(start);
+  while(cur <= end){
+    const week = [];
+    for(let i = 0; i < 7; i++){
+      const ds = fmtDate(cur);
+      const inRange = ds >= keys[0] && ds <= keys[keys.length-1];
+      const o = map.get(ds);
+      week.push({
+        date: ds, inRange,
+        points: o ? o.points : 0,
+        count:  o ? o.count  : 0
+      });
+      cur.setDate(cur.getDate() + 1);
+    }
+    weeks.push(week);
+  }
+
+  const months = [];
+  let lastM = -1;
+  weeks.forEach((w, i) => {
+    const m = parseDs(w[0].date).getMonth();
+    if(m !== lastM){ months.push({col:i, text:(m+1)+'月'}); lastM = m; }
+  });
+
+  return { weeks, months, from: keys[0], to: keys[keys.length-1] };
+}
+
+function renderCalendarUnit(cal, mode, color, title, unitLabel){
+  const [r,g,b] = color;
+
+  let max = 0, total = 0;
+  for(const w of cal.weeks) for(const c of w){
+    if(!c.inRange) continue;
+    const v = c[mode];
+    if(v > max) max = v;
+    total += v;
+  }
+  if(max === 0) max = 1;
+
+  const emptyCol = `rgba(${r},${g},${b},0.06)`;
+  const colorOf = v => {
+    if(v <= 0) return emptyCol;
+    const t = Math.pow(v / max, 0.6);
+    const a = 0.16 + 0.84 * t;
+    return `rgba(${r},${g},${b},${a.toFixed(3)})`;
+  };
+
+  const monthHead = new Array(cal.weeks.length).fill('');
+  for(const m of cal.months) monthHead[m.col] = m.text;
+
+  const weekdays = ['一','二','三','四','五','六','日'];
+
+  let html = '<div class="cal-scroll"><table class="cal">';
+  html += '<thead><tr><th class="rowlbl"></th>';
+  html += monthHead.map(t => `<th class="month">${t}</th>`).join('');
+  html += '</tr></thead><tbody>';
+
+  for(let r = 0; r < 7; r++){
+    html += `<tr><th class="rowlbl">${weekdays[r]}</th>`;
+    for(let c = 0; c < cal.weeks.length; c++){
+      const cell = cal.weeks[c][r];
+      if(!cell.inRange){
+        html += '<td class="cal-cell out"></td>';
+        continue;
+      }
+      const v = cell[mode];
+      const tip = `${cell.date}\n积分：${fmt2(cell.points)}\n请求：${cell.count} 次`;
+      html += `<td class="cal-cell has"
+        style="background:${colorOf(v)}"
+        title="${tip}"></td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+
+  const steps = [0, 0.25, 0.5, 0.75, 1];
+  html += `<div class="cal-legend">
+    <span>少</span>
+    <span class="scale">${
+      steps.map(t => `<i style="background:${
+        t === 0 ? emptyCol : `rgba(${r},${g},${b},${(0.16 + 0.84*Math.pow(t,0.6)).toFixed(3)})`
+      }"></i>`).join('')
+    }</span>
+    <span>多</span>
+    <span style="margin-left:10px">峰值 <b style="color:#182135">${
+      mode === 'points' ? fmt2(max) + ' 积分' : max + ' 次'
+    }</b></span>
+    <span style="margin-left:auto">合计 <b style="color:#182135">${
+      mode === 'points' ? fmt2(total) + ' 积分' : total + ' 次'
+    }</b></span>
+  </div>`;
+
+  return `
+    <div class="cal-unit">
+      <div class="cal-unit-title">
+        <span class="swatch" style="background:rgba(${r},${g},${b},0.85)"></span>
+        ${title}
+        <span class="total">${unitLabel}</span>
+      </div>
+      ${html}
+    </div>`;
+}
+
+function renderDateHeatmap(d){
+  const cal = buildCalendar(d);
+  if(!cal){
+    $('calGrid').innerHTML = '<p style="color:#93a0b8">当前筛选条件下无数据。</p>';
+    return;
+  }
+  const s = computeStats(d);
+
+  const unitP = renderCalendarUnit(
+    cal, 'points', [79,110,247],
+    `每日积分消耗 <span style="font-weight:500;color:#93a0b8">${cal.from} ~ ${cal.to}</span>`,
+    `共 ${fmt2(s.total)} 积分`
+  );
+  const unitC = renderCalendarUnit(
+    cal, 'count', [18,184,134],
+    `每日请求次数 <span style="font-weight:500;color:#93a0b8">${cal.from} ~ ${cal.to}</span>`,
+    `共 ${s.count} 次`
+  );
+
+  $('calGrid').innerHTML = unitP + unitC;
+}
+
+/* =========================================================
+ *  8. 表格
+ * =======================================================*/
+function renderTables(d){
+  const s = computeStats(d);
+
+  $('tblTop').innerHTML = `
+    <thead><tr>
+      <th style="width:34px">#</th><th>请求 ID</th><th>模型</th>
+      <th>客户端</th><th>时间</th><th class="num">积分</th>
+      <th class="num">Token</th><th class="num">Token/积分</th>
+    </tr></thead>
+    <tbody>${ s.top.map((x,i) => `
+      <tr>
+        <td style="color:#a8b3c8;font-weight:700">${i+1}</td>
+        <td class="mono" title="${esc(x.id)}">${esc(x.id.length > 20 ? x.id.slice(0,18)+'…' : x.id)}</td>
+        <td><span class="pill">${esc(x.model)}</span></td>
+        <td style="color:#6b7891">${esc(x.client)}</td>
+        <td class="mono">${x.date} ${pad(x.hour)}:${pad(x.min)}</td>
+        <td class="num">${fmt2(x.points)}</td>
+        <td class="num">${x.token ? fmtTok(x.token.tot) : '<span style="color:#c8d1e2">—</span>'}</td>
+        <td class="num" style="color:#6b7891">${
+          x.token && x.points > 0 ? fmtTok(x.token.tot / x.points) : '<span style="color:#c8d1e2">—</span>'
+        }</td>
+      </tr>`).join('')
+    }</tbody>`;
+
+  const maxModelSum = s.byModel[0]?.sum || 1;
+  $('tblModel').innerHTML = `
+    <thead><tr>
+      <th>模型</th><th class="num">积分</th><th class="num">Token</th>
+      <th class="num">Token/积分</th><th class="num">占比</th>
+      <th class="num">次数</th><th style="width:70px"></th>
+    </tr></thead>
+    <tbody>${ s.byModel.map((x,i) => `
+      <tr>
+        <td><span class="pill" style="background:${
+          PALETTE[i%PALETTE.length]+'1f'};color:${PALETTE[i%PALETTE.length]}">${esc(x.key)}</span></td>
+        <td class="num">${fmt2(x.sum)}</td>
+        <td class="num">${x.tk ? fmtTok(x.tk) : '<span style="color:#c8d1e2">—</span>'}</td>
+        <td class="num" style="color:#6b7891">${
+          x.tk && x.sum > 0 ? fmtTok(x.tk / x.sum) : '<span style="color:#c8d1e2">—</span>'
+        }</td>
+        <td class="num" style="color:#6b7891">${pct(x.sum, s.total)}</td>
+        <td class="num" style="color:#6b7891">${x.count}</td>
+        <td><div class="bar-mini"><i style="width:${(x.sum/maxModelSum*100).toFixed(1)}%"></i></div></td>
+      </tr>`).join('')
+    }</tbody>`;
+
+  $('tblClient').innerHTML = `
+    <thead><tr>
+      <th>客户端</th><th class="num">积分</th><th class="num">占比</th>
+      <th class="num">次数</th><th class="num">均值</th>
+    </tr></thead>
+    <tbody>${ s.byClient.map((x,i) => `
+      <tr>
+        <td><span class="pill ${['g','p','o','r'][i % 4]}">${esc(x.key)}</span></td>
+        <td class="num">${fmt2(x.sum)}</td>
+        <td class="num" style="color:#6b7891">${pct(x.sum, s.total)}</td>
+        <td class="num" style="color:#6b7891">${x.count}</td>
+        <td class="num" style="color:#6b7891">${fmt2(x.sum/x.count)}</td>
+      </tr>`).join('')
+    }</tbody>`;
+
+  const maxDay = s.peakDay.sum || 1;
+  $('tblDay').innerHTML = `
+    <thead><tr>
+      <th>日期</th><th class="num">积分</th><th class="num">Token</th><th class="num">请求数</th>
+      <th class="num">均值</th><th>主力模型</th><th style="width:90px"></th>
+    </tr></thead>
+    <tbody>${ s.byDate.map(day => {
+      const rows = d.filter(x => x.date === day.key);
+      const mm = agg(rows, x => x.model)[0];
+      return `<tr>
+        <td><b>${day.key}</b></td>
+        <td class="num">${fmt2(day.sum)}</td>
+        <td class="num">${day.tk ? fmtTok(day.tk) : '<span style="color:#c8d1e2">—</span>'}</td>
+        <td class="num" style="color:#6b7891">${day.count}</td>
+        <td class="num" style="color:#6b7891">${fmt2(day.sum/day.count)}</td>
+        <td style="font-size:12px;color:#6b7891">${mm ? esc(mm.key) : '-'}</td>
+        <td><div class="bar-mini"><i style="width:${(day.sum/maxDay*100).toFixed(1)}%"></i></div></td>
+      </tr>`;
+    }).join('') }</tbody>`;
+
+  /* ---- Token 消耗 Top 10 回合 ---- */
+  const tokCard = $('tokenTopCard');
+  if(tokCard) tokCard.hidden = !s.hasToken;
+  if(s.hasToken){
+    $('tblTokTop').innerHTML = `
+      <thead><tr>
+        <th style="width:34px">#</th><th>回合 ID</th><th>时间</th>
+        <th class="num">Token</th><th class="num">步骤</th><th class="num">积分</th><th class="num">时长</th>
+      </tr></thead>
+      <tbody>${ s.topToken.map((x,i) => {
+        const tk = x.token;
+        const dur = (tk.t1 && tk.t0) ? (tk.t1 - tk.t0) / 1000 : 0;
+        return `<tr>
+          <td style="color:#a8b3c8;font-weight:700">${i+1}</td>
+          <td class="mono" title="${esc(x.id)}">${esc(x.id.length > 20 ? x.id.slice(0,18)+'…' : x.id)}</td>
+          <td class="mono">${x.date} ${pad(x.hour)}:${pad(x.min)}</td>
+          <td class="num"><b>${fmtTok(tk.tot)}</b></td>
+          <td class="num" style="color:#6b7891">${tk.n}</td>
+          <td class="num">${fmt2(x.points)}</td>
+          <td class="num" style="color:#6b7891">${
+            dur >= 60 ? (dur/60).toFixed(1) + ' 分' : dur.toFixed(0) + ' 秒'}</td>
+        </tr>`;
+      }).join('') }</tbody>`;
+  }
+
+  /* ---- 工具 Token 消耗 ---- */
+  const toolCard = $('toolCard');
+  if(toolCard) toolCard.hidden = !s.hasDetail;
+  if(s.hasDetail){
+    const maxToolTk = s.byTool[0]?.tk || 1;
+    const show = s.byTool.slice(0, 15);
+    const rest = s.byTool.slice(15);
+    $('tblTool').innerHTML = `
+      <thead><tr>
+        <th>工具</th><th class="num">Token</th><th class="num">占比</th>
+        <th class="num">调用</th><th style="width:56px"></th>
+      </tr></thead>
+      <tbody>${ show.map(t2 => `<tr>
+          <td><span class="pill">${esc(t2.key)}</span></td>
+          <td class="num">${fmtTok(t2.tk)}</td>
+          <td class="num" style="color:#6b7891">${pct(t2.tk, s.tokenTot)}</td>
+          <td class="num" style="color:#6b7891">${t2.steps}</td>
+          <td><div class="bar-mini"><i style="width:${(t2.tk/maxToolTk*100).toFixed(1)}%"></i></div></td>
+        </tr>`).join('')
+      }${ rest.length ? `<tr>
+          <td style="color:#93a0b8">其余 ${rest.length} 个工具</td>
+          <td class="num" style="color:#93a0b8">${fmtTok(rest.reduce((a,b) => a + b.tk, 0))}</td>
+          <td class="num" style="color:#93a0b8">${pct(rest.reduce((a,b) => a + b.tk, 0), s.tokenTot)}</td>
+          <td class="num" style="color:#93a0b8">${rest.reduce((a,b) => a + b.steps, 0)}</td>
+          <td></td>
+        </tr>` : ''
+      }</tbody>`;
+  }
+}
+
+/* =========================================================
+ *  9. 报告
+ * =======================================================*/
+function renderReport(d){
+  const s = computeStats(d);
+  if(!s.count){
+    $('report').innerHTML = '<p style="color:#93a0b8">当前筛选条件下没有数据。</p>';
+    return;
+  }
+  const m1 = s.byModel[0], m2 = s.byModel[1], m3 = s.byModel[2];
+  const c1 = s.byClient[0];
+  const top3ModelSum = s.byModel.slice(0,3).reduce((a,b) => a + b.sum, 0);
+  const peakRange = `${pad(s.peakHour.key)}:00–${pad(s.peakHour.key)}:59`;
+  const concentration = pct(s.top10Sum, s.total);
+  const zeroPct = pct(s.zeroCnt, s.count);
+
+  const sortedHours = [...s.byHour].sort((a,b) => b.sum - a.sum);
+  const peakH = sortedHours[0];
+  const hourSum3 = [peakH.key-1, peakH.key, peakH.key+1]
+    .filter(h => h >= 0 && h < 24).reduce((a,h) => a + s.hourArr[h], 0);
+
+  const calDays = s.byDate.map(x => ({date:x.key, points:x.sum, count:x.count}));
+  const busiestDay = [...calDays].sort((a,b) => b.points - a.points)[0];
+  const busiestByCount = [...calDays].sort((a,b) => b.count - a.count)[0];
+  const quietDay = [...calDays].sort((a,b) => a.points - b.points)[0];
+
+  // Token 关联章节正文：在模板外拼好，避免模板内深层嵌套反引号
+  const keptTurns = (TokenData.get() && TokenData.get().meta && TokenData.get().meta.kept) || 0;
+  let tokenSummary;
+  if(s.hasToken){
+    const lowCover = s.tkRows / Math.max(s.count, 1) < 0.5;
+    tokenSummary = `Token 数据覆盖了 <span class="hl">${pct(s.tokenPts, s.total)}</span> 的积分花销（已关联 <b>${s.tkRows}</b> / ${s.count} 条），`
+      + `累计 Token <b>${fmtTok(s.tokenTot)}</b>（输入 ${fmtTok(s.tokenIn)} / 输出 ${fmtTok(s.tokenOut)}），`
+      + `缓存命中率 <b>${(s.cacheHitRate*100).toFixed(1)}%</b>。`
+      + `平均每 1 积分产出 <b>${fmtTok(s.tokenPerPoint)}</b> token，每个回合平均触发 <b>${s.stepsPerTurn.toFixed(1)}</b> 次 API 请求。`
+      + (s.freeRows > 0 ? `其中 <b>${fmt0(s.freeRows)}</b> 条是 0 积分记录，免费产出 <b>${fmtTok(s.freeToken)}</b> token。` : '')
+      + (s.byTool.length
+          ? `消耗最多的工具是 <b>${esc(s.byTool[0].key)}</b>（${fmtTok(s.byTool[0].tk)}，占 ${pct(s.byTool[0].tk, s.tokenTot)}），`
+            + `前 3 名合计占 ${pct(s.byTool.slice(0,3).reduce((a,b) => a + b.tk, 0), s.tokenTot)}。`
+            + `<br><span style="color:#8b98b3">口径说明：Agent 每次工具调用都要重发全量上下文，所以「工具 Token」`
+            + `是调用该工具的请求所携带的上下文之和，反映的是调用频次与上下文规模，并非工具本身的固有开销。</span>`
+          : '')
+      + (keptTurns ? `另有 <b>${fmt0(keptTurns)}</b> 个回合来自历次同步的历史保留（本地 jsonl 中已不存在，不会被本地清理影响）。` : '')
+      + (lowCover ? `<br><span style="color:#8b98b3">未关联的 ${s.count - s.tkRows} 条记录仅占 ${pct(s.total - s.tokenPts, s.total)} 的积分`
+        + `（多为小额请求）；本机会话记录只保留了部分历史，缺失部分可能由其他环境产生或已被清理，故 Token 指标仅代表已关联样本。</span>` : '');
+  }else{
+    tokenSummary = `<span style="color:#8b98b3">尚未同步 Token 数据。运行「同步Token.bat」或点击顶栏「🔄 同步 Token」，`
+      + `即可把每条积分关联到本地会话记录，得到 Token 用量、缓存命中率、每积分 token 产出等指标。</span>`;
+  }
+
+  const tips = [];
+  if(m1 && m1.sum / s.total > 0.5)
+    tips.push(`<b>${esc(m1.key)}</b> 消耗占比达 <span class="hl">${pct(m1.sum, s.total)}</span>，成本高度集中。建议对超长上下文任务做<b>分段 / 摘要预处理</b>，或对简单问答降级到 flash 级模型。`);
+  if(s.top10Sum / s.total > 0.3)
+    tips.push(`Top 10 请求合计占 <span class="hl">${concentration}</span>，属于典型的长尾集中结构。建议为这几类高频长请求建立 <b>Prompt 缓存</b> 或结果复用机制。`);
+  if(s.max / Math.max(s.avg, 0.0001) > 15)
+    tips.push(`单次最高消耗 <b>${fmt2(s.max)}</b> 是平均值的 <b>${(s.max/s.avg).toFixed(1)} 倍</b>，存在极端长请求。建议对单次请求设置<b>积分上限告警</b>。`);
+  if(s.zeroCnt > 0)
+    tips.push(`存在 <b>${s.zeroCnt}</b> 条 0 积分请求（占 ${zeroPct}）。请确认是<b>未计费通道</b>、试跑模型，还是埋点缺失。`);
+  if(peakH && peakH.sum / s.total > 0.25)
+    tips.push(`消耗集中在 <b>${peakRange}</b>（占 ${pct(peakH.sum, s.total)}）。若需控成本，可对该时段做<b>限流 / 排队</b>或错峰调度。`);
+  if(busiestDay && quietDay && busiestDay.points > 0)
+    tips.push(`日历维度看，<b>${busiestDay.date}</b> 单日积分最高（${fmt2(busiestDay.points)}），而 <b>${quietDay.date}</b> 最低（${fmt2(quietDay.points)}）。日间波动比达 <b>${(busiestDay.points/Math.max(quietDay.points,0.01)).toFixed(1)}×</b>，可考虑把重任务从高峰日错峰到低谷日。`);
+  if(s.byModel.length > 4)
+    tips.push(`当前共使用 <b>${s.byModel.length}</b> 个模型，建议收敛到 2–3 个主力模型，以简化成本归因与缓存策略。`);
+  if(s.hasToken && s.cacheHitRate < 0.5)
+    tips.push(`缓存命中率仅 <b>${(s.cacheHitRate*100).toFixed(1)}%</b>，说明大部分上下文每次都要重新计价。建议把稳定不变的长前缀（系统提示、规范文档等）固定在上下文前部，提升缓存复用。`);
+  if(s.hasToken && s.stepsPerTurn > 10)
+    tips.push(`平均每个回合触发 <b>${s.stepsPerTurn.toFixed(1)}</b> 次 API 请求，回合越长则全量上下文重发次数越多。建议把长链路任务拆成更小的回合。`);
+  if(s.hasDetail && s.byTool[0] && s.byTool[0].tk / Math.max(s.tokenTot, 1) > 0.2)
+    tips.push(`单个工具 <b>${esc(s.byTool[0].key)}</b> 就占了 <span class="hl">${pct(s.byTool[0].tk, s.tokenTot)}</span> 的 Token。建议检查它的调用频率与单次返回量——例如给命令输出加截断、缩小搜索范围，或改用更省的等效操作。`);
+  if(!tips.length)
+    tips.push('整体消耗结构较为均衡，暂无明显异常点，建议保持当前用量监控频率。');
+
+  const topDays = [...s.byDate].sort((a,b) => b.sum - a.sum).slice(0, 3);
+
+  $('report').innerHTML = `
+    <h4>一、总览</h4>
+    <p>统计区间为 <b>${s.from}</b> ~ <b>${s.to}</b>，共 <b>${s.days}</b> 天、<b>${s.count}</b> 次请求，
+    累计消耗 <span class="hl">${fmt2(s.total)} 积分</span>。
+    日均消耗 <b>${fmt2(s.dailyAvg)}</b> 积分，平均单次 <b>${fmt2(s.avg)}</b> 积分，
+    单次最高 <b>${fmt2(s.max)}</b> 积分${
+      s.maxReq ? `（${esc(s.maxReq.model)} · ${s.maxReq.date} ${pad(s.maxReq.time.getHours())}:${pad(s.maxReq.time.getMinutes())}）` : ''
+    }。</p>
+
+    <h4>二、模型结构</h4>
+    <p>${ m1 ? `<b>${esc(m1.key)}</b> 以 <span class="hl">${fmt2(m1.sum)}</span> 积分位居第一，
+      占比 <b>${pct(m1.sum, s.total)}</b>，共 <b>${m1.count}</b> 次调用，单次均值 <b>${fmt2(m1.sum/m1.count)}</b>。` : '' }
+    ${ m2 ? `其次是 <b>${esc(m2.key)}</b>（${fmt2(m2.sum)}，${pct(m2.sum, s.total)}）。` : '' }
+    ${ m3 ? `第三为 <b>${esc(m3.key)}</b>（${fmt2(m3.sum)}，${pct(m3.sum, s.total)}）。` : '' }
+    前三模型合计占 <b>${pct(top3ModelSum, s.total)}</b>。</p>
+
+    <h4>三、客户端结构</h4>
+    <p>${ c1 ? `<b>${esc(c1.key)}</b> 是主要消耗入口，贡献 <span class="hl">${fmt2(c1.sum)}</span> 积分，
+      占比 <b>${pct(c1.sum, s.total)}</b>，共 <b>${c1.count}</b> 次请求。` : '' }
+    ${ s.byClient.slice(1).map(c =>
+      `${esc(c.key)} 占 <b>${pct(c.sum, s.total)}</b>（${fmt2(c.sum)} 积分 / ${c.count} 次）。`
+    ).join('') }</p>
+
+    <h4>四、时间分布</h4>
+    <p>消耗峰值出现在 <span class="hl">${peakRange}</span>，单时段 <b>${fmt2(peakH.sum)}</b> 积分，
+    占全天 <b>${pct(peakH.sum, s.total)}</b>；峰值前后三小时合计占 <b>${pct(hourSum3, s.total)}</b>。</p>
+    <p>从日期热力图看，积分最高的日期是 <b>${busiestDay ? busiestDay.date : '-'}</b>
+    （${busiestDay ? fmt2(busiestDay.points) : '0'} 积分）；请求数最多的日期是
+    <b>${busiestByCount ? busiestByCount.date : '-'}</b>
+    （${busiestByCount ? busiestByCount.count : 0} 次）。
+    单日积分 Top3 为：${
+      topDays.map(x => `<b>${x.key}</b>（${fmt2(x.sum)} 积分 / ${x.count} 次）`).join('、')
+    }。</p>
+
+    <h4>五、集中度</h4>
+    <p>Top 10 高消耗请求合计 <b>${fmt2(s.top10Sum)}</b> 积分，占总量 <span class="hl">${concentration}</span>，
+    平均每条 <b>${fmt2(s.top10Sum / Math.max(s.top.length,1))}</b> 积分，
+    是全量平均值 <b>${fmt2(s.avg)}</b> 的 <b>${(s.top10Sum/Math.max(s.top.length,1)/Math.max(s.avg,0.0001)).toFixed(1)} 倍</b>。
+    这类请求是最值得优先优化的对象。</p>
+
+    <div class="note">
+      <b>关键信号：</b>
+      0 积分请求 <b>${s.zeroCnt}</b> 条（${zeroPct}）；
+      涉及模型 <b>${s.byModel.length}</b> 个；
+      单次极值 / 均值比 <b>${(s.max/Math.max(s.avg,0.0001)).toFixed(1)}×</b>；
+      日间波动 <b>${busiestDay && quietDay ? (busiestDay.points/Math.max(quietDay.points,0.01)).toFixed(1) : '-'}×</b>。
+    </div>
+
+    <h4>六、Token 关联</h4>
+    <p>${tokenSummary}</p>
+
+    <h4>七、优化建议</h4>
+    <ul>${tips.map(t => `<li>${t}</li>`).join('')}</ul>
+  `;
+}
+
+/* =========================================================
+ * 10. 导出
+ * =======================================================*/
+function buildMarkdown(d){
+  const s = computeStats(d);
+  const L = [];
+  L.push(`# 积分消耗报告`);
+  L.push('');
+  L.push(`> 数据源：${state.fileName || '未命名'} · Sheet：${state.sheetName || '-'}`);
+  L.push(`> 统计区间：${s.from} ~ ${s.to}（${s.days} 天）`);
+  L.push(`> 生成时间：${new Date().toLocaleString('zh-CN')}`);
+  const tm = state.tokenMatch;
+  L.push(`> Token 数据：${!state.tokenLoaded ? '未同步'
+    : (tm && tm.total ? `匹配 ${tm.hit} / ${tm.total}（${(tm.rate*100).toFixed(1)}%）` : '已加载但无匹配')}`);
+  L.push('');
+  L.push(`## 一、核心指标`);
+  L.push('');
+  L.push(`| 指标 | 数值 |`);
+  L.push(`|:--|--:|`);
+  L.push(`| 总积分消耗 | ${fmt2(s.total)} |`);
+  L.push(`| 请求次数 | ${s.count} |`);
+  L.push(`| 日均消耗 | ${fmt2(s.dailyAvg)} |`);
+  L.push(`| 平均单次 | ${fmt2(s.avg)} |`);
+  L.push(`| 单次最高 | ${fmt2(s.max)}${s.maxReq ? ` (${s.maxReq.model} · ${s.maxReq.date})` : ''} |`);
+  L.push(`| 0 积分请求 | ${s.zeroCnt} (${pct(s.zeroCnt, s.count)}) |`);
+  if(s.hasToken){
+    L.push(`| Token 合计 | ${fmtTok(s.tokenTot)} |`);
+    L.push(`| &nbsp;&nbsp;其中：输入 | ${fmtTok(s.tokenIn)} |`);
+    L.push(`| &nbsp;&nbsp;其中：输出 | ${fmtTok(s.tokenOut)} |`);
+    L.push(`| 缓存命中率 | ${(s.cacheHitRate*100).toFixed(1)}% |`);
+    L.push(`| 每积分 Token | ${fmtTok(s.tokenPerPoint)} |`);
+    L.push(`| 每 M Token 积分 | ${fmt2(s.pointsPerMToken)} |`);
+    L.push(`| 免费模型 Token | ${fmtTok(s.freeToken)}（${fmt0(s.freeRows)} 条 0 积分记录） |`);
+    L.push(`| 积分覆盖 | ${pct(s.tokenPts, s.total)}（${s.tkRows} / ${s.count} 条已关联） |`);
+  }
+  L.push('');
+  L.push(`## 二、模型消耗`);
+  L.push('');
+  L.push(`| 模型 | 积分 | Token | 每积分Token | 占比 | 次数 |`);
+  L.push(`|:--|--:|--:|--:|--:|--:|`);
+  s.byModel.forEach(x => L.push(
+    `| ${x.key} | ${fmt2(x.sum)} | ${x.tk ? fmtTok(x.tk) : '—'} | ${
+      x.tk && x.sum > 0 ? fmtTok(x.tk / x.sum) : '—'} | ${pct(x.sum, s.total)} | ${x.count} |`));
+  L.push('');
+  L.push(`## 三、客户端消耗`);
+  L.push('');
+  L.push(`| 客户端 | 积分 | 占比 | 次数 |`);
+  L.push(`|:--|--:|--:|--:|`);
+  s.byClient.forEach(x => L.push(
+    `| ${x.key} | ${fmt2(x.sum)} | ${pct(x.sum, s.total)} | ${x.count} |`));
+  L.push('');
+  L.push(`## 四、每日汇总（日历明细）`);
+  L.push('');
+  L.push(`| 日期 | 星期 | 积分 | 请求数 | 均值 |`);
+  L.push(`|:--|:--|--:|--:|--:|`);
+  const wd = ['一','二','三','四','五','六','日'];
+  s.byDate.forEach(x => {
+    const dow = wd[(parseDs(x.key).getDay() + 6) % 7];
+    L.push(`| ${x.key} | ${dow} | ${fmt2(x.sum)} | ${x.count} | ${fmt2(x.sum/x.count)} |`);
+  });
+  L.push('');
+  L.push(`## 五、Top 10 高消耗请求`);
+  L.push('');
+  L.push(`| # | RequestID | 模型 | 客户端 | 时间 | 积分 | Token |`);
+  L.push(`|--:|:--|:--|:--|:--|--:|--:|`);
+  s.top.forEach((x,i) => L.push(
+    `| ${i+1} | \`${x.id}\` | ${x.model} | ${x.client} | ${x.date} ${pad(x.hour)}:${pad(x.min)} | ${fmt2(x.points)} | ${x.token ? fmtTok(x.token.tot) : '—'} |`));
+  L.push('');
+  if(s.hasDetail){
+    L.push(`## 六、工具 Token 消耗`);
+    L.push('');
+    L.push(`| 工具 | Token | 占比 | 调用次数 |`);
+    L.push(`|:--|--:|--:|--:|`);
+    s.byTool.slice(0, 15).forEach(x => L.push(
+      `| ${x.key} | ${fmtTok(x.tk)} | ${pct(x.tk, s.tokenTot)} | ${x.steps} |`));
+    L.push('');
+  }
+  L.push(`## 七、洞察`);
+  L.push('');
+  L.push(`- **主要消耗来源**：${s.byModel[0]?.key || '-'}（${pct(s.byModel[0]?.sum||0, s.total)}）、${s.byClient[0]?.key || '-'}（${pct(s.byClient[0]?.sum||0, s.total)}）`);
+  if(s.hasDetail && s.byTool[0])
+    L.push(`- **最耗 Token 的工具**：${s.byTool[0].key}（${fmtTok(s.byTool[0].tk)}，占 ${pct(s.byTool[0].tk, s.tokenTot)}），共调用 ${s.byTool[0].steps} 次`);
+  L.push(`- **峰值时段**：${pad(s.peakHour.key)}:00–${pad(s.peakHour.key)}:59，${fmt2(s.peakHour.sum)} 积分（${pct(s.peakHour.sum, s.total)}）`);
+  L.push(`- **峰值日期**：${s.peakDay.key}，${fmt2(s.peakDay.sum)} 积分`);
+  L.push(`- **集中度**：Top 10 请求占 ${pct(s.top10Sum, s.total)}`);
+  if(s.hasToken){
+    L.push(`- **Token 效率**：平均每 1 积分产出 **${fmtTok(s.tokenPerPoint)}** token（每 M token 约 ${fmt2(s.pointsPerMToken)} 积分）`);
+    L.push(`- **缓存命中**：输入上下文中 ${(s.cacheHitRate*100).toFixed(1)}% 走缓存读取`);
+    L.push(`- **回合粒度**：已关联 ${s.tkRows} 个回合，合计 ${fmt0(s.tokenReq)} 次 API 请求，平均 ${s.stepsPerTurn.toFixed(1)} 次/回合`);
+  }
+  L.push('');
+  return L.join('\n');
+}
+
+function buildCSV(d){
+  const s = computeStats(d);
+  // 未关联 token 的维度留空，而不是填 0——0 会被误读成「消耗为零」
+  const tkCols = x => [
+    x.tk ? Math.round(x.tk) : '',
+    (x.tk && x.sum > 0) ? Math.round(x.tk / x.sum) : ''
+  ];
+  const rows = [['维度','名称','积分','占比','请求数','单次均值','Token','每积分Token']];
+  s.byModel.forEach(x => rows.push(['模型', x.key, x.sum.toFixed(2),
+    (x.sum/s.total*100).toFixed(2)+'%', x.count, (x.sum/x.count).toFixed(3), ...tkCols(x)]));
+  s.byClient.forEach(x => rows.push(['客户端', x.key, x.sum.toFixed(2),
+    (x.sum/s.total*100).toFixed(2)+'%', x.count, (x.sum/x.count).toFixed(3), ...tkCols(x)]));
+  s.byDate.forEach(x => rows.push(['日期', x.key, x.sum.toFixed(2),
+    (x.sum/s.total*100).toFixed(2)+'%', x.count, (x.sum/x.count).toFixed(3), ...tkCols(x)]));
+  // 工具维度没有积分归属（一个回合内多个工具共享一次计费），积分列留空
+  s.byTool.slice(0, 20).forEach(x => rows.push(['工具', x.key, '', '', x.steps, '',
+    Math.round(x.tk), '']));
+  Array.from({length:24}, (_,h) => {
+    const v = s.hourArr[h];
+    // 时段维度没有 token 归属，补两个空串保持列数与表头对齐
+    if(v > 0) rows.push(['时段', pad(h)+':00', v.toFixed(2),
+      (v/s.total*100).toFixed(2)+'%', '', '', '', '']);
+  });
+  return '\ufeff' + rows.map(r => r.map(c => {
+    const t = String(c ?? '');
+    return /[",\n]/.test(t) ? `"${t.replace(/"/g,'""')}"` : t;
+  }).join(',')).join('\n');
+}
+
+/* =========================================================
+ * 10.5 Token 数据通道（token-usage-data.js）
+ *
+ * 由 token-usage-report.js --emit-js 生成，内容是 window.__TOKEN_DATA__，
+ * 按 conversationRequestId（回合 ID）聚合——一次用户提问 = 一个回合 =
+ * 该回合内 agent 串行发起的一批 API 请求，token 已在此求和。
+ * 看板按 Excel 的 RequestID 精确匹配这些回合。
+ *
+ * 用 <script> 注入而非 fetch：file:// 下 fetch 同目录文件会被 CORS 拦，
+ * script 标签则可以加载。
+ * =======================================================*/
+const TokenData = (() => {
+  let _data = null;
+
+  function inject(src){
+    return new Promise(resolve => {
+      const old = $('tokJs');
+      if(old) old.remove();
+      const s = document.createElement('script');
+      s.id = 'tokJs';
+      s.src = src;
+      s.onload  = () => resolve(true);
+      s.onerror = () => resolve(false);
+      document.head.appendChild(s);
+    });
+  }
+
+  async function load(){
+    // 先清旧引用：文件被删掉时，残留的全局变量会让人误以为已同步
+    _data = null;
+    window.__TOKEN_DATA__ = null;
+
+    // 先带时间戳绕缓存；万一环境不支持 query，再退化为裸路径重试
+    if(!await inject('token-usage-data.js?v=' + Date.now()))
+      await inject('token-usage-data.js');
+
+    const d = window.__TOKEN_DATA__;
+    _data = (d && d.t && typeof d.t === 'object') ? d : null;
+    if(!_data) console.warn('[TokenData] token-usage-data.js 未加载或格式无效');
+    return !!_data;
+  }
+
+  // 大小写 / 首尾空白归一化后查表（脚本生成时键也是小写，双保险）
+  function lookup(id){
+    if(!_data || !id) return null;
+    return _data.t[String(id).trim().toLowerCase()] || null;
+  }
+
+  return { load, lookup, get: () => _data };
+})();
+
+/** 把 token 数据挂到每一行；返回匹配统计 */
+function attachTokens(rows){
+  let hit = 0, miss = 0, noId = 0;
+  for(const r of rows){
+    if(!r.id || r.id === '-'){ r.token = null; noId++; continue; }
+    const t = TokenData.lookup(r.id);
+    if(t){ r.token = t; hit++; }
+    else { r.token = null; miss++; }
+  }
+  const total = hit + miss;   // 分母排除没有 RequestID 的行
+  state.tokenMatch = { hit, miss, noId, total, rate: total ? hit / total : 0 };
+  return state.tokenMatch;
+}
+
+/** 同步入口：重新加载数据文件 → 重新匹配 → 重渲染 */
+async function syncTokens(opts){
+  opts = opts || {};
+  state.tokenLoaded = await TokenData.load();
+
+  if(state.all.length){
+    attachTokens(state.all);
+    render();
+  }
+
+  if(!opts.toast) return state.tokenLoaded;
+
+  if(!state.tokenLoaded){
+    toast('未找到 token-usage-data.js，请先运行「同步Token.bat」');
+  }else{
+    const tm = state.tokenMatch;
+    toast(tm && tm.hit
+      ? `已同步：匹配 ${tm.hit} / ${tm.total} 条`
+      : 'Token 数据已加载，但当前数据没有命中');
+  }
+  return state.tokenLoaded;
+}
+
+/* =========================================================
+ * 11. chips
+ * =======================================================*/
+function renderChips(){
+  const models  = [...new Set(state.all.map(x => x.model))].sort();
+  const clients = [...new Set(state.all.map(x => x.client))].sort();
+
+  $('modelChips').innerHTML = models.map(m =>
+    `<button class="chip${state.filters.models.has(m)?' on':''}" data-type="model" data-val="${esc(m)}">${esc(m)}</button>`
+  ).join('') || '<span style="color:#a8b3c8;font-size:12px">—</span>';
+
+  $('clientChips').innerHTML = clients.map(c =>
+    `<button class="chip${state.filters.clients.has(c)?' on':''}" data-type="client" data-val="${esc(c)}">${esc(c)}</button>`
+  ).join('') || '<span style="color:#a8b3c8;font-size:12px">—</span>';
+}
+
+function bindChips(){
+  const handler = e => {
+    const b = e.target.closest('.chip');
+    if(!b) return;
+    const {type, val} = b.dataset;
+    const set = type === 'model' ? state.filters.models : state.filters.clients;
+    set.has(val) ? set.delete(val) : set.add(val);
+    render();
+  };
+  $('modelChips').addEventListener('click', handler);
+  $('clientChips').addEventListener('click', handler);
+}
+
+/* =========================================================
+ * 12. 主渲染
+ * =======================================================*/
+function render(){
+  const d = getFiltered();
+  renderChips();
+  renderKPIs(d);
+  renderDateHeatmap(d);
+  renderCharts(d);
+  renderHeatmap(d);
+  renderTables(d);
+  renderReport(d);
+
+  // 匹配率是数据质量指标，基于全量 state.all，不随筛选变化
+  const tm = state.tokenMatch;
+  let line = `已筛选 ${d.length} 条 / 共 ${state.all.length} 条`;
+  if(!state.tokenLoaded){
+    line += ' · Token 未同步';
+  }else if(tm && tm.total){
+    line += tm.hit ? ` · Token 已关联 ${tm.hit} / ${tm.total} 条` : ' · Token 无匹配';
+  }
+  $('statLine').textContent = line;
+  persistFilters();
+}
+
+/* =========================================================
+ * 13. 本地持久化（覆盖式自动槽 + 手动快照槽）
+ * =======================================================*/
+const Persist = (() => {
+  const DB_NAME = 'points-dashboard', DB_VER = 2, STORE = 'snapshots';
+  const LS_META = 'points-dashboard:meta';
+  const AUTO_ID = 'auto-merged-latest';
+  const MAX_MANUAL = 5;
+
+  let _db = null;
+  function db(){
+    if(_db) return Promise.resolve(_db);
+    return new Promise((res, rej) => {
+      const rq = indexedDB.open(DB_NAME, DB_VER);
+      rq.onupgradeneeded = e => {
+        const d = e.target.result;
+        if(!d.objectStoreNames.contains(STORE)){
+          const s = d.createObjectStore(STORE, {keyPath:'id'});
+          s.createIndex('savedAt', 'savedAt');
+        }
+      };
+      rq.onsuccess = () => { _db = rq.result; res(_db); };
+      rq.onerror   = () => rej(rq.error);
+    });
+  }
+  const tx = async (mode, fn) => {
+    const d = await db();
+    return new Promise((res, rej) => {
+      const t = d.transaction(STORE, mode);
+      const out = fn(t.objectStore(STORE));
+      t.oncomplete = () => res(out && out.result !== undefined ? out.result : true);
+      t.onerror    = () => rej(t.error);
+    });
+  };
+
+  const put   = snap => tx('readwrite', s => s.put(snap));
+  const del   = id   => tx('readwrite', s => s.delete(id));
+  const clear = ()   => tx('readwrite', s => s.clear());
+  const all   = ()   => tx('readonly',  s => s.getAll()).then(l =>
+                        (l || []).sort((a,b) => b.savedAt - a.savedAt));
+  const get   = id   => tx('readonly',  s => s.get(id));
+
+  const serialize = rows => rows.map(r => ({
+    i: r.id, p: r.points, m: r.model, c: r.client, t: r.time.getTime()
+  }));
+  const deserialize = raw => raw.map(r => {
+    const time = new Date(r.t);
+    return { id:r.i, points:r.p, model:r.m, client:r.c, time,
+             date: fmtDate(time), hour: time.getHours(), min: time.getMinutes() };
+  });
+
+  /* 自动槽：固定 id，覆盖式 —— 合并后的完整数据集 */
+  async function saveAuto(fileName, sheetName, rows){
+    const snap = {
+      id: AUTO_ID,
+      kind: 'auto',
+      fileName, sheetName, savedAt: Date.now(),
+      count: rows.length,
+      total: Math.round(rows.reduce((s,x) => s + x.points, 0) * 100) / 100,
+      rows: serialize(rows)
+    };
+    await put(snap);
+    return snap;
+  }
+
+  /* 手动槽：追加式，最多 MAX_MANUAL 份 */
+  async function saveManual(fileName, sheetName, rows, note){
+    const snap = {
+      id: 'manual-' + Date.now() + '-' + Math.random().toString(36).slice(2,6),
+      kind: 'manual',
+      fileName, sheetName, note: note || '',
+      savedAt: Date.now(),
+      count: rows.length,
+      total: Math.round(rows.reduce((s,x) => s + x.points, 0) * 100) / 100,
+      rows: serialize(rows)
+    };
+    await put(snap);
+    const list = (await all()).filter(s => s.kind === 'manual');
+    for(const s of list.slice(MAX_MANUAL)) await del(s.id);
+    return snap;
+  }
+
+  const loadAuto   = () => get(AUTO_ID);
+  const listManual = async () => (await all()).filter(s => s.kind === 'manual');
+
+  const loadMeta  = () => { try{ return JSON.parse(localStorage.getItem(LS_META) || '{}'); }catch(e){ return {}; } };
+  const saveMeta  = obj => { try{ localStorage.setItem(LS_META, JSON.stringify({...loadMeta(), ...obj})); }catch(e){} };
+  const clearMeta = () => { try{ localStorage.removeItem(LS_META); }catch(e){} };
+
+  return { saveAuto, saveManual, loadAuto, listManual,
+           del, clear, all, serialize, deserialize,
+           saveMeta, loadMeta, clearMeta, MAX_MANUAL };
+})();
+
+function setSaveState(kind, text){
+  const dot = $('saveDot');
+  if(!dot) return;
+  dot.hidden = false;
+  dot.classList.toggle('saving', kind === 'saving');
+  $('saveTxt').textContent = text || (kind === 'saving' ? '保存中…' : '已自动保存');
+}
+function showBanner(snap, n){
+  const b = $('banner');
+  if(!b) return;
+  b.hidden = false;
+  b.innerHTML = `<span style="font-size:17px">💾</span>
+    <span>已自动恢复上次合并数据：<b>${esc(snap.fileName || '未命名')}</b>
+      · ${n} 条记录 · ${fmt2(snap.total)} 积分
+      <span style="color:#8b98b3">（${timeAgo(snap.savedAt)}保存）</span></span>
+    <span class="x" title="关闭">×</span>`;
+  b.querySelector('.x').onclick = () => b.hidden = true;
+}
+function showMergeInfo(info, fileName){
+  const el = $('mergeInfo');
+  if(!el) return;
+  const parts = [];
+  if(info.added > 0)      parts.push(`<span class="tag">新增 <b>${info.added}</b> 条</span>`);
+  if(info.updated > 0)    parts.push(`<span class="tag">更新 <b>${info.updated}</b> 条</span>`);
+  if(info.duplicate > 0)  parts.push(`<span class="tag">忽略重复 <b>${info.duplicate}</b> 条</span>`);
+
+  // Token 关联结果：用户刚导完数据，此刻注意力最集中，一次性告知
+  const tm = state.tokenMatch;
+  if(state.tokenLoaded && tm && tm.total){
+    parts.push(`<span class="tag" style="background:#eef1ff;color:#4f6ef7">Token 已关联 <b>${tm.hit}</b>/${tm.total}</span>`);
+  }else if(!state.tokenLoaded){
+    parts.push(`<span class="tag">Token 未同步</span>`);
+  }
+
+  el.innerHTML = `<span style="font-size:16px">🔀</span>
+    <span>已合并 <b>${esc(fileName)}</b>${parts.length ? '：' + parts.join(' ') : '：内容无变化'}
+      &nbsp;·&nbsp; 当前数据集共 <b>${info.total}</b> 条</span>`;
+  el.classList.add('show');
+}
+
+let _pfTimer = null;
+function persistFilters(){
+  clearTimeout(_pfTimer);
+  _pfTimer = setTimeout(() => {
+    Persist.saveMeta({
+      filters: {
+        from: state.filters.from,
+        to:   state.filters.to,
+        models:  [...state.filters.models],
+        clients: [...state.filters.clients]
+      }
+    });
+  }, 300);
+}
+
+/* 应用数据集（保留筛选语义） */
+function applyDataset(rows, sheet, fileName){
+  state.all = rows;
+  state.sheetName = sheet || '';
+  if(fileName) state.fileName = fileName;
+  $('srcName').textContent = state.fileName ? `· ${state.fileName}` : '';
+
+  // 只清理已不存在的筛选项，保留用户当前选择
+  const validModels  = new Set(rows.map(x => x.model));
+  const validClients = new Set(rows.map(x => x.client));
+  state.filters.models  = new Set([...state.filters.models ].filter(m => validModels.has(m)));
+  state.filters.clients = new Set([...state.filters.clients].filter(c => validClients.has(c)));
+
+  const dates = [...new Set(rows.map(x => x.date))].sort();
+  const minD = dates[0], maxD = dates[dates.length - 1];
+
+  // 日期范围只扩不缩
+  if(!state.filters.from || state.filters.from < minD) state.filters.from = minD;
+  if(!state.filters.to   || state.filters.to   > maxD) state.filters.to   = maxD;
+
+  $('dateFrom').min = $('dateTo').min = minD;
+  $('dateFrom').max = $('dateTo').max = maxD;
+  $('dateFrom').value = state.filters.from;
+  $('dateTo').value   = state.filters.to;
+
+  $('uploader').hidden = true;
+  $('dash').hidden = false;
+  ['btnPrint','btnMd','btnCsv','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
+    .forEach(id => { const el = $(id); if(el) el.hidden = false; });
+
+  // 无条件重算 token 关联：覆盖「首次导入 / 追加合并 / 快照恢复」全部路径
+  attachTokens(state.all);
+  render();
+}
+
+async function tryRestore(){
+  try{
+    const snap = await Persist.loadAuto();
+    if(!snap || !snap.rows || !snap.rows.length) return false;
+
+    const rows = Persist.deserialize(snap.rows);
+    applyDataset(rows, snap.sheetName, snap.fileName);
+
+    const meta = Persist.loadMeta();
+    const f = meta.filters;
+    if(f){
+      if(f.from){ state.filters.from = f.from; $('dateFrom').value = f.from; }
+      if(f.to)  { state.filters.to   = f.to;   $('dateTo').value   = f.to;   }
+      (f.models  || []).forEach(m => state.filters.models.add(m));
+      (f.clients || []).forEach(c => state.filters.clients.add(c));
+      render();
+    }
+
+    setSaveState('saved', `已恢复 · ${timeAgo(snap.savedAt)}`);
+    showBanner(snap, rows.length);
+    return true;
+  }catch(e){
+    console.warn('[Persist] 恢复失败', e);
+    return false;
+  }
+}
+
+async function openHistory(){
+  const auto    = await Persist.loadAuto();
+  const manual  = await Persist.listManual();
+  const root    = $('modalRoot');
+
+  const renderItem = (s, isAuto) => `
+    <div class="snap" data-id="${s.id}">
+      <div class="ico ${isAuto ? '' : 'manual'}">${isAuto ? '💾' : '📌'}</div>
+      <div class="info">
+        <div class="nm" title="${esc(s.fileName)}">
+          ${esc(s.fileName || '未命名')}
+          ${isAuto ? '<span style="font-size:11px;color:#4f6ef7;font-weight:500;margin-left:6px">当前数据集</span>'
+                   : (s.note ? `<span style="font-size:11px;color:#7048d6;font-weight:500;margin-left:6px">${esc(s.note)}</span>` : '')}
+        </div>
+        <div class="mt">
+          ${new Date(s.savedAt).toLocaleString('zh-CN')} · ${timeAgo(s.savedAt)}
+          · ${s.count} 条 · ${fmt2(s.total)} 积分
+        </div>
+      </div>
+      <div class="ops">
+        ${isAuto ? '' : '<button data-act="load">恢复</button>'}
+        <button data-act="export">导出</button>
+        ${isAuto ? '' : '<button data-act="del" class="danger">删除</button>'}
+      </div>
+    </div>`;
+
+  root.innerHTML = `
+    <div class="modal" id="modalMask">
+      <div class="modal-box">
+        <div class="modal-head">
+          📂 本地快照
+          <span style="font-weight:500;font-size:12px;color:var(--muted)">
+            自动槽 1 份（覆盖式）+ 手动槽最多 ${Persist.MAX_MANUAL} 份</span>
+          <span class="x" id="modalClose">×</span>
+        </div>
+        <div class="modal-body">
+          <div class="sec-title">自动保存（当前合并数据集）</div>
+          ${ auto ? renderItem(auto, true)
+                  : '<div class="empty-tip">尚无自动快照</div>' }
+          <div class="sec-title">手动快照（追加式，最多 ${Persist.MAX_MANUAL} 份）</div>
+          ${ manual.length ? manual.map(s => renderItem(s, false)).join('')
+                           : '<div class="empty-tip">还没有手动快照<br>点顶栏「💾 手动快照」可保存当前版本</div>' }
+        </div>
+      </div>
+    </div>`;
+
+  const close = () => { root.innerHTML = ''; };
+  $('modalClose').onclick = close;
+  $('modalMask').onclick = e => { if(e.target.id === 'modalMask') close(); };
+
+  root.querySelector('.modal-body').onclick = async e => {
+    const btn = e.target.closest('button[data-act]');
+    if(!btn) return;
+    const id  = btn.closest('.snap').dataset.id;
+    const act = btn.dataset.act;
+
+    let snap = null;
+    if(id === auto?.id) snap = auto;
+    else snap = manual.find(s => s.id === id);
+    if(!snap) return;
+
+    if(act === 'del'){
+      await Persist.del(id);
+      toast('已删除该快照');
+      openHistory();
+      return;
+    }
+    if(act === 'export'){
+      download(`${(snap.fileName||'snapshot').replace(/\.[^.]+$/,'')}-${new Date(snap.savedAt).toISOString().slice(0,10)}.json`,
+        JSON.stringify(snap, null, 2), 'application/json');
+      toast('已导出 JSON');
+      return;
+    }
+    if(act === 'load'){
+      const rows = Persist.deserialize(snap.rows);
+      if(!rows.length){ alert('该快照无有效数据'); return; }
+      applyDataset(rows, snap.sheetName, snap.fileName);
+      await Persist.saveAuto(snap.fileName, snap.sheetName, rows);
+      Persist.saveMeta({ filters: null });
+      setSaveState('saved', `已恢复 · ${timeAgo(snap.savedAt)}`);
+      close();
+      toast('已恢复该快照');
+    }
+  };
+}
+
+/* =========================================================
+ * 14. 文件导入（合并）
+ * =======================================================*/
+async function loadFile(file){
+  if(!file) return;
+  setSaveState('saving', '正在合并…');
+
+  try{
+    const buf = await file.arrayBuffer();
+    const wb  = XLSX.read(new Uint8Array(buf), {type:'array', cellDates:true});
+    const {rows: newRows, sheet} = readWorkbook(wb);
+
+    if(!newRows.length){
+      alert('未能识别有效数据。\n\n请确认表格中包含「积分消耗 / 模型 / 客户端 / 时间」等列，且时间列格式可解析。');
+      setSaveState('saved', '已自动保存');
+      return;
+    }
+
+    // ★ 与现有数据集按 RequestID 合并
+    const oldRows = state.all;
+    const result  = mergeByRequestId(oldRows, newRows);
+
+    applyDataset(result.rows, sheet, file.name);
+    await Persist.saveAuto(file.name, sheet, result.rows);
+    Persist.saveMeta({ filters: null });
+
+    if(oldRows.length === 0){
+      $('mergeInfo').classList.remove('show');
+      toast(`已载入 ${result.rows.length} 条记录`);
+    }else{
+      showMergeInfo(result, file.name);
+      const parts = [];
+      if(result.added)     parts.push(`新增 ${result.added}`);
+      if(result.updated)   parts.push(`更新 ${result.updated}`);
+      if(result.duplicate) parts.push(`忽略重复 ${result.duplicate}`);
+      toast(parts.length ? `合并完成：${parts.join('，')}` : '合并完成：内容无变化');
+    }
+
+    setSaveState('saved',
+      `已保存 · ${new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}`);
+    window.scrollTo({top:0, behavior:'smooth'});
+  }catch(err){
+    console.error(err);
+    alert('解析失败：' + err.message);
+    setSaveState('saved', '已自动保存');
+  }
+}
+
+/* =========================================================
+ * 15. 事件绑定 + 启动
+ * =======================================================*/
+(function init(){
+  const drop = $('drop'), input = $('fileInput');
+
+  drop.addEventListener('click', () => input.click());
+  input.addEventListener('change', e => {
+    if(e.target.files[0]) loadFile(e.target.files[0]);
+    input.value = '';
+  });
+
+  ['dragenter','dragover'].forEach(ev =>
+    drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave','drop'].forEach(ev =>
+    drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', e => {
+    const f = e.dataTransfer?.files?.[0];
+    if(f) loadFile(f);
+  });
+
+  document.addEventListener('dragover', e => e.preventDefault());
+  document.addEventListener('drop', e => {
+    e.preventDefault();
+    if(!$('uploader').hidden){
+      const f = e.dataTransfer?.files?.[0];
+      if(f) loadFile(f);
+    }
+  });
+
+  $('dateFrom').addEventListener('change', e => { state.filters.from = e.target.value; render(); });
+  $('dateTo').addEventListener('change',   e => { state.filters.to   = e.target.value; render(); });
+
+  $('qAll').addEventListener('click', () => {
+    const dates = [...new Set(state.all.map(x => x.date))].sort();
+    $('dateFrom').value = dates[0]; $('dateTo').value = dates[dates.length-1];
+    state.filters.from = dates[0];  state.filters.to = dates[dates.length-1];
+    render();
+  });
+  $('qToday').addEventListener('click', () => {
+    const dates = [...new Set(state.all.map(x => x.date))].sort();
+    const last = dates[dates.length-1];
+    $('dateFrom').value = last; $('dateTo').value = last;
+    state.filters.from = last;  state.filters.to = last;
+    render();
+  });
+  $('q7').addEventListener('click', () => {
+    const dates = [...new Set(state.all.map(x => x.date))].sort();
+    const last = dates[dates.length-1];
+    const d = parseDs(last);
+    d.setDate(d.getDate() - 6);
+    const from = fmtDate(d) < dates[0] ? dates[0] : fmtDate(d);
+    $('dateFrom').value = from; $('dateTo').value = last;
+    state.filters.from = from;  state.filters.to = last;
+    render();
+  });
+
+  $('btnPrint').addEventListener('click', () => window.print());
+  $('btnMd').addEventListener('click', () => {
+    const d = getFiltered();
+    download(`积分报告_${state.filters.from}_${state.filters.to}.md`,
+      buildMarkdown(d), 'text/markdown');
+  });
+  $('btnCsv').addEventListener('click', () => {
+    const d = getFiltered();
+    download(`积分汇总_${state.filters.from}_${state.filters.to}.csv`,
+      buildCSV(d), 'text/csv');
+  });
+
+  /* ★ 新增：追加数据 */
+  $('btnAppend').addEventListener('click', () => {
+    $('fileInput').click();
+  });
+
+  /* ★ 修改：清空重来 */
+  $('btnReset').addEventListener('click', () => {
+    if(!confirm(
+      '确定要清空当前数据集吗？\n\n' +
+      '· 页面上的合并结果会被清空\n' +
+      '· 本地自动快照保留，可从「📂 历史」恢复\n' +
+      '· 如果你只是想追加新文件，请点「➕ 追加数据」'
+    )) return;
+
+    Object.values(state.charts).forEach(c => c.destroy());
+    state.charts = {};
+    state.all = [];
+    state.filters.models.clear();
+    state.filters.clients.clear();
+    state.filters.from = '';
+    state.filters.to   = '';
+    $('uploader').hidden = false;
+    $('dash').hidden = true;
+    $('banner').hidden = true;
+    $('mergeInfo').classList.remove('show');
+    ['btnPrint','btnMd','btnCsv','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
+      .forEach(id => { const el = $(id); if(el) el.hidden = true; });
+    $('srcName').textContent = '';
+    window.scrollTo({top:0, behavior:'smooth'});
+  });
+
+  $('btnSnap').addEventListener('click', async () => {
+    if(!state.all.length){ toast('当前无数据'); return; }
+    const note = prompt('为这份手动快照写个备注（可留空）：', '') || '';
+    setSaveState('saving', '正在保存…');
+    await Persist.saveManual(state.fileName, state.sheetName, state.all, note);
+    setSaveState('saved',
+      '已保存 · ' + new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}));
+    toast('已保存手动快照');
+  });
+
+  $('btnHist').addEventListener('click', openHistory);
+
+  $('btnWipe').addEventListener('click', async () => {
+    if(!confirm('将删除浏览器中保存的所有快照（自动 + 手动）与筛选记录。\n\n当前页面数据不受影响，确定继续？')) return;
+    await Persist.clear();
+    Persist.clearMeta();
+    toast('已清空本地缓存');
+  });
+
+  $('btnSync').addEventListener('click', () => syncTokens({ toast: true }));
+
+  bindChips();
+
+  // 先静默加载 token 数据（失败不能阻塞快照恢复），再恢复历史数据集
+  (async () => {
+    state.tokenLoaded = await TokenData.load();
+    await tryRestore();
+  })();
+})();
+</script>
+</body>
+</html>
