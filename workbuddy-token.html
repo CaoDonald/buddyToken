@@ -1645,9 +1645,11 @@ async function syncTokens(opts){
     toast('未找到 token-usage-data.js，请先运行「同步Token.bat」');
   }else{
     const tm = state.tokenMatch;
+    const td = TokenData.get();
+    const when = td && td.gen ? `（数据生成于 ${timeAgo(td.gen)}）` : '';
     toast(tm && tm.hit
-      ? `已同步：匹配 ${tm.hit} / ${tm.total} 条`
-      : 'Token 数据已加载，但当前数据没有命中');
+      ? `已同步：匹配 ${tm.hit} / ${tm.total} 条${when}`
+      : `Token 数据已加载，但当前数据没有命中${when}`);
   }
   return state.tokenLoaded;
 }
@@ -1702,6 +1704,9 @@ function render(){
   }else if(tm && tm.total){
     line += tm.hit ? ` · Token 已关联 ${tm.hit} / ${tm.total} 条` : ' · Token 无匹配';
   }
+  // 数据新鲜度：让「数据是旧的」这件事一眼可见，而不是让人以为按钮没生效
+  const td = TokenData.get();
+  if(td && td.gen) line += ` · 数据 ${timeAgo(td.gen)}生成`;
   $('statLine').textContent = line;
   persistFilters();
 }
