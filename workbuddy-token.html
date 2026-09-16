@@ -767,7 +767,7 @@ function computeStats(d){
   // ---- 模型性价比 ----
   // 每积分 Token 是唯一能把 token 与积分拉到同一尺度的指标，越高越划算。
   // 注意：低不代表模型差——复杂任务才会用强模型，它天然 token 多、积分高。
-  const modelRank = s.byModel
+  const modelRank = byModel
     .filter(m => m.tk > 0)                       // 有 token 数据的才参与比较
     .map(m => ({
       key: m.key, count: m.count, pts: m.sum,
