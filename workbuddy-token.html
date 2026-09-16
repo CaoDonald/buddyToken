@@ -325,7 +325,7 @@ table.cal td.cal-cell.has:hover{
     <div class="spacer"></div>
     <div class="save-dot" id="saveDot" hidden><i></i><span id="saveTxt">已自动保存</span></div>
     <button class="btn" id="btnScan" title="授权 ~/.workbuddy 或 ~/.codebuddy 目录，让页面直接读取本地会话">📁 连接本地会话</button>
-    <button class="btn" id="btnSync" title="重新加载本地 token-usage-data.js 并关联到当前数据">🔄 同步 Token</button>
+    <button class="btn" id="btnSync" title="重新同步一次数据：已连接本地目录时重扫会话记录，否则重读 token-usage-data.js">🔄 同步 Token</button>
     <button class="btn primary" id="btnAppend" hidden>➕ 追加数据</button>
     <button class="btn" id="btnSnap" hidden>💾 手动快照</button>
     <button class="btn" id="btnHist" hidden>📂 历史</button>
@@ -2702,7 +2702,13 @@ async function loadFile(file){
     toast('已清空本地缓存');
   });
 
-  $('btnSync').addEventListener('click', () => syncTokens({ toast: true }));
+  /* 「同步 Token」= 真的去同步一次数据
+     已连接本地目录 → 直接重扫（符合「同步」的直觉）
+     未连接目录     → 退回重读 token-usage-data.js（bat 生成的那个文件） */
+  $('btnSync').addEventListener('click', async () => {
+    if(LocalScan.count()) await scanLocal({ toast: true });
+    else                   await syncTokens({ toast: true });
+  });
 
   /* ---- 本地会话直读：授权一次，之后导入即自动匹配 ---- */
   $('btnScan').addEventListener('click', async () => {
