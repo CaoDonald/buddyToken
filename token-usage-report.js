@@ -9,7 +9,6 @@
  * 数据来源
  *   WorkBuddy     : %USERPROFILE%\.workbuddy\projects\<工作区>\<sessionId>.jsonl
  *   CodeBuddy CLI : %USERPROFILE%\.codebuddy\projects\<项目>\<sessionId>.jsonl
- *   Claude Code   : %USERPROFILE%\.claude\projects\<项目>\<sessionId>.jsonl   (需 --include-claude)
  *
  * 口径说明
  *   每一条带 message.usage 的记录 = 一次模型 API 请求。
@@ -31,7 +30,6 @@
  *   node token-usage-report.js                     # 全量统计
  *   node token-usage-report.js --days 7            # 最近 7 天
  *   node token-usage-report.js --since 2026-09-01  # 起始日期
- *   node token-usage-report.js --include-claude    # 连 Claude Code 一起统计
  *   node token-usage-report.js -o D:\out           # 指定输出目录
  *   node token-usage-report.js --emit-js           # 额外生成看板数据 token-usage-data.js
  *   node token-usage-report.js --emit-js --light   # 同上，省略每步明细（文件约小一半）
@@ -61,9 +59,8 @@ const { parseArgs } = require('util');
 const HOME = os.homedir();
 
 const SOURCES = [
-  { name: 'WorkBuddy',    base: path.join(HOME, '.workbuddy', 'projects'), claude: false },
-  { name: 'CodeBuddyCLI', base: path.join(HOME, '.codebuddy',  'projects'), claude: false },
-  { name: 'ClaudeCode',   base: path.join(HOME, '.claude',     'projects'), claude: true  },
+  { name: 'WorkBuddy',    base: path.join(HOME, '.workbuddy', 'projects') },
+  { name: 'CodeBuddyCLI', base: path.join(HOME, '.codebuddy',  'projects') },
 ];
 
 // ---------------------------------------------------------------- 工具函数
@@ -207,13 +204,12 @@ async function scanFile(file, source) {
 
 // ---------------------------------------------------------------- 汇总收集
 
-async function collect(includeClaude, since) {
+async function collect(since) {
   const allReqs = [];
   const allTurns = [];
   const stats = [];
 
   for (const s of SOURCES) {
-    if (s.claude && !includeClaude) continue;
     if (!fs.existsSync(s.base)) continue;
 
     const files = walk(s.base);
@@ -351,7 +347,6 @@ async function main() {
       options: {
         days: { type: 'string' },
         since: { type: 'string' },
-        'include-claude': { type: 'boolean' },
         outdir: { type: 'string', short: 'o' },
         'emit-js': { type: 'boolean' },
         'light': { type: 'boolean' },
@@ -388,7 +383,7 @@ async function main() {
     since = new Date(now.getTime() - days * 86400000);
   }
 
-  const { allReqs: reqs, allTurns: turns, stats } = await collect(!!args['include-claude'], since);
+  const { allReqs: reqs, allTurns: turns, stats } = await collect(since);
 
   // ---------------------------------------------------------- 明细 CSV
   reqs.sort((a, b) => (a.time ? a.time.getTime() : 0) - (b.time ? b.time.getTime() : 0));

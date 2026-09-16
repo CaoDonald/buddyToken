@@ -4,8 +4,6 @@
 
 **适用于 WorkBuddy 桌面端与 CodeBuddy CLI**。两者内核相同、会话记录格式一致，只是根目录不同，本项目同时扫描两边。
 
-> 也支持 Claude Code，加 `--include-claude` 即可；但计费口径与前述两者不同，仅作参考。
-
 纯本地运行，零服务端、零依赖安装（脚本只用 Node 标准库，看板的图表库走 CDN）。
 
 ---
@@ -122,7 +120,6 @@ Windows 上也可以直接双击 **`同步Token.bat`**：自动探测 Node → �
 | --- | --- |
 | WorkBuddy 桌面端 | `%USERPROFILE%\.workbuddy\projects\<工作区>\*.jsonl` |
 | CodeBuddy CLI | `%USERPROFILE%\.codebuddy\projects\<项目>\*.jsonl` |
-| Claude Code（可选） | `%USERPROFILE%\.claude\projects\<项目>\*.jsonl`，需加 `--include-claude` |
 
 每个 `.jsonl` 是一个会话，一条带 `message.usage` 的记录 = 一次 API 请求。
 
@@ -132,7 +129,6 @@ Windows 上也可以直接双击 **`同步Token.bat`**：自动探测 Node → �
 node token-usage-report.js --emit-js            # 生成看板数据
 node token-usage-report.js --days 7             # 只统计最近 7 天
 node token-usage-report.js --since 2026-09-01   # 起始日期
-node token-usage-report.js --include-claude     # 连 Claude Code 一起统计
 node token-usage-report.js --emit-js --light    # 省略每步明细，文件小一半
 node token-usage-report.js --emit-js --no-merge # 关闭增量合并，纯全量覆盖
 node token-usage-report.js -o D:\out            # 指定输出目录
@@ -179,7 +175,7 @@ node token-usage-report.js -o D:\out            # 指定输出目录
 
 积分账单是**账号级**计费口径，覆盖所有设备；本地 jsonl 只是**本机**留痕。如果同一账号在多台设备或不同入口使用，账单里会有一部分记录在本机找不到对应会话。
 
-看板对此的处理是：主指标用**积分覆盖率**（Token 数据覆盖了多少比例的实际花销，通常远高于条数覆盖率），条数放在副标题，并且**不用警告色**——这是数据可得性的正常现象，不是错误。
+看板对此的处理是：主指标用**积分覆盖率**（Token 数据覆盖了多少比例的实际花销），条数放在副标题，并且**不用警告色**——这是数据可得性的正常现象，不是错误。
 
 ---
 
