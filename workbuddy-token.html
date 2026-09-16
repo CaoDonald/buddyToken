@@ -308,6 +308,7 @@ table.cal td.cal-cell.has:hover{
     <div class="brand">📊 积分消耗看板 <small id="srcName"></small></div>
     <div class="spacer"></div>
     <div class="save-dot" id="saveDot" hidden><i></i><span id="saveTxt">已自动保存</span></div>
+    <button class="btn" id="btnScan" title="授权 ~/.workbuddy 或 ~/.codebuddy 目录，让页面直接读取本地会话">📁 连接本地会话</button>
     <button class="btn" id="btnSync" title="重新加载本地 token-usage-data.js 并关联到当前数据">🔄 同步 Token</button>
     <button class="btn primary" id="btnAppend" hidden>➕ 追加数据</button>
     <button class="btn" id="btnSnap" hidden>💾 手动快照</button>
@@ -1756,7 +1757,194 @@ const TokenData = (() => {
     return _data.t[String(id).trim().toLowerCase()] || null;
   }
 
-  return { load, lookup, get: () => _data };
+  return {
+    load, lookup, get: () => _data,
+    /** 合并外部数据（本地目录直读的结果）。同键以传入的为准，并重算 meta。 */
+    merge(turns, extra){
+      if(!_data) _data = { v:1, gen:Date.now(),
+        meta:{ turns:0, reqs:0, from:0, to:0, sources:[], light:false }, t:{} };
+      let added = 0, updated = 0;
+      for(const [k, v] of Object.entries(turns)){
+        if(_data.t[k]) updated++; else added++;
+        _data.t[k] = v;
+      }
+      const m = _data.meta;
+      const vals = Object.values(_data.t);
+      m.turns = vals.length;
+      m.reqs  = vals.reduce((a, b) => a + (b.n || 0), 0);
+      m.from = 0; m.to = 0;
+      for(const v of vals){
+        if(v.t0 && (!m.from || v.t0 < m.from)) m.from = v.t0;
+        if(v.t1 > m.to) m.to = v.t1;
+      }
+      if(extra && extra.sources) m.sources = [...new Set([...(m.sources || []), ...extra.sources])];
+      m.localScan = true;          // 标记数据里含本地直读的部分
+      _data.gen = Date.now();      // 刷新数据时间，让状态栏显示「刚刚生成」
+      return { added, updated, total: m.turns };
+    }
+  };
+})();
+
+/* =========================================================
+ * 10.7 本地会话直读（File System Access API）
+ *
+ * 浏览器在 file:// 下无法执行 node 脚本，但可以直接读文件。
+ * 用户授权一次 ~/.workbuddy 或 ~/.codebuddy 目录后，页面就能自己扫描
+ * projects 目录下的所有 .jsonl，聚合出与 token-usage-data.js 同构的回合数据，
+ * 于是「导入 Excel → 自动匹配」不再需要先跑 bat。
+ *
+ * 目录句柄存在 IndexedDB 里，下次打开只需点一下恢复授权。
+ * =======================================================*/
+const LocalScan = (() => {
+  const DB = 'buddy-scan', STORE = 'dirs';
+  let _handles = [];
+
+  function idb(){
+    return new Promise((res, rej) => {
+      const rq = indexedDB.open(DB, 1);
+      rq.onupgradeneeded = e => {
+        const d = e.target.result;
+        if(!d.objectStoreNames.contains(STORE)) d.createObjectStore(STORE, { keyPath:'i' });
+      };
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror   = () => rej(rq.error);
+    });
+  }
+  async function saveHandles(){
+    try{
+      const d = await idb();
+      let out;
+      const t = d.transaction(STORE, 'readwrite');
+      const s = t.objectStore(STORE);
+      s.clear();
+      _handles.forEach((h, i) => s.put({ i, h }));
+    }catch(e){ console.warn('[LocalScan] 保存句柄失败', e); }
+  }
+  async function loadHandles(){
+    try{
+      const d = await idb();
+      const t = d.transaction(STORE, 'readonly');
+      const all = await new Promise((res, rej) => {
+        const rq = t.objectStore(STORE).getAll();
+        rq.onsuccess = () => res(rq.result);
+        rq.onerror   = () => rej(rq.error);
+      });
+      _handles = all.map(x => x.h).filter(Boolean);
+      return _handles.length;
+    }catch(e){ return 0; }
+  }
+
+  /** 定位目录下的 projects 子目录（用户可能选 .workbuddy，也可能直接选 projects） */
+  async function findProjects(dir){
+    const out = [];
+    if(dir.name === 'projects'){ out.push(dir); return out; }
+    try{
+      for await (const [name, h] of dir.entries()){
+        if(h.kind === 'directory' && name === 'projects') out.push(h);
+      }
+    }catch(e){ /* 忽略不可读的目录 */ }
+    return out;
+  }
+
+  /** 递归收集 .jsonl（限制深度，跳过明显无关的大目录） */
+  const SKIP = new Set(['node_modules', '.git', 'binaries', 'plugins', 'blobs', 'cache', 'logs']);
+  async function collectJsonl(dir, out, depth){
+    if(depth > 5) return;
+    try{
+      for await (const [name, h] of dir.entries()){
+        if(h.kind === 'directory'){
+          if(SKIP.has(name)) continue;
+          await collectJsonl(h, out, depth + 1);
+        }else if(name.endsWith('.jsonl')){
+          out.push(h);
+        }
+      }
+    }catch(e){ /* 忽略 */ }
+  }
+
+  /** 解析单个 jsonl，按 conversationRequestId 聚合（与 token-usage-report.js 同口径） */
+  async function parseFile(fh, acc){
+    const file = await fh.getFile();
+    const text = await file.text();
+    for(const line of text.split('\n')){
+      if(!line.includes('"usage"')) continue;
+      let d;
+      try{ d = JSON.parse(line); }catch{ continue; }
+      const m = d.message;
+      if(!m || typeof m !== 'object' || Array.isArray(m)) continue;
+      const u = m.usage;
+      if(!u || typeof u !== 'object' || Array.isArray(u)) continue;
+      const pd = d.providerData || {};
+      const key = String(pd.conversationRequestId || '').trim().toLowerCase();
+      if(!key) continue;
+
+      const inp = u.input_tokens || 0, o = u.output_tokens || 0;
+      const cr  = u.cache_read_input_tokens || 0;
+      const tot = u.total_tokens || (inp + o);
+
+      let t = acc[key];
+      if(!t) t = acc[key] = { n:0, in:0, out:0, cr:0, cc:0, tot:0, t0:0, t1:0,
+                              m:'', s:d.sessionId || '', src:'本地目录', p:d.cwd || '',
+                              best:-1, d:[] };
+      t.n++;
+      t.in += inp; t.out += o; t.cr += cr;
+      t.cc += u.cache_creation_input_tokens || 0;
+      t.tot += tot;
+
+      const ms = d.timestamp || 0;
+      if(ms){ if(!t.t0 || ms < t.t0) t.t0 = ms; if(ms > t.t1) t.t1 = ms; }
+      if(tot > t.best){ t.best = tot; t.m = pd.model || 'unknown'; }
+      t.d.push([ms, d.name || '', inp, o, cr]);
+    }
+  }
+
+  /** 扫描全部已授权目录 */
+  async function scan(onProgress){
+    const files = [];
+    for(const h of _handles){
+      const ps = await findProjects(h);
+      for(const p of ps) await collectJsonl(p, files, 0);
+    }
+    const acc = {};
+    let done = 0;
+    for(const fh of files){
+      try{ await parseFile(fh, acc); }catch(e){ /* 单个文件失败不影响整体 */ }
+      done++;
+      if(onProgress && done % 5 === 0) onProgress(done, files.length);
+    }
+    if(onProgress) onProgress(files.length, files.length);
+    return { turns: acc, files: files.length };
+  }
+
+  /** 检查并申请目录读取权限 */
+  async function ensure(h){
+    const q = await h.queryPermission({ mode:'read' });
+    if(q === 'granted') return true;
+    return (await h.requestPermission({ mode:'read' })) === 'granted';
+  }
+
+  return {
+    supported: () => typeof window.showDirectoryPicker === 'function',
+    count: () => _handles.length,
+    handles: () => _handles,
+    loadHandles, saveHandles, ensure, scan,
+    async add(){
+      const h = await window.showDirectoryPicker({ id:'buddy-scan', mode:'read' });
+      // 避免重复添加同一个目录
+      if(!_handles.some(x => x.name === h.name)){
+        _handles.push(h);
+        await saveHandles();
+      }
+      return h;
+    },
+    async clear(){
+      _handles = [];
+      try{
+        const d = await idb();
+        d.transaction(STORE, 'readwrite').objectStore(STORE).clear();
+      }catch(e){ /* 忽略 */ }
+    }
+  };
 })();
 
 /** 把 token 数据挂到每一行；返回匹配统计 */
@@ -1771,6 +1959,49 @@ function attachTokens(rows){
   const total = hit + miss;   // 分母排除没有 RequestID 的行
   state.tokenMatch = { hit, miss, noId, total, rate: total ? hit / total : 0 };
   return state.tokenMatch;
+}
+
+/** 扫描本地会话目录（需先授权）→ 合并进 Token 数据 → 重新匹配渲染 */
+async function scanLocal(opts){
+  opts = opts || {};
+  if(!LocalScan.supported()){
+    if(!opts.silent) toast('当前浏览器不支持读取本地目录，请用 Chrome / Edge');
+    return false;
+  }
+  if(!LocalScan.count()){
+    if(!opts.silent) toast('请先点「📁 连接本地会话」授权目录');
+    return false;
+  }
+
+  // 权限可能已过期（浏览器重启后），需要用户再确认一次
+  let ok = 0;
+  for(const h of LocalScan.handles()){ if(await LocalScan.ensure(h)) ok++; }
+  if(!ok){ if(!opts.silent) toast('目录授权被拒绝'); return false; }
+
+  const btn = $('btnScan');
+  const label = btn ? btn.textContent : '';
+  if(btn){ btn.disabled = true; btn.textContent = '⏳ 扫描中…'; }
+  setSaveState('saving', '正在扫描本地会话…');
+
+  let r;
+  try{
+    r = await LocalScan.scan((done, total) => { if(btn) btn.textContent = `⏳ ${done}/${total}`; });
+  }catch(e){
+    console.error('[LocalScan]', e);
+    if(btn){ btn.disabled = false; btn.textContent = label; }
+    setSaveState('saved', '扫描失败');
+    if(!opts.silent) toast('扫描失败：' + e.message);
+    return false;
+  }
+
+  const res = TokenData.merge(r.turns, { sources: ['本地目录'] });
+  state.tokenLoaded = true;
+  if(state.all.length){ attachTokens(state.all); render(); }
+
+  if(btn){ btn.disabled = false; btn.textContent = label; }
+  setSaveState('saved', `已扫描 ${r.files} 个会话文件`);
+  if(!opts.silent) toast(`扫描完成：${r.files} 个文件，回合 ${res.total}（新增 ${res.added}）`);
+  return true;
 }
 
 /** 同步入口：重新加载数据文件 → 重新匹配 → 重渲染 */
@@ -2194,6 +2425,10 @@ async function loadFile(file){
     setSaveState('saved',
       `已保存 · ${new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}`);
     window.scrollTo({top:0, behavior:'smooth'});
+
+    // 已连接本地目录时后台重扫一遍 —— 这就是「导入即自动匹配」。
+    // 故意不 await：先让用户立刻看到数据，扫完自动刷新。
+    if(LocalScan.count()) scanLocal({ silent: true });
   }catch(err){
     console.error(err);
     alert('解析失败：' + err.message);
@@ -2350,11 +2585,26 @@ async function loadFile(file){
 
   $('btnSync').addEventListener('click', () => syncTokens({ toast: true }));
 
+  /* ---- 本地会话直读：授权一次，之后导入即自动匹配 ---- */
+  $('btnScan').addEventListener('click', async () => {
+    try{
+      await LocalScan.add();
+    }catch(e){
+      if(e && e.name === 'AbortError') return;   // 用户自己取消了选择
+      toast('选择目录失败：' + (e && e.message || e));
+      return;
+    }
+    await scanLocal();
+  });
+
   bindChips();
 
   // 先静默加载 token 数据（失败不能阻塞快照恢复），再恢复历史数据集
   (async () => {
     state.tokenLoaded = await TokenData.load();
+    // 恢复上次授权的目录句柄（权限需要用户点一下才生效）
+    const n = await LocalScan.loadHandles();
+    if(n) $('btnScan').textContent = `📁 本地会话 (${n})`;
     await tryRestore();
   })();
 })();
