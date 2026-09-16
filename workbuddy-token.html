@@ -316,7 +316,6 @@ table.cal td.cal-cell.has:hover{
     <button class="btn" id="btnPrint" hidden>🖨 打印 / PDF</button>
     <button class="btn" id="btnMd" hidden>⬇ Markdown</button>
     <button class="btn" id="btnCsv" hidden>⬇ CSV</button>
-    <button class="btn" id="btnFull" hidden title="逐条导出全部记录，未关联 Token 的也保留">⬇ 完整明细</button>
     <button class="btn" id="btnReset" hidden>🗑 清空重来</button>
   </div>
 </div>
@@ -2033,7 +2032,7 @@ function applyDataset(rows, sheet, fileName){
 
   $('uploader').hidden = true;
   $('dash').hidden = false;
-  ['btnPrint','btnMd','btnCsv','btnFull','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
+  ['btnPrint','btnMd','btnCsv','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
     .forEach(id => { const el = $(id); if(el) el.hidden = false; });
 
   // 无条件重算 token 关联：覆盖「首次导入 / 追加合并 / 快照恢复」全部路径
@@ -2271,14 +2270,6 @@ async function loadFile(file){
       buildCSV(d), 'text/csv');
   });
 
-  $('btnFull').addEventListener('click', () => {
-    const d = getFiltered();
-    if(!d.length){ toast('当前无数据'); return; }
-    const linked = d.filter(x => x.token).length;
-    download(`积分Token完整明细_${d.length}条.csv`, buildFullDetail(d), 'text/csv');
-    toast(`已导出 ${d.length} 条（已关联 ${linked}，未关联 ${d.length - linked}）`);
-  });
-
   /* ---- 完整明细卡：三态筛选 + 搜索 + 分页 ---- */
   $('detailSeg').addEventListener('click', e => {
     const b = e.target.closest('.chip');
@@ -2332,7 +2323,7 @@ async function loadFile(file){
     $('dash').hidden = true;
     $('banner').hidden = true;
     $('mergeInfo').classList.remove('show');
-    ['btnPrint','btnMd','btnCsv','btnFull','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
+    ['btnPrint','btnMd','btnCsv','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
       .forEach(id => { const el = $(id); if(el) el.hidden = true; });
     $('srcName').textContent = '';
     window.scrollTo({top:0, behavior:'smooth'});
