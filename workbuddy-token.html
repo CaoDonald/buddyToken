@@ -412,7 +412,7 @@ table.cal td.cal-cell.has:hover{
       </div>
 
       <div class="card c12">
-        <h3><span class="dot"></span>每日趋势 <span class="tag">柱=积分 · 线=Token / 请求数</span></h3>
+        <h3><span class="dot"></span>每日趋势 <span class="tag">柱=积分 / Token / 请求数</span></h3>
         <div class="chart-box tall"><canvas id="cDaily"></canvas></div>
       </div>
 
@@ -1004,24 +1004,24 @@ function renderCharts(d){
   });
 
   const dayLabels = s.byDate.map(x => x.key);
-  /* ---- 每日三轴：柱=积分（左）· 线=Token（右内）· 线=请求数（右外）----
+  /* ---- 每日三轴并排柱：积分（左）· Token（右内）· 请求数（右外）----
      无 Token 数据时退化为「积分 + 请求数」两轴，请求数独占右轴。 */
   const dailyDatasets = [
     {type:'bar', label:'积分消耗', data: s.byDate.map(x => Math.round(x.sum*100)/100),
-     yAxisID:'y', backgroundColor:'rgba(79,110,247,.72)', borderRadius:5,
-     barPercentage:.6, order:2}
+     yAxisID:'y', backgroundColor:'rgba(79,110,247,.75)', borderRadius:4,
+     categoryPercentage:.85, barPercentage:.9}
   ];
   if(s.hasToken){
     dailyDatasets.push(
-      {type:'line', label:'Token', data: s.byDate.map(x => x.tk),
-       yAxisID:'y1', borderColor:'#f59f00', backgroundColor:'rgba(245,159,0,.14)',
-       fill:true, borderWidth:2, tension:.35, pointRadius:3, pointHoverRadius:5, order:1}
+      {type:'bar', label:'Token', data: s.byDate.map(x => x.tk),
+       yAxisID:'y1', backgroundColor:'rgba(245,159,0,.75)', borderRadius:4,
+       categoryPercentage:.85, barPercentage:.9}
     );
   }
   dailyDatasets.push(
-    {type:'line', label:'请求数', data: s.byDate.map(x => x.count),
-     yAxisID: s.hasToken ? 'y2' : 'y1', borderColor:'#12b886', backgroundColor:'#12b886',
-     borderWidth:2, tension:.35, pointRadius:3, pointHoverRadius:5, order:1}
+    {type:'bar', label:'请求数', data: s.byDate.map(x => x.count),
+     yAxisID: s.hasToken ? 'y2' : 'y1', backgroundColor:'rgba(18,184,134,.75)', borderRadius:4,
+     categoryPercentage:.85, barPercentage:.9}
   );
 
   const dailyScales = {
@@ -1047,7 +1047,7 @@ function renderCharts(d){
       interaction:{mode:'index', intersect:false},
       plugins:{
         legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
-          usePointStyle:true, pointStyle:'circle', padding:12}},
+          usePointStyle:true, pointStyle:'rect', padding:12}},
         tooltip:{callbacks:{label(c){
           const name = c.dataset.label;
           if(name === 'Token')  return ` Token：${fmt0(c.parsed.y)}`;

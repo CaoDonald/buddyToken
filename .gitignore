@@ -16,6 +16,9 @@ _verify*.py
 _analyze*.py
 _timematch.py
 
+# 浏览器调试工具产物
+.playwright-cli/
+
 # 系统文件
 Thumbs.db
 desktop.ini
