@@ -412,13 +412,13 @@ table.cal td.cal-cell.has:hover{
       </div>
 
       <div class="card c12">
-        <h3><span class="dot"></span>每日趋势 <span class="tag">柱=积分 · 线=请求数</span></h3>
+        <h3><span class="dot"></span>每日趋势 <span class="tag">柱=积分 · 线=Token / 请求数</span></h3>
         <div class="chart-box tall"><canvas id="cDaily"></canvas></div>
       </div>
 
-      <div class="card c12" id="tokenChartCard" hidden>
-        <h3><span class="dot"></span>每日 Token 与积分 <span class="tag">柱=积分 · 线=Token</span></h3>
-        <div class="chart-box tall"><canvas id="cTokenDaily"></canvas></div>
+      <div class="card c12" id="tokTrendCard" hidden>
+        <h3><span class="dot"></span>Token 趋势 <span class="tag">堆叠 · 缓存读 + 未命中输入 + 输出</span></h3>
+        <div class="chart-box tall"><canvas id="cTokTrend"></canvas></div>
       </div>
 
       <div class="card c7" id="tokenTopCard" hidden>
@@ -1004,19 +1004,44 @@ function renderCharts(d){
   });
 
   const dayLabels = s.byDate.map(x => x.key);
+  /* ---- 每日三轴：柱=积分（左）· 线=Token（右内）· 线=请求数（右外）----
+     无 Token 数据时退化为「积分 + 请求数」两轴，请求数独占右轴。 */
+  const dailyDatasets = [
+    {type:'bar', label:'积分消耗', data: s.byDate.map(x => Math.round(x.sum*100)/100),
+     yAxisID:'y', backgroundColor:'rgba(79,110,247,.72)', borderRadius:5,
+     barPercentage:.6, order:2}
+  ];
+  if(s.hasToken){
+    dailyDatasets.push(
+      {type:'line', label:'Token', data: s.byDate.map(x => x.tk),
+       yAxisID:'y1', borderColor:'#f59f00', backgroundColor:'rgba(245,159,0,.14)',
+       fill:true, borderWidth:2, tension:.35, pointRadius:3, pointHoverRadius:5, order:1}
+    );
+  }
+  dailyDatasets.push(
+    {type:'line', label:'请求数', data: s.byDate.map(x => x.count),
+     yAxisID: s.hasToken ? 'y2' : 'y1', borderColor:'#12b886', backgroundColor:'#12b886',
+     borderWidth:2, tension:.35, pointRadius:3, pointHoverRadius:5, order:1}
+  );
+
+  const dailyScales = {
+    x:{grid:{display:false}, ticks:{maxTicksLimit:20, autoSkip:true, maxRotation:0}},
+    y:{beginAtZero:true, position:'left', grid:{color:'#f0f3fa'},
+       title:{display:true, text:'积分', font:{size:10.5}}, ticks:{callback:v => fmt0(v)}}
+  };
+  if(s.hasToken){
+    dailyScales.y1 = {beginAtZero:true, position:'right', grid:{display:false},
+      title:{display:true, text:'Token', font:{size:10.5}}, ticks:{callback:v => fmt0(v)}};
+    dailyScales.y2 = {beginAtZero:true, position:'right', grid:{display:false},
+      title:{display:true, text:'请求数', font:{size:10.5}}, ticks:{precision:0}};
+  } else {
+    dailyScales.y1 = {beginAtZero:true, position:'right', grid:{display:false},
+      title:{display:true, text:'请求数', font:{size:10.5}}, ticks:{precision:0}};
+  }
+
   upsert('cDaily', {
     type:'bar',
-    data:{
-      labels: dayLabels,
-      datasets:[
-        {type:'bar', label:'积分消耗', data: s.byDate.map(x => Math.round(x.sum*100)/100),
-         yAxisID:'y', backgroundColor:'rgba(79,110,247,.72)', borderRadius:5,
-         barPercentage:.6, order:2},
-        {type:'line', label:'请求数', data: s.byDate.map(x => x.count),
-         yAxisID:'y1', borderColor:'#12b886', backgroundColor:'#12b886',
-         borderWidth:2, tension:.35, pointRadius:3, pointHoverRadius:5, order:1}
-      ]
-    },
+    data:{ labels: dayLabels, datasets: dailyDatasets },
     options:{
       responsive:true, maintainAspectRatio:false,
       interaction:{mode:'index', intersect:false},
@@ -1024,20 +1049,63 @@ function renderCharts(d){
         legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
           usePointStyle:true, pointStyle:'circle', padding:12}},
         tooltip:{callbacks:{label(c){
-          return c.dataset.type === 'line'
-            ? ` 请求数：${c.parsed.y} 次`
-            : ` 积分：${fmt2(c.parsed.y)}`;
+          const name = c.dataset.label;
+          if(name === 'Token')  return ` Token：${fmt0(c.parsed.y)}`;
+          if(name === '请求数') return ` 请求数：${c.parsed.y} 次`;
+          return ` 积分：${fmt2(c.parsed.y)}`;
         }}}
       },
-      scales:{
-        x:{grid:{display:false}, ticks:{maxTicksLimit:20, autoSkip:true, maxRotation:0}},
-        y:{beginAtZero:true, position:'left', grid:{color:'#f0f3fa'},
-           title:{display:true, text:'积分', font:{size:10.5}}, ticks:{callback:v => fmt0(v)}},
-        y1:{beginAtZero:true, position:'right', grid:{display:false},
-            title:{display:true, text:'请求数', font:{size:10.5}}, ticks:{precision:0}}
-      }
+      scales: dailyScales
     }
   });
+
+  /* ---- Token 趋势：逐日堆叠柱，缓存读 / 未命中输入 / 输出 ----
+     三段相加 = 当日总 Token（cr 是 in 的子集，必须从 in 里扣出去，不能平铺相加）。 */
+  const tokTrendCard = $('tokTrendCard');
+  if(tokTrendCard) tokTrendCard.hidden = !s.hasToken;
+  if(s.hasToken){
+    // 注意顺序：必须先把容器取消 hidden，再 upsert。
+    // Chart.js 在隐藏容器上初始化会量到 0 尺寸，图会画不出来。
+    upsert('cTokTrend', {
+      type:'bar',
+      data:{
+        labels: dayLabels,
+        datasets:[
+          {label:'未命中输入', data: s.byDate.map(x => Math.max(0, x.tkIn - x.tkCr)),
+           backgroundColor:'#4f6ef7', borderRadius:3, barPercentage:.62},
+          {label:'缓存读', data: s.byDate.map(x => x.tkCr),
+           backgroundColor:'#b3c0fd', borderRadius:3, barPercentage:.62},
+          {label:'输出', data: s.byDate.map(x => x.tkOut),
+           backgroundColor:'#f59f00', borderRadius:3, barPercentage:.62}
+        ]
+      },
+      options:{
+        responsive:true, maintainAspectRatio:false,
+        interaction:{mode:'index', intersect:false},
+        plugins:{
+          legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
+            usePointStyle:true, pointStyle:'circle', padding:12}},
+          tooltip:{
+            callbacks:{
+              label(c){ return ` ${c.dataset.label}：${fmt0(c.parsed.y)}`; },
+              footer(items){
+                const day = s.byDate[items[0].dataIndex];
+                if(!day) return '';
+                const rate = day.tkIn ? day.tkCr / day.tkIn : 0;
+                return `合计 ${fmt0(day.tk)} token · 缓存命中 ${(rate*100).toFixed(1)}%`;
+              }
+            }
+          }
+        },
+        scales:{
+          x:{stacked:true, grid:{display:false},
+             ticks:{maxTicksLimit:20, autoSkip:true, maxRotation:0}},
+          y:{stacked:true, beginAtZero:true, grid:{color:'#f0f3fa'},
+             ticks:{callback:v => fmtTok(v)}}
+        }
+      }
+    });
+  }
 
   const topModels = s.byModel.slice(0, 6).map(x => x.key);
   const datasets = topModels.map((m, i) => ({
@@ -1082,47 +1150,6 @@ function renderCharts(d){
     }
   });
 
-  /* ---- 每日 Token 与积分：柱=积分（左轴）· 线=Token（右轴）---- */
-  const tokCard = $('tokenChartCard');
-  if(tokCard) tokCard.hidden = !s.hasToken;
-  if(s.hasToken){
-    // 注意顺序：必须先把容器取消 hidden，再 upsert。
-    // Chart.js 在隐藏容器上初始化会量到 0 尺寸，图会画不出来。
-    upsert('cTokenDaily', {
-      type:'bar',
-      data:{
-        labels: dayLabels,
-        datasets:[
-          {type:'bar', label:'积分', data: s.byDate.map(x => Math.round(x.sum*100)/100),
-           yAxisID:'y', backgroundColor:'rgba(79,110,247,.72)', borderRadius:5,
-           barPercentage:.6, order:2},
-          {type:'line', label:'Token', data: s.byDate.map(x => x.tk),
-           yAxisID:'y1', borderColor:'#f59f00', backgroundColor:'rgba(245,159,0,.14)',
-           fill:true, borderWidth:2, tension:.35, pointRadius:3, pointHoverRadius:5, order:1}
-        ]
-      },
-      options:{
-        responsive:true, maintainAspectRatio:false,
-        interaction:{mode:'index', intersect:false},
-        plugins:{
-          legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
-            usePointStyle:true, pointStyle:'circle', padding:12}},
-          tooltip:{callbacks:{label(c){
-            return c.dataset.type === 'line'
-              ? ` Token：${fmt0(c.parsed.y)}`
-              : ` 积分：${fmt2(c.parsed.y)}`;
-          }}}
-        },
-        scales:{
-          x:{grid:{display:false}, ticks:{maxTicksLimit:20, autoSkip:true, maxRotation:0}},
-          y:{beginAtZero:true, position:'left', grid:{color:'#f0f3fa'},
-             title:{display:true, text:'积分', font:{size:10.5}}, ticks:{callback:v => fmt0(v)}},
-          y1:{beginAtZero:true, position:'right', grid:{display:false},
-              title:{display:true, text:'Token', font:{size:10.5}}, ticks:{callback:v => fmt0(v)}}
-        }
-      }
-    });
-  }
 }
 
 /* =========================================================
