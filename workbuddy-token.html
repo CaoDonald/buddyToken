@@ -380,6 +380,7 @@ table.cal td.cal-cell.has:hover{
         <input type="date" id="dateTo">
         <button class="btn" id="qToday" style="padding:5px 10px;font-size:12px" title="把日期范围设为今天">今日</button>
         <button class="btn" id="q7" style="padding:5px 10px;font-size:12px" title="把日期范围设为最近 7 天">近7日</button>
+        <button class="btn" id="q30" style="padding:5px 10px;font-size:12px" title="把日期范围设为最近 30 天">近30日</button>
         <button class="btn" id="qAll" style="padding:5px 10px;font-size:12px" title="清除日期限制，显示全部数据">全部</button>
       </div>
       <div class="fgroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
@@ -436,6 +437,14 @@ table.cal td.cal-cell.has:hover{
         <div class="chart-box tall"><canvas id="cStack"></canvas></div>
       </div>
 
+      <div class="card c12" id="latCard" hidden>
+        <h3>
+          <span class="dot"></span>各模型响应耗时
+          <span class="tag">单次 API 请求 · 已排除工具执行 · P90 反映长尾</span>
+        </h3>
+        <div class="chart-box tall"><canvas id="cLatency"></canvas></div>
+      </div>
+
       <div class="card c12">
         <h3><span class="dot"></span>模型 × 时段 热力图</h3>
         <div id="heatWrap"></div>
@@ -470,6 +479,11 @@ table.cal td.cal-cell.has:hover{
           <br>
           <b>解读提醒</b>：这个数字低不代表模型差——复杂任务才会用强模型，它天然 Token 多、积分高。
           要横向比性价比，请结合「单次积分」和「缓存率」一起看。
+          <br>
+          <b>响应 P50 / 首字延迟 / 输出速度</b>：三者都针对<b>单次 API 请求</b>，
+          已排除工具执行时间但含网络与排队。后两者由「耗时 ≈ 首字延迟 + 输出 token ÷ 速度」
+          分箱回归拟合得出（样本不足 60 条时留空）。带 <span style="color:#c8a24a">*</span> 表示样本不足 30 条。
+          <b>单次请求耗时不等于用户等待时间</b>——用户等的是整个回合，见上方 KPI 的「模型耗时占比」。
         </p>
       </div>
 
@@ -525,6 +539,11 @@ const pct = (v,t) => t>0 ? (v/t*100).toFixed(1)+'%' : '0%';
 const pad = n => String(n).padStart(2,'0');
 const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
 const parseDs = s => new Date(s.replace(/-/g,'/'));
+/**
+ * 响应耗时有效性窗口，与 token-usage-report.js 保持一致：
+ * <0.5s 多半是记录异常或没有可用起点，>1h 多半是会话中断后残留，一律记为 0（无数据）。
+ */
+const validLat = ms => (ms > 500 && ms < 3600000) ? ms : 0;
 const PALETTE = ['#4f6ef7','#7c5cff','#12b886','#f59f00','#f0475f','#3bb2e8',
                  '#9b8cff','#5ad1a0','#ff8a65','#26c6da','#ab47bc','#8d9bb5'];
 
@@ -715,7 +734,8 @@ const state = {
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
   detail: { mode:'all', q:'', page:0, expanded:null },   // expanded = 展开步骤明细的回合 ID
   rank: { sort:'perPoint', dir:'desc' },  // 模型性价比卡的表头排序
-  sess: { sort:'pts', dir:'desc' }        // Session 消耗卡的表头排序
+  sess: { sort:'pts', dir:'desc' },       // Session 消耗卡的表头排序
+  day:  { sort:'date', dir:'asc' }        // 每日汇总卡的表头排序（默认时间正序）
 };
 
 /* =========================================================
@@ -749,6 +769,43 @@ function getFiltered(){
     if(f.clients.size && !f.clients.has(x.client)) return false;
     return true;
   });
+}
+
+/**
+ * 用稳健分箱回归把响应耗时拆成「首字延迟」与「输出速度」：
+ *   latency ≈ ttft + 输出token / speed
+ *
+ * 单次请求的耗时波动很大（网络抖动、服务端负载、缓存命中与否），直接对原
+ * 始点做最小二乘会被离群点带偏。所以先按输出 token 排序分成若干箱、每箱取
+ * 中位数，得到一个平滑的点列后再做最小二乘。样本太少时返回 null——回归出来
+ * 的速度没有参考价值。
+ *
+ * pairs 是 [输出token, 耗时ms] 的数组。返回 { ttft(秒), speed(tok/s), n }。
+ */
+function fitLatency(pairs){
+  if(pairs.length < 60) return null;
+  const s = [...pairs].sort((a, b) => a[0] - b[0]);
+  // 箱数随样本量收放：固定 25 箱时小样本的每箱不足 8 条会被大量跳过，
+  // 最后组不出足够的点，回归直接失败。
+  const BINS = Math.max(6, Math.min(25, Math.floor(s.length / 8))), pts = [];
+  for(let i = 0; i < BINS; i++){
+    const seg = s.slice(Math.floor(i * s.length / BINS), Math.floor((i + 1) * s.length / BINS));
+    if(seg.length < 8) continue;
+    const xs = seg.map(p => p[0]).sort((a, b) => a - b);
+    const ys = seg.map(p => p[1]).sort((a, b) => a - b);
+    pts.push([xs[Math.floor(xs.length / 2)], ys[Math.floor(ys.length / 2)]]);
+  }
+  if(pts.length < 4) return null;
+  const n = pts.length;
+  const mx = pts.reduce((a, p) => a + p[0], 0) / n;
+  const my = pts.reduce((a, p) => a + p[1], 0) / n;
+  let num = 0, den = 0;
+  for(const [x, y] of pts){ num += (x - mx) * (y - my); den += (x - mx) ** 2; }
+  if(!den) return null;
+  const b = num / den;
+  // 斜率非正说明样本没有「输出越多越慢」的规律，此时速度无意义
+  if(b <= 0) return null;
+  return { ttft: Math.max(my - b * mx, 0) / 1000, speed: 1000 / b, n: pairs.length };
 }
 
 function computeStats(d){
@@ -833,19 +890,90 @@ function computeStats(d){
     modelList: [...o.models],
   }));
 
+  // ---- 模型响应耗时 ----
+  // 请求级耗时藏在步骤明细的第 6 位（--light 产物没有明细，这里自然为空）。
+  // 归组用积分行的模型名（而非回合代表模型），这样与模型表、筛选条件天然对齐。
+  //
+  // 回合级跨度由明细反推：起点 = min(完成时刻 − 耗时)，终点 = max(完成时刻)，
+  // 算出来的正是「用户提交 → 最后一次响应完成」，含首个请求自身的耗时。
+  // 若改用首末完成时刻相减，会漏掉首个请求，占比被显著高估。
+  const latMap = new Map();
+  const allLats = [];
+  const turnRatios = [];
+  let turnLatN = 0;
+  for(const x of tkRows){
+    const t = x.token;
+    const det = t && t.d;
+    if(!det || !det.length) continue;
+
+    let g = latMap.get(x.model);
+    if(!g){ g = { key:x.model, pairs:[] }; latMap.set(x.model, g); }
+
+    let start = 0, end = 0, tLat = 0, tN = 0;
+    for(const st of det){
+      const ms = st[0] || 0, out = st[3] || 0, lat = st[5] || 0;
+      if(ms && lat){
+        if(!start || ms - lat < start) start = ms - lat;
+        if(ms > end) end = ms;
+      }
+      if(lat > 0){
+        g.pairs.push([out, lat]);
+        allLats.push(lat);
+        tLat += lat; tN++;
+      }
+    }
+    // 跨度 >6h 的多半是会话中断后 anchor 被污染的残留，占比 >1 的是推算舍入
+    if(tN && start && end > start){
+      const span = end - start;
+      if(span < 6 * 3600000) turnRatios.push(Math.min(tLat / span, 1));
+      turnLatN++;
+    }
+  }
+
+  const latModels = [...latMap.values()].map(g => {
+    const lats = g.pairs.map(p => p[1]).sort((a, b) => a - b);
+    const fit  = fitLatency(g.pairs);
+    const sumLat = lats.reduce((a, b) => a + b, 0);
+    const sumOut = g.pairs.reduce((a, p) => a + p[0], 0);
+    return {
+      key: g.key, n: lats.length,
+      mean: sumLat / lats.length,
+      p50:  lats[Math.floor(lats.length / 2)],
+      p90:  lats[Math.floor(lats.length * 0.9)],
+      // 拟合不出来（样本不足或输出量与耗时不成规律）时为 null，界面显示「—」
+      ttft:  fit ? fit.ttft  : null,
+      speed: fit ? fit.speed : null,
+      // 有效吞吐：Σ输出token / Σ耗时，含首字延迟影响，比纯流式速度保守
+      thru: sumLat > 0 ? (sumOut / sumLat) * 1000 : 0,
+    };
+  }).sort((a, b) => a.p50 - b.p50);
+  const latByModel = new Map(latModels.map(m => [m.key, m]));
+
+  allLats.sort((a, b) => a - b);
+  turnRatios.sort((a, b) => a - b);
+  const medOf = a => a.length ? a[Math.floor(a.length / 2)] : null;
+
   // ---- 模型性价比 ----
   // 每积分 Token 是唯一能把 token 与积分拉到同一尺度的指标，越高越划算。
   // 注意：低不代表模型差——复杂任务才会用强模型，它天然 token 多、积分高。
   const modelRank = byModel
     .filter(m => m.tk > 0)                       // 有 token 数据的才参与比较
-    .map(m => ({
-      key: m.key, count: m.count, pts: m.sum,
-      tk: m.tk, tkIn: m.tkIn, tkOut: m.tkOut, tkCr: m.tkCr,
-      free: m.sum === 0,
-      perPoint: m.sum > 0 ? m.tk / m.sum : null, // null = 免费，无法算比率
-      perReq:   m.count  ? m.sum / m.count : 0,  // 单次均值积分
-      cacheRate: m.tkIn  ? m.tkCr / m.tkIn : 0,
-    }))
+    .map(m => {
+      const lm = latByModel.get(m.key);
+      return {
+        key: m.key, count: m.count, pts: m.sum,
+        tk: m.tk, tkIn: m.tkIn, tkOut: m.tkOut, tkCr: m.tkCr,
+        free: m.sum === 0,
+        perPoint: m.sum > 0 ? m.tk / m.sum : null, // null = 免费，无法算比率
+        perReq:   m.count  ? m.sum / m.count : 0,  // 单次均值积分
+        cacheRate: m.tkIn  ? m.tkCr / m.tkIn : 0,
+        // 响应耗时：--light 产物没有步骤明细、或该模型没关联到记录时为 null
+        latP50: lm ? lm.p50 : null,
+        ttft:   lm ? lm.ttft : null,
+        speed:  lm ? lm.speed : null,
+        latN:   lm ? lm.n : 0,
+      };
+    })
     .sort((a, b) => {
       if(a.free !== b.free) return a.free ? -1 : 1;   // 免费的排最前
       if(a.free && b.free)  return b.tk - a.tk;
@@ -871,7 +999,15 @@ function computeStats(d){
     tokenPerPoint:   tokenPts > 0 ? tokenTot / tokenPts : 0,        // 每 1 积分产出多少 token
     pointsPerMToken: tokenTot > 0 ? tokenPts / tokenTot * 1e6  : 0, // 每 M token 花多少积分
     cacheHitRate:    tokenIn  > 0 ? tokenCr / tokenIn : 0,
-    stepsPerTurn:    tkRows.length ? tokenReq / tkRows.length : 0
+    stepsPerTurn:    tkRows.length ? tokenReq / tkRows.length : 0,
+    // 响应耗时：请求级（每次 API 请求）与回合级（用户感知的等待）
+    latModels, latByModel, hasLatency: allLats.length > 0,
+    latN: allLats.length,
+    latMean: allLats.length ? allLats.reduce((a, b) => a + b, 0) / allLats.length : null,
+    latP50:  medOf(allLats),
+    latP90:  allLats.length ? allLats[Math.floor(allLats.length * 0.9)] : null,
+    latTurnN: turnLatN,
+    latTurnShare: medOf(turnRatios)
   };
 }
 
@@ -910,7 +1046,15 @@ function renderKPIs(d){
       {label:'Session 数', value: fmt0(s.bySession.length),
        sub: s.bySession.length
          ? `平均 <b>${(s.bySession.reduce((a,b) => a + b.count, 0) / s.bySession.length).toFixed(1)}</b> 回合 · 最长 <b>${Math.max(...s.bySession.map(b => b.count))}</b> 回合`
-         : '—'}
+         : '—'},
+      // 「单次 API 请求」与「回合等待」是两个口径，必须并列展示，
+      // 否则「平均响应 7s」很容易被读成「提问 7 秒就答完」。
+      ...(s.hasLatency ? [
+        {label:'单次响应耗时', value:`${(s.latMean/1000).toFixed(1)}s`, small:true,
+         sub:`每次 API 请求 · P50 <b>${(s.latP50/1000).toFixed(1)}s</b> · P90 ${(s.latP90/1000).toFixed(1)}s`},
+        {label:'模型耗时占比', value: s.latTurnShare != null ? `${(s.latTurnShare*100).toFixed(0)}%` : '—',
+         sub:`回合等待中花在模型上的中位比例 · ${fmt0(s.latTurnN)} 个回合`}
+      ] : [])
     );
   }else if(state.tokenLoaded){
     items.push({label:'Token 数据', value:'无匹配', small:true,
@@ -1150,6 +1294,54 @@ function renderCharts(d){
     }
   });
 
+  /* ---- 各模型响应耗时：横向条形，P50 与 P90 对照 ----
+     只看单次 API 请求的耗时（已排除工具执行）。P90 与 P50 的差距反映长尾程度：
+     差距大说明该模型偶尔会很慢，用户体感上比中位数差。 */
+  const latCard = $('latCard');
+  const latList = s.latModels.filter(m => m.n >= 20);
+  if(latCard) latCard.hidden = latList.length < 2;
+  if(latList.length >= 2){
+    // 同 cTokTrend：先取消 hidden 再 upsert，在隐藏容器上初始化会量到 0 尺寸
+    upsert('cLatency', {
+      type:'bar',
+      data:{
+        labels: latList.map(m => m.key),
+        datasets:[
+          {label:'P50', data: latList.map(m => +(m.p50 / 1000).toFixed(1)),
+           backgroundColor:'#4f6ef7', borderRadius:3, barPercentage:.7},
+          {label:'P90', data: latList.map(m => +(m.p90 / 1000).toFixed(1)),
+           backgroundColor:'#b3c0fd', borderRadius:3, barPercentage:.7}
+        ]
+      },
+      options:{
+        indexAxis:'y',
+        responsive:true, maintainAspectRatio:false,
+        interaction:{mode:'index', intersect:false},
+        plugins:{
+          legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
+            usePointStyle:true, pointStyle:'circle', padding:12}},
+          tooltip:{
+            callbacks:{
+              label:c => ` ${c.dataset.label}：${c.parsed.x} 秒`,
+              afterBody:items => {
+                const m = latList[items[0].dataIndex];
+                if(!m) return '';
+                return ['', `样本 ${fmt0(m.n)} 次请求`,
+                  m.ttft  != null ? `首字延迟 ${m.ttft.toFixed(1)} 秒` : '首字延迟：样本不足',
+                  m.speed != null ? `输出速度 ${m.speed.toFixed(0)} tok/s` : '输出速度：样本不足'
+                ];
+              }
+            }
+          }
+        },
+        scales:{
+          x:{beginAtZero:true, grid:{color:'#f0f3fa'}, ticks:{callback:v => v + 's'}},
+          y:{grid:{display:false}}
+        }
+      }
+    });
+  }
+
 }
 
 /* =========================================================
@@ -1358,6 +1550,15 @@ function renderDateHeatmap(d){
 /* =========================================================
  *  8. 表格
  * =======================================================*/
+const DAY_COLS = [
+  { k:'date',  t:'日期' },
+  { k:'sum',   t:'积分',     num:1 },
+  { k:'tk',    t:'Token',    num:1 },
+  { k:'count', t:'请求数',   num:1 },
+  { k:'avg',   t:'均值',     num:1 },
+  { k:'model', t:'主力模型' },
+];
+
 function renderTables(d){
   const s = computeStats(d);
 
@@ -1420,24 +1621,38 @@ function renderTables(d){
     }</tbody>`;
 
   const maxDay = s.peakDay.sum || 1;
+  // 每行先摊平成可比较的字段，再交给统一的表头排序处理。
+  // 日期用 YYYY-MM-DD 字符串，字典序即时间序。
+  const dayRows = s.byDate.map(day => {
+    const mm = agg(d.filter(x => x.date === day.key), x => x.model)[0];
+    return { date: day.key, sum: day.sum, tk: day.tk, count: day.count,
+             avg: day.sum / day.count, model: mm ? mm.key : '' };
+  });
+  {
+    const { sort, dir } = state.day;
+    const sign = dir === 'desc' ? -1 : 1;
+    dayRows.sort((a, b) => {
+      const va = a[sort], vb = b[sort];
+      if(typeof va === 'string') return sign * String(va).localeCompare(String(vb));
+      return sign * ((va || 0) - (vb || 0));
+    });
+  }
+  const dayHead = DAY_COLS.map(c => {
+    const on = state.day.sort === c.k;
+    return `<th class="sortable${on ? ' on' : ''}${c.num ? ' num' : ''}" data-k="${c.k}" title="点击排序">` +
+           `${c.t}${on ? (state.day.dir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`;
+  }).join('');
   $('tblDay').innerHTML = `
-    <thead><tr>
-      <th>日期</th><th class="num">积分</th><th class="num">Token</th><th class="num">请求数</th>
-      <th class="num">均值</th><th>主力模型</th><th style="width:90px"></th>
-    </tr></thead>
-    <tbody>${ s.byDate.map(day => {
-      const rows = d.filter(x => x.date === day.key);
-      const mm = agg(rows, x => x.model)[0];
-      return `<tr>
-        <td><b>${day.key}</b></td>
-        <td class="num">${fmt2(day.sum)}</td>
-        <td class="num">${day.tk ? fmtTok(day.tk) : '<span style="color:#c8d1e2">—</span>'}</td>
-        <td class="num" style="color:#6b7891">${day.count}</td>
-        <td class="num" style="color:#6b7891">${fmt2(day.sum/day.count)}</td>
-        <td style="font-size:12px;color:#6b7891">${mm ? esc(mm.key) : '-'}</td>
-        <td><div class="bar-mini"><i style="width:${(day.sum/maxDay*100).toFixed(1)}%"></i></div></td>
-      </tr>`;
-    }).join('') }</tbody>`;
+    <thead><tr>${dayHead}<th style="width:90px"></th></tr></thead>
+    <tbody>${ dayRows.map(r => `<tr>
+        <td><b>${r.date}</b></td>
+        <td class="num">${fmt2(r.sum)}</td>
+        <td class="num">${r.tk ? fmtTok(r.tk) : '<span style="color:#c8d1e2">—</span>'}</td>
+        <td class="num" style="color:#6b7891">${r.count}</td>
+        <td class="num" style="color:#6b7891">${fmt2(r.avg)}</td>
+        <td style="font-size:12px;color:#6b7891">${r.model ? esc(r.model) : '-'}</td>
+        <td><div class="bar-mini"><i style="width:${(r.sum/maxDay*100).toFixed(1)}%"></i></div></td>
+      </tr>`).join('') }</tbody>`;
 
   /* ---- Token 消耗 Top 10 回合 ---- */
   const tokCard = $('tokenTopCard');
@@ -1504,6 +1719,9 @@ const RANK_COLS = [
   { k:'pts',       t:'积分',         num:1 },
   { k:'tk',        t:'Token',        num:1 },
   { k:'perPoint',  t:'每积分 Token', num:1 },
+  { k:'latP50',    t:'响应 P50',     num:1 },
+  { k:'ttft',      t:'首字延迟',     num:1 },
+  { k:'speed',     t:'输出速度',     num:1 },
   { k:'perReq',    t:'单次积分',     num:1 },
   { k:'cacheRate', t:'缓存率',       num:1 },
 ];
@@ -1524,6 +1742,13 @@ function renderModelRank(d){
       va = a.free ? Infinity : (va || 0);
       vb = b.free ? Infinity : (vb || 0);
     }
+    // 没有耗时数据的模型（--light 产物、或没关联到本地记录）始终沉底，
+    // 不参与升降序——否则它们会被当成 0 混在真实值中间。
+    if(sort === 'latP50' || sort === 'ttft' || sort === 'speed'){
+      const na = va == null, nb = vb == null;
+      if(na !== nb) return na ? 1 : -1;
+      if(na && nb) return 0;
+    }
     if(typeof va === 'string') return sign * String(va).localeCompare(String(vb));
     return sign * ((va || 0) - (vb || 0));
   });
@@ -1541,6 +1766,14 @@ function renderModelRank(d){
       <td class="num">${fmtTok(m.tk)}</td>
       <td class="num" style="font-weight:600">${
         m.free ? '<span class="free-tag">免费</span>' : fmtTok(m.perPoint)}</td>
+      <td class="num" style="color:#6b7891"${
+        m.latP50 != null && m.latN < 30 ? ` title="样本仅 ${m.latN} 条，参考价值有限"` : ''}>${
+        m.latP50 != null
+          ? (m.latP50 / 1000).toFixed(1) + 's' +
+            (m.latN < 30 ? '<span style="color:#c8a24a" title="样本不足">*</span>' : '')
+          : '—'}</td>
+      <td class="num" style="color:#6b7891">${m.ttft != null ? m.ttft.toFixed(1) + 's' : '—'}</td>
+      <td class="num" style="color:#6b7891">${m.speed != null ? m.speed.toFixed(0) + ' tok/s' : '—'}</td>
       <td class="num" style="color:#6b7891">${fmt2(m.perReq)}</td>
       <td class="num" style="color:#6b7891">${(m.cacheRate*100).toFixed(1)}%</td>
     </tr>`).join('');
@@ -1639,10 +1872,14 @@ function renderSteps(t){
   }
   const rows = t.d.map((s, i) => {
     const ms = s[0], tool = s[1], inTok = s[2] || 0, outTok = s[3] || 0, cr = s[4] || 0;
+    // 第 6 位是本次请求的模型耗时。旧格式（5 列）没有这一位，显示「—」。
+    const lat = s[5] || 0;
     const time = ms ? new Date(ms).toLocaleTimeString('zh-CN', { hour12:false }) : '—';
     return `<tr>
       <td style="color:#a8b3c8">${i + 1}</td>
       <td class="mono">${time}</td>
+      <td class="num" style="color:#6b7891">${
+        lat > 0 ? (lat / 1000).toFixed(1) + 's' : '—'}</td>
       <td>${tool ? esc(tool) : '<span style="color:#c8d1e2">(无工具)</span>'}</td>
       <td class="num">${fmt0(inTok)}</td>
       <td class="num">${fmt0(outTok)}</td>
@@ -1653,7 +1890,7 @@ function renderSteps(t){
   return `<div class="steps">
     <table>
       <thead><tr>
-        <th style="width:34px">#</th><th>时间</th><th>工具</th>
+        <th style="width:34px">#</th><th>时间</th><th class="num">模型耗时</th><th>工具</th>
         <th class="num">输入</th><th class="num">输出</th><th class="num">缓存读</th><th class="num">合计</th>
       </tr></thead>
       <tbody>${rows}</tbody>
@@ -1686,7 +1923,19 @@ function renderDetail(d){
     </tr></thead>
     <tbody>${ rows.length ? rows.map(x => {
       const t = x.token;
-      const dur = (t && t.t1 && t.t0) ? (t.t1 - t.t0) / 1000 : 0;
+      // 回合时长优先用步骤明细推算的「用户提交 → 最后一次响应完成」——它含首个
+      // 请求自身的耗时；只取首末时间戳相减会漏掉它。没有明细时退回后者。
+      let dur = (t && t.t1 && t.t0) ? (t.t1 - t.t0) / 1000 : 0;
+      if(t && t.d && t.d.length){
+        let st0 = 0, en = 0;
+        for(const st of t.d){
+          const lat = st[5] || 0;
+          if(lat > 0 && st[0] && (!st0 || st[0] - lat < st0)) st0 = st[0] - lat;
+          if(st[0] > en) en = st[0];
+        }
+        if(st0 && en > st0) dur = (en - st0) / 1000;
+      }
+      const latSum = (t && t.lat) ? t.lat / 1000 : 0;
       const open = f.expanded === x.id;
       const hasSteps = !!(t && t.d && t.d.length);
       // 请求数可点：有步骤明细时展开该回合的每一步
@@ -1703,7 +1952,10 @@ function renderDetail(d){
         <td class="num">${fmt2(x.points)}</td>
         <td class="num">${t ? fmtTok(t.tot) : '<span style="color:#c8d1e2">—</span>'}</td>
         ${reqCell}
-        <td class="num" style="color:#6b7891">${
+        <td class="num" style="color:#6b7891"${
+          latSum > 0 && dur > 0
+            ? ` title="其中模型耗时 ${latSum.toFixed(1)} 秒（${(100*latSum/dur).toFixed(0)}%），其余为工具执行"`
+            : ''}>${
           t ? (dur >= 60 ? (dur / 60).toFixed(1) + ' 分' : dur.toFixed(0) + ' 秒')
             : '<span style="color:#c8d1e2">—</span>'}</td>
       </tr>`;
@@ -1776,6 +2028,30 @@ function renderReport(d){
       + `即可把每条积分关联到本地会话记录，得到 Token 用量、缓存命中率、每积分 token 产出等指标。</span>`;
   }
 
+  // 响应耗时章节正文（同样在模板外拼好，避免模板内深层嵌套反引号）
+  let latSummary;
+  if(s.hasLatency){
+    const cand = s.latModels.filter(m => m.n >= 30);
+    const fast = cand.length ? [...cand].sort((a, b) => a.p50 - b.p50)[0] : null;
+    const slow = cand.length > 1 ? [...cand].sort((a, b) => b.p50 - a.p50)[0] : null;
+    latSummary = `共统计 <b>${fmt0(s.latN)}</b> 次 API 请求的耗时，单次中位 <span class="hl">${(s.latP50/1000).toFixed(1)} 秒</span>`
+      + `（均值 ${(s.latMean/1000).toFixed(1)} 秒，P90 ${(s.latP90/1000).toFixed(1)} 秒）。`
+      + (fast ? `样本足够的模型中 <b>${esc(fast.key)}</b> 最快（P50 ${(fast.p50/1000).toFixed(1)} 秒）` : '')
+      + (slow && fast && slow.key !== fast.key
+          ? `，<b>${esc(slow.key)}</b> 最慢（P50 ${(slow.p50/1000).toFixed(1)} 秒），相差 <b>${(slow.p50/fast.p50).toFixed(1)} 倍</b>。`
+          : '。')
+      + `<br>这些耗时<b>已排除工具执行时间</b>，只反映模型侧（含网络往返与排队）。`
+      + (s.latTurnShare != null
+          ? `从用户视角看，回合等待里模型耗时占 <b>${(s.latTurnShare*100).toFixed(0)}%</b>（中位，基于 ${fmt0(s.latTurnN)} 个回合），其余是工具执行。`
+          : '')
+      + `<br><span style="color:#8b98b3">口径说明：耗时由会话记录的时间戳推算——模型响应完成时刻减去上一次工具执行完成时刻，`
+      + `因此工具执行被干净排除。时间戳取的是记录写入时刻，换网络环境数值会变；`
+      + `单次请求耗时 &lt;0.5 秒或 &gt;1 小时视为异常已剔除，故样本数可能略少于总请求数。</span>`;
+  }else{
+    latSummary = `<span style="color:#8b98b3">当前数据没有请求级耗时——可能是 token-usage-data.js 由 <b>--light</b> 模式生成，`
+      + `或本地会话记录缺少可推算的成对时间戳。</span>`;
+  }
+
   const tips = [];
   if(m1 && m1.sum / s.total > 0.5)
     tips.push(`<b>${esc(m1.key)}</b> 消耗占比达 <span class="hl">${pct(m1.sum, s.total)}</span>，成本高度集中。建议对超长上下文任务做<b>分段 / 摘要预处理</b>，或对简单问答降级到 flash 级模型。`);
@@ -1797,6 +2073,17 @@ function renderReport(d){
     tips.push(`平均每个回合触发 <b>${s.stepsPerTurn.toFixed(1)}</b> 次 API 请求，回合越长则全量上下文重发次数越多。建议把长链路任务拆成更小的回合。`);
   if(s.hasDetail && s.byTool[0] && s.byTool[0].tk / Math.max(s.tokenTot, 1) > 0.2)
     tips.push(`单个工具 <b>${esc(s.byTool[0].key)}</b> 就占了 <span class="hl">${pct(s.byTool[0].tk, s.tokenTot)}</span> 的 Token。建议检查它的调用频率与单次返回量——例如给命令输出加截断、缩小搜索范围，或改用更省的等效操作。`);
+  if(s.hasLatency){
+    const cand = s.latModels.filter(m => m.n >= 30);
+    if(cand.length >= 2){
+      const fast = [...cand].sort((a, b) => a.p50 - b.p50)[0];
+      const slow = [...cand].sort((a, b) => b.p50 - a.p50)[0];
+      if(slow.p50 / fast.p50 >= 3)
+        tips.push(`响应速度上，<b>${esc(slow.key)}</b> 的 P50 是 <b>${esc(fast.key)}</b> 的 `
+          + `<b>${(slow.p50/fast.p50).toFixed(1)} 倍</b>（同等输出规模下差距依然存在）。`
+          + `对延迟敏感的交互式任务可优先走更快的模型，把慢模型留给能容忍等待的深度任务。`);
+    }
+  }
   if(!tips.length)
     tips.push('整体消耗结构较为均衡，暂无明显异常点，建议保持当前用量监控频率。');
 
@@ -1853,7 +2140,10 @@ function renderReport(d){
     <h4>六、Token 关联</h4>
     <p>${tokenSummary}</p>
 
-    <h4>七、优化建议</h4>
+    <h4>七、响应时间</h4>
+    <p>${latSummary}</p>
+
+    <h4>八、优化建议</h4>
     <ul>${tips.map(t => `<li>${t}</li>`).join('')}</ul>
   `;
 }
@@ -1926,8 +2216,12 @@ function buildMarkdown(d){
   s.top.forEach((x,i) => L.push(
     `| ${i+1} | \`${x.id}\` | ${x.model} | ${x.client} | ${x.date} ${pad(x.hour)}:${pad(x.min)} | ${fmt2(x.points)} | ${x.token ? fmtTok(x.token.tot) : '—'} |`));
   L.push('');
+  // 六章之后是条件章节，编号交给计数器，避免跳过时出现「五 → 七」这种断号
+  const CN = ['','一','二','三','四','五','六','七','八','九','十'];
+  let sec = 5;                       // 前五章编号固定
   if(s.hasDetail){
-    L.push(`## 六、工具 Token 消耗`);
+    sec++;
+    L.push(`## ${CN[sec]}、工具 Token 消耗`);
     L.push('');
     L.push(`| 工具 | Token | 占比 | 调用次数 |`);
     L.push(`|:--|--:|--:|--:|`);
@@ -1935,7 +2229,32 @@ function buildMarkdown(d){
       `| ${x.key} | ${fmtTok(x.tk)} | ${pct(x.tk, s.tokenTot)} | ${x.steps} |`));
     L.push('');
   }
-  L.push(`## 七、洞察`);
+  sec++;
+  L.push(`## ${CN[sec]}、模型响应时间`);
+  L.push('');
+  if(s.hasLatency){
+    L.push(`> **口径**：单次 API 请求的端到端耗时，已排除工具执行时间，但含网络往返与排队。`);
+    L.push(`> 它**不是用户感知的等待时间**——用户等的是整个回合；回合跨度里模型耗时占 ` +
+      `${s.latTurnShare != null ? (s.latTurnShare*100).toFixed(0) + '%' : '—'}（中位）。`);
+    L.push('');
+    L.push(`| 模型 | 样本 | 均值 | P50 | P90 | 首字延迟 | 输出速度 | 有效吞吐 |`);
+    L.push(`|:--|--:|--:|--:|--:|--:|--:|--:|`);
+    s.latModels.forEach(m => L.push(
+      `| ${m.key}${m.n < 30 ? ' \\*' : ''} | ${fmt0(m.n)} | ${(m.mean/1000).toFixed(1)}s | ` +
+      `${(m.p50/1000).toFixed(1)}s | ${(m.p90/1000).toFixed(1)}s | ` +
+      `${m.ttft  != null ? m.ttft.toFixed(1) + 's' : '—'} | ` +
+      `${m.speed != null ? m.speed.toFixed(0) + ' tok/s' : '—'} | ${m.thru.toFixed(0)} tok/s |`));
+    L.push('');
+    L.push(`- 首字延迟与输出速度按「耗时 ≈ 首字延迟 + 输出 token ÷ 速度」拟合，样本不足 60 条时留空`);
+    L.push(`- 有效吞吐 = Σ输出 token ÷ Σ耗时，含首字延迟影响，比纯流式速度保守`);
+    if(s.latModels.some(m => m.n < 30)) L.push(`- \`*\` 样本不足 30 条，参考价值有限`);
+  }else{
+    L.push(`当前数据没有请求级耗时——可能是 token-usage-data.js 由 \`--light\` 模式生成，`);
+    L.push(`或本地会话记录缺少可推算时间的成对记录。`);
+  }
+  L.push('');
+  sec++;
+  L.push(`## ${CN[sec]}、洞察`);
   L.push('');
   L.push(`- **主要消耗来源**：${s.byModel[0]?.key || '-'}（${pct(s.byModel[0]?.sum||0, s.total)}）、${s.byClient[0]?.key || '-'}（${pct(s.byClient[0]?.sum||0, s.total)}）`);
   if(s.hasDetail && s.byTool[0])
@@ -1947,6 +2266,16 @@ function buildMarkdown(d){
     L.push(`- **Token 效率**：平均每 1 积分产出 **${fmtTok(s.tokenPerPoint)}** token（每 M token 约 ${fmt2(s.pointsPerMToken)} 积分）`);
     L.push(`- **缓存命中**：输入上下文中 ${(s.cacheHitRate*100).toFixed(1)}% 走缓存读取`);
     L.push(`- **回合粒度**：已关联 ${s.tkRows} 个回合，合计 ${fmt0(s.tokenReq)} 次 API 请求，平均 ${s.stepsPerTurn.toFixed(1)} 次/回合`);
+  }
+  // 只比样本足够的模型，否则一两个样本的极值会得出「快 N 倍」的误导结论
+  if(s.hasLatency){
+    const cand = s.latModels.filter(m => m.n >= 30);
+    if(cand.length >= 2){
+      const fast = [...cand].sort((a, b) => a.p50 - b.p50)[0];
+      const slow = [...cand].sort((a, b) => b.p50 - a.p50)[0];
+      L.push(`- **响应速度**：${fast.key} 最快（P50 ${(fast.p50/1000).toFixed(1)}s），` +
+             `${slow.key} 最慢（P50 ${(slow.p50/1000).toFixed(1)}s），相差 ${(slow.p50/fast.p50).toFixed(1)} 倍`);
+    }
   }
   L.push('');
   return L.join('\n');
@@ -1991,7 +2320,8 @@ function buildFullDetail(rows){
     return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
   };
   const head = ['RequestID','关联状态','积分消耗','模型','客户端','时间',
-                'Token合计','输入token','输出token','缓存读token','请求数','回合时长(秒)','是否免费'];
+                'Token合计','输入token','输出token','缓存读token','请求数',
+                '回合时长(秒)','回合模型耗时(秒)','是否免费'];
   const out = [head.join(',')];
   // 最新的排在前面
   [...rows].sort((a,b) => b.time - a.time).forEach(r => {
@@ -2006,6 +2336,7 @@ function buildFullDetail(rows){
       `${r.date} ${pad(r.hour)}:${pad(r.min)}:00`,
       t ? t.tot : '', t ? t.in : '', t ? t.out : '',
       t ? t.cr : '', t ? t.n : '', dur,
+      (t && t.lat) ? Math.round(t.lat / 1000) : '',
       r.points === 0 ? '是' : ''
     ].map(esc2).join(','));
   });
@@ -2165,12 +2496,35 @@ const LocalScan = (() => {
     }catch(e){ /* 忽略 */ }
   }
 
-  /** 解析单个 jsonl，按 conversationRequestId 聚合（与 token-usage-report.js 同口径） */
+  /**
+   * 解析单个 jsonl，按 conversationRequestId 聚合（与 token-usage-report.js 同口径）。
+   *
+   * 响应耗时同样靠时间戳推算：agent 是串行的「模型响应 → 工具执行 → 下一次模型
+   * 响应」，所以 function_call 的时间戳是模型响应完成时刻，而 function_call_result
+   * 与用户消息是新的等待起点，两者相减即该次请求的纯模型耗时（不含工具执行）。
+   * 详见 token-usage-report.js 文件头的「响应耗时口径」。
+   */
   async function parseFile(fh, acc){
     const file = await fh.getFile();
     const text = await file.text();
+
+    let anchor = 0;         // 最近一次「等待起点」；0 表示尚无可用起点
+    const seen = new Map(); // messageId → 已产出的样本，用于合并同一次响应的流式分片
+
     for(const line of text.split('\n')){
-      if(!line.includes('"usage"')) continue;
+      const hasUsage = line.includes('"usage"');
+      const hasDelta = line.includes('"tokenDelta"');
+      if(!hasUsage && !hasDelta &&
+         !line.includes('"function_call_result"') && !line.includes('"role":"user"')) continue;
+
+      // 工具结果 / 用户消息只用来推进起点。这类行可能含几十 KB 的工具输出，
+      // 整行 JSON.parse 既慢又没必要——timestamp 一定在行首。
+      if(!hasUsage && !hasDelta){
+        const tm = /"timestamp":\s*(\d+)/.exec(line.slice(0, 300));
+        if(tm) anchor = Number(tm[1]);
+        continue;
+      }
+
       let d;
       try{ d = JSON.parse(line); }catch{ continue; }
       const m = d.message;
@@ -2184,20 +2538,48 @@ const LocalScan = (() => {
       const inp = u.input_tokens || 0, o = u.output_tokens || 0;
       const cr  = u.cache_read_input_tokens || 0;
       const tot = u.total_tokens || (inp + o);
+      const ms  = typeof d.timestamp === 'number' ? d.timestamp : 0;
+      const mid = pd.messageId || d.id || '';
+
+      // 同一次响应可能分多条写入（reasoning / 正文 / 工具调用）。token 取首条
+      // （与既有的 messageId 去重口径一致），但完成时刻要取最晚的那条，
+      // 否则会把耗时算到第一个分片为止，系统性低估。
+      const dup = mid ? seen.get(mid) : null;
+      if(dup){
+        if(ms && ms > dup.ms){
+          dup.ms = ms;
+          dup.lat = dup.anchor ? validLat(ms - dup.anchor) : 0;
+          const st = dup.turn.d[dup.idx];
+          if(st){ st[0] = ms; st[5] = dup.lat; }
+          if(dup.turn.t1 < ms) dup.turn.t1 = ms;
+        }
+        continue;
+      }
 
       let t = acc[key];
       if(!t) t = acc[key] = { n:0, in:0, out:0, cr:0, cc:0, tot:0, t0:0, t1:0,
                               m:'', s:d.sessionId || '', src:'本地目录', p:d.cwd || '',
-                              best:-1, d:[] };
+                              best:-1, d:[], lat:0, latn:0 };
+      if(!t.d) t.d = [];
+      if(!t.lat){ t.lat = 0; }
+      if(!t.latn){ t.latn = 0; }
+
+      const lat = (anchor && ms) ? validLat(ms - anchor) : 0;
+
       t.n++;
       t.in += inp; t.out += o; t.cr += cr;
       t.cc += u.cache_creation_input_tokens || 0;
       t.tot += tot;
+      if(lat > 0){ t.lat += lat; t.latn++; }
 
-      const ms = d.timestamp || 0;
       if(ms){ if(!t.t0 || ms < t.t0) t.t0 = ms; if(ms > t.t1) t.t1 = ms; }
       if(tot > t.best){ t.best = tot; t.m = pd.model || 'unknown'; }
-      t.d.push([ms, d.name || '', inp, o, cr]);
+
+      const idx = t.d.length;
+      // 第 6 位是本次请求的模型耗时 ms（0 = 无法推算）
+      t.d.push([ms, d.name || '', inp, o, cr, lat]);
+      if(mid) seen.set(mid, { ms, lat, anchor, turn:t, idx });
+      if(ms) anchor = ms;
     }
   }
 
@@ -2774,27 +3156,28 @@ async function loadFile(file){
   $('dateFrom').addEventListener('change', e => { state.filters.from = e.target.value; render(); });
   $('dateTo').addEventListener('change',   e => { state.filters.to   = e.target.value; render(); });
 
-  $('qAll').addEventListener('click', () => {
+  /* 快捷范围：都以「数据里最后一天」为基准，而不是今天——数据不是当天时
+     按今天算会得到一个空区间。区间两端还会被夹在数据的实际首尾之内。 */
+  const setRecentDays = n => {
     const dates = [...new Set(state.all.map(x => x.date))].sort();
-    $('dateFrom').value = dates[0]; $('dateTo').value = dates[dates.length-1];
-    state.filters.from = dates[0];  state.filters.to = dates[dates.length-1];
-    render();
-  });
-  $('qToday').addEventListener('click', () => {
-    const dates = [...new Set(state.all.map(x => x.date))].sort();
-    const last = dates[dates.length-1];
-    $('dateFrom').value = last; $('dateTo').value = last;
-    state.filters.from = last;  state.filters.to = last;
-    render();
-  });
-  $('q7').addEventListener('click', () => {
-    const dates = [...new Set(state.all.map(x => x.date))].sort();
-    const last = dates[dates.length-1];
+    if(!dates.length) return;
+    const last = dates[dates.length - 1];
     const d = parseDs(last);
-    d.setDate(d.getDate() - 6);
+    d.setDate(d.getDate() - (n - 1));
     const from = fmtDate(d) < dates[0] ? dates[0] : fmtDate(d);
     $('dateFrom').value = from; $('dateTo').value = last;
     state.filters.from = from;  state.filters.to = last;
+    render();
+  };
+  $('qToday').addEventListener('click', () => setRecentDays(1));
+  $('q7').addEventListener('click',    () => setRecentDays(7));
+  $('q30').addEventListener('click',   () => setRecentDays(30));
+
+  $('qAll').addEventListener('click', () => {
+    const dates = [...new Set(state.all.map(x => x.date))].sort();
+    if(!dates.length) return;
+    $('dateFrom').value = dates[0]; $('dateTo').value = dates[dates.length-1];
+    state.filters.from = dates[0];  state.filters.to = dates[dates.length-1];
     render();
   });
 
@@ -2808,6 +3191,21 @@ async function loadFile(file){
     const d = getFiltered();
     download(`积分汇总_${state.filters.from}_${state.filters.to}.csv`,
       buildCSV(d), 'text/csv');
+  });
+
+  /* ---- 每日汇总：点表头排序 ---- */
+  $('tblDay').addEventListener('click', e => {
+    const th = e.target.closest('th.sortable');
+    if(!th) return;
+    const k = th.dataset.k;
+    if(state.day.sort === k){
+      state.day.dir = state.day.dir === 'desc' ? 'asc' : 'desc';
+    }else{
+      state.day.sort = k;
+      // 换一列时给个符合直觉的默认方向：数值列先看最大的，文本列按字面正序
+      state.day.dir = (k === 'date' || k === 'model') ? 'asc' : 'desc';
+    }
+    renderTables(getFiltered());
   });
 
   /* ---- Session 消耗：点表头排序 ---- */

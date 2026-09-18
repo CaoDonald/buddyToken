@@ -46,6 +46,18 @@
  *   一次用户提问 = 一个回合，但 agent 会在其中发起多次 API 请求（实测均 7.65 次）。
  *   积分看板按回合 ID 与本脚本产出的 token 数据对齐，因此 --emit-js 会按
  *   conversationRequestId 把整回合的 token 求和，与一行积分一一对应。
+ *
+ * 响应耗时口径（latencyMs）
+ *   会话记录里没有现成的耗时字段，但记录是按 agent 循环顺序写入的：
+ *     用户提交 ──> function_call @ts      （模型响应完成的时刻）
+ *                   └─ 工具执行 ──> function_call_result @ts
+ *                                    └─> function_call @ts
+ *   因此「本次响应完成 − 上一次工具完成」即该次请求的纯模型耗时，
+ *   工具执行时间被干净地排除在外。回合内首个请求以用户消息的时间戳为起点。
+ *
+ *   注意两条：① 它是「单次 API 请求」耗时，不是用户感知的等待时间——用户实际
+ *   等的是整个回合（含工具执行）；② 时间戳是记录写入时刻，含网络、排队与完整
+ *   流式输出，换网络环境数值会变。窗口外的值（<0.5s / >1h）记为 0 表示无效。
  */
 
 'use strict';
@@ -85,6 +97,15 @@ function pick(obj, ...keys) {
     if (v) return v;
   }
   return null;
+}
+
+/**
+ * 响应耗时有效性窗口。
+ *   < 0.5s 多半是记录异常或没有可用起点；> 1h 多半是会话被中断后残留。
+ * 落在窗口外的记为 0（无效），由消费方当作「无数据」处理。
+ */
+function validLatency(ms) {
+  return ms > 500 && ms < 3600000 ? ms : 0;
 }
 
 function fmtTime(d) {
@@ -143,11 +164,32 @@ async function scanFile(file, source) {
     crlfDelay: Infinity,
   });
 
+  // ---- 响应耗时推算状态（口径详见文件头）----
+  // agent 循环是严格串行的：模型响应 → 工具执行 → 下一次模型响应。
+  //   function_call 记录的时间戳    = 该次模型响应完成的时刻
+  //   function_call_result 的时间戳 = 该次工具执行完成的时刻
+  // 所以「本次响应完成 - 上一次工具完成」就是纯粹的模型侧耗时，工具执行被排除。
+  // 回合内首个请求以用户消息的时间戳为起点。
+  let anchor = 0;         // 最近一次「等待起点」；0 表示尚无可用起点
+  const seen = new Map(); // messageId → 已产出的请求，用于合并同一次响应的流式分片
+
   for await (let line of rl) {
-    if (!line.includes('"usage"') && !line.includes('"tokenDelta"')) continue;
+    const hasUsage = line.includes('"usage"');
+    const hasDelta = line.includes('"tokenDelta"');
+    if (!hasUsage && !hasDelta &&
+        !line.includes('"function_call_result"') && !line.includes('"role":"user"')) continue;
+
     if (line.charCodeAt(0) === 0xfeff) line = line.slice(1);
     line = line.trim();
     if (!line) continue;
+
+    // 工具结果 / 用户消息：只用来推进响应起点。这类记录可能内含几十 KB 的工具
+    // 输出，整行 JSON.parse 既慢又没必要——timestamp 一定在行首，正则取即可。
+    if (!hasUsage && !hasDelta) {
+      const tm = /"timestamp":\s*(\d+)/.exec(line.slice(0, 300));
+      if (tm) anchor = Number(tm[1]);
+      continue;
+    }
 
     let d;
     try {
@@ -176,17 +218,32 @@ async function scanFile(file, source) {
     if (!u || typeof u !== 'object' || Array.isArray(u)) continue;
 
     const pd = d.providerData && typeof d.providerData === 'object' ? d.providerData : {};
+    const ms = typeof d.timestamp === 'number' ? d.timestamp : 0;
+    const key = pick(pd, 'messageId') || m.id || d.id || '';
+
+    // 同一次响应可能分多条写入（reasoning / 正文 / 工具调用）。token 取首条
+    // （与既有的 messageId 去重口径一致），但完成时刻要取最晚的那条，
+    // 否则会把耗时算到第一个分片为止，系统性低估。
+    const dup = key ? seen.get(key) : null;
+    if (dup) {
+      if (ms && ms > dup._ms) {
+        dup._ms = ms;
+        dup.time = toDate(ms);
+        dup.latencyMs = dup.anchorMs ? validLatency(ms - dup.anchorMs) : 0;
+      }
+      continue;
+    }
 
     const inp = u.input_tokens || 0;
     const out = u.output_tokens || 0;
 
-    reqs.push({
-      time: toDate(d.timestamp),
+    const r = {
+      time: toDate(ms),
       source,
       model: pick(pd, 'model') || m.model || 'unknown',
       project: d.cwd || projdir,
       session: d.sessionId || fname,
-      requestId: pick(pd, 'messageId') || m.id || d.id || '',
+      requestId: key,
       // 回合 ID：粒度比 messageId 粗，一次用户提问对应一个回合（内含多次 API 请求）
       conversationRequestId: pd.conversationRequestId || '',
       kind: d.type || '',
@@ -196,8 +253,21 @@ async function scanFile(file, source) {
       cacheReadTokens: u.cache_read_input_tokens || 0,
       cacheCreationTokens: u.cache_creation_input_tokens || 0,
       totalTokens: u.total_tokens || (inp + out),
-    });
+      // 本次响应的纯模型耗时（已排除工具执行）；0 = 无法推算
+      latencyMs: anchor && ms ? validLatency(ms - anchor) : 0,
+      // 该次等待的起点（用户提交或上一次工具完成）。单个请求用不到它，
+      // 但回合级「用户等了多久」要靠 min(anchorMs) → max(anchorMs + latencyMs)
+      // 才算得准：只取首末响应时间戳会漏掉首个请求自身的耗时。
+      anchorMs: anchor,
+      _ms: ms,
+    };
+    if (key) seen.set(key, r);
+    reqs.push(r);
+    if (ms) anchor = ms;
   }
+
+  // 内部分片合并字段不对外暴露
+  for (const r of reqs) delete r._ms;
 
   return { reqs, turns };
 }
@@ -271,7 +341,10 @@ function buildTokenDataJs(reqs, light) {
     let t = turns.get(key);
     if (!t) {
       t = { n: 0, in: 0, out: 0, cr: 0, cc: 0, tot: 0, t0: 0, t1: 0,
-            m: '', s: r.session, src: r.source, p: r.project, best: -1, d: [] };
+            m: '', s: r.session, src: r.source, p: r.project, best: -1, d: [],
+            // 模型侧耗时：lat 为有效之和、latn 为有效条数。不依赖步骤明细，
+            // 所以 --light 下依然可用（只是少了逐请求分布）。
+            lat: 0, latn: 0 };
       turns.set(key, t);
     }
     t.n++;
@@ -280,6 +353,7 @@ function buildTokenDataJs(reqs, light) {
     t.cr  += r.cacheReadTokens;
     t.cc  += r.cacheCreationTokens;
     t.tot += r.totalTokens;
+    if (r.latencyMs > 0) { t.lat += r.latencyMs; t.latn++; }
 
     const ms = r.time ? r.time.getTime() : 0;
     if (ms) {
@@ -288,13 +362,19 @@ function buildTokenDataJs(reqs, light) {
     }
     // 回合代表模型：取消耗最大的那次请求，比取第一次更贴近成本归因
     if (r.totalTokens > t.best) { t.best = r.totalTokens; t.m = r.model; }
-    if (!light) t.d.push([ms, r.tool || '', r.inputTokens, r.outputTokens, r.cacheReadTokens]);
+    if (!light) {
+      // 第 6 位是本次请求的模型耗时 ms（0 = 无法推算）。旧数据只有 5 位，
+      // 消费方读下标 5 时要做「undefined 即无数据」的兼容。
+      t.d.push([ms, r.tool || '', r.inputTokens, r.outputTokens, r.cacheReadTokens,
+                r.latencyMs || 0]);
+    }
   }
 
   const out = {};
   for (const [k, t] of turns) {
     const o = { n: t.n, in: t.in, out: t.out, cr: t.cr, cc: t.cc, tot: t.tot,
-                t0: t.t0, t1: t.t1, m: t.m, s: t.s, src: t.src, p: t.p };
+                t0: t.t0, t1: t.t1, m: t.m, s: t.s, src: t.src, p: t.p,
+                lat: t.lat, latn: t.latn };
     if (!light) o.d = t.d.sort((a, b) => a[0] - b[0]);
     out[k] = o;
   }
@@ -391,13 +471,14 @@ async function main() {
   const csvPath = path.join(outdir, 'token-usage-detail.csv');
   const lines = [];
   lines.push(['时间', '来源', '模型', '项目目录', '会话ID', '回合ID', '请求ID', '类型', '工具',
-              '输入token', '输出token', '缓存读token', '缓存写token', '合计token'].join(','));
+              '输入token', '输出token', '缓存读token', '缓存写token', '合计token',
+              '响应耗时ms'].join(','));
   for (const r of reqs) {
     lines.push([
       fmtTime(r.time), r.source, r.model, r.project, r.session,
       r.conversationRequestId, r.requestId,
       r.kind, r.tool, r.inputTokens, r.outputTokens, r.cacheReadTokens,
-      r.cacheCreationTokens, r.totalTokens,
+      r.cacheCreationTokens, r.totalTokens, r.latencyMs || '',
     ].map(esc).join(','));
   }
   // \uFEFF = UTF-8 BOM，保证 Excel 双击打开中文不乱码
@@ -577,9 +658,54 @@ async function main() {
   }
   W();
 
+  // 模型响应耗时（请求级）
+  const latReqs = reqs.filter((r) => r.latencyMs > 0);
+  if (latReqs.length) {
+    const latMap = new Map();
+    for (const r of latReqs) {
+      let c = latMap.get(r.model);
+      if (!c) { c = { n: 0, sum: 0, out: 0, l: [] }; latMap.set(r.model, c); }
+      c.n++;
+      c.sum += r.latencyMs;
+      c.out += r.outputTokens;
+      c.l.push(r.latencyMs);
+    }
+
+    W('## 八、模型响应时间');
+    W();
+    W('> **口径**：单次 API 请求的端到端耗时 =「模型响应完成时刻 − 上一次工具执行');
+    W('> 完成时刻」，**已排除工具执行时间**，但含网络往返、排队与完整流式输出。');
+    W('> 它不是用户感知的等待时间——用户等的是整个回合（含工具执行），见下一章。');
+    W('> 时间戳取的是记录写入时刻，换网络环境数值会变。');
+    W();
+    const latAll = latReqs.map((r) => r.latencyMs).sort((a, b) => a - b);
+    W(`- 有效样本：${fmt(latReqs.length)} / ${fmt(reqs.length)} 条请求` +
+      `（其余 ${fmt(reqs.length - latReqs.length)} 条无法推算耗时）`);
+    W(`- 整体：均值 ${(latAll.reduce((a, b) => a + b, 0) / latAll.length / 1000).toFixed(1)}s` +
+      ` · P50 ${(latAll[Math.floor(latAll.length / 2)] / 1000).toFixed(1)}s` +
+      ` · P90 ${(latAll[Math.floor(latAll.length * 0.9)] / 1000).toFixed(1)}s`);
+    W();
+    W('| 模型 | 样本 | 均值 | P50 | P90 | 有效吞吐 |');
+    W('| --- | ---: | ---: | ---: | ---: | ---: |');
+    for (const [k, c] of [...latMap].sort((a, b) => b[1].n - a[1].n)) {
+      c.l.sort((a, b) => a - b);
+      // 有效吞吐 = Σ输出token / Σ耗时，含首字延迟的影响，是偏保守的速度口径
+      const thru = c.sum > 0 ? (c.out / c.sum) * 1000 : 0;
+      W(`| ${k}${c.n < 30 ? ' *' : ''} | ${fmt(c.n)} | ${(c.sum / c.n / 1000).toFixed(1)}s | ` +
+        `${(c.l[Math.floor(c.l.length / 2)] / 1000).toFixed(1)}s | ` +
+        `${(c.l[Math.floor(c.l.length * 0.9)] / 1000).toFixed(1)}s | ${thru.toFixed(1)} tok/s |`);
+    }
+    W();
+    if ([...latMap.values()].some((c) => c.n < 30)) {
+      W('> `*` 样本不足 30 条，数字仅供参考。对比不同模型时请优先看同一输出规模下的');
+      W('> 表现——输出 token 量是耗时的主要驱动因素。');
+      W();
+    }
+  }
+
   // 回合指标
   if (turns.length) {
-    W('## 八、回合指标（turn-metrics，交叉验证用）');
+    W('## 九、回合指标（turn-metrics，交叉验证用）');
     W();
     W('> **口径差异（重要）**：`turn-metrics.tokenDelta` 统计的是「本回合新增内容」的');
     W('> 增量，而 `usage.input_tokens` 是每次请求重发的全量上下文。两者数字差异大是');
@@ -591,6 +717,44 @@ async function main() {
     W(`- 回合数：${fmt(turns.length)}`);
     W(`- token 增量合计：${fmt(tsum)}`);
     W(`- 累计耗时：${(tdur / 3600000).toFixed(1)} 小时`);
+    // 回合级口径：把每回合的模型耗时之和与该回合「用户实际经历」的跨度相比，
+    // 回答「等的时间里有多少花在模型上」。
+    // 跨度 = max(等待起点 + 耗时) − min(等待起点)：起点是用户提交时刻、终点是
+    // 最后一次响应完成时刻，因此含首个请求自身的耗时。若改用首末响应时间戳相减，
+    // 会漏掉首个请求，占比被显著高估。
+    const perTurn = new Map();
+    for (const r of reqs) {
+      const k = r.conversationRequestId;
+      if (!k || !r.anchorMs) continue;
+      let g = perTurn.get(k);
+      if (!g) { g = { lat: 0, n: 0, start: 0, end: 0 }; perTurn.set(k, g); }
+      if (r.latencyMs > 0) {
+        g.lat += r.latencyMs;
+        g.n++;
+        const end = r.anchorMs + r.latencyMs;
+        if (end > g.end) g.end = end;
+      }
+      if (!g.start || r.anchorMs < g.start) g.start = r.anchorMs;
+    }
+    const ratios = [];
+    for (const g of perTurn.values()) {
+      if (!g.n || !g.start || g.end <= g.start) continue;
+      const span = g.end - g.start;
+      // 跨度超过 6 小时的回合基本是会话中断后 anchor 被污染的残留，
+      // 会让分母虚高；占比 >1 说明推算有舍入误差。两者都不参与统计。
+      if (span > 6 * 3600000) continue;
+      const r = g.lat / span;
+      if (r > 1.02) continue;
+      ratios.push(Math.min(r, 1));
+    }
+    if (ratios.length) {
+      ratios.sort((a, b) => a - b);
+      const q = (x) => (ratios[Math.min(ratios.length - 1, Math.floor(ratios.length * x))] * 100).toFixed(1);
+      W(`- 模型耗时占回合跨度：中位 **${q(0.5)}%**（四分位 ${q(0.25)}% ~ ${q(0.75)}%）` +
+        `｜${fmt(ratios.length)} 个可测算回合`);
+      W(`- 跨度 = 用户提交 → 最后一次响应完成（不含用户输入时间），其余为工具执行。`);
+      W(`  分布很宽：纯读文件类回合接近 100%，跑长命令或等外部接口的回合可低到 30% 以下。`);
+    }
     W();
     W('| 日期 | 回合 | token增量 |');
     W('| --- | ---: | ---: |');
@@ -611,7 +775,7 @@ async function main() {
     W();
   }
 
-  W('## 九、明细文件');
+  W('## 十、明细文件');
   W();
   W(`- \`${path.basename(csvPath)}\`  （逐条请求，可用 Excel 打开做透视）`);
   W();
