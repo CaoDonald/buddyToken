@@ -47,6 +47,14 @@
  *   积分看板按回合 ID 与本脚本产出的 token 数据对齐，因此 --emit-js 会按
  *   conversationRequestId 把整回合的 token 求和，与一行积分一一对应。
  *
+ * 会话标题（ti 字段）
+ *   会话记录里有一条客户端自己生成的标题记录，不需要额外调模型：
+ *     {"timestamp":…,"type":"ai-title","aiTitle":"…","sessionId":…,"cwd":…}
+ *   每个会话一条，sessionId 与回合的 s 字段同源、可直接关联。标题是会话级
+ *   而非回合级，所以 --emit-js 把它写成顶层的 ti 映射（{会话ID: 标题}），
+ *   而不是塞进每个回合重复存。本地已扫不到的会话，其标题同样会被增量保留。
+ *   客户端尚未生成标题的新会话会缺失，消费方需按「无标题」处理。
+ *
  * 响应耗时口径（latencyMs）
  *   会话记录里没有现成的耗时字段，但记录是按 agent 循环顺序写入的：
  *     用户提交 ──> function_call @ts      （模型响应完成的时刻）
@@ -153,9 +161,16 @@ function walk(dir, out = []) {
 
 // ---------------------------------------------------------------- 解析单个会话文件
 
+/**
+ * 会话标题记录的行首特征。用锚定正则而不是 includes('ai-title')：工具输出
+ * 正文里完全可能出现这两个词，那种行里往往还带着 usage，误判会丢记录。
+ */
+const TITLE_LINE_RE = /^\uFEFF?\{(?:"id":"[^"]*",)?"timestamp":\d+,"type":"ai-title"/;
+
 async function scanFile(file, source) {
   const reqs = [];
   const turns = [];
+  const titles = new Map();   // sessionId → 客户端生成的会话标题
   const fname = path.basename(file, '.jsonl');
   const projdir = path.basename(path.dirname(file));
 
@@ -174,6 +189,18 @@ async function scanFile(file, source) {
   const seen = new Map(); // messageId → 已产出的请求，用于合并同一次响应的流式分片
 
   for await (let line of rl) {
+    // 会话标题：客户端在首轮对话后写入的独立记录，不带 usage，得单独收下
+    if (TITLE_LINE_RE.test(line)) {
+      const raw = line.charCodeAt(0) === 0xfeff ? line.slice(1) : line;
+      try {
+        const d = JSON.parse(raw.trim());
+        if (d.type === 'ai-title' && d.sessionId && d.aiTitle && !titles.has(d.sessionId)) {
+          titles.set(d.sessionId, String(d.aiTitle));
+        }
+      } catch { /* 坏行忽略 */ }
+      continue;
+    }
+
     const hasUsage = line.includes('"usage"');
     const hasDelta = line.includes('"tokenDelta"');
     if (!hasUsage && !hasDelta &&
@@ -269,7 +296,7 @@ async function scanFile(file, source) {
   // 内部分片合并字段不对外暴露
   for (const r of reqs) delete r._ms;
 
-  return { reqs, turns };
+  return { reqs, turns, titles };
 }
 
 // ---------------------------------------------------------------- 汇总收集
@@ -277,6 +304,7 @@ async function scanFile(file, source) {
 async function collect(since) {
   const allReqs = [];
   const allTurns = [];
+  const allTitles = new Map();   // sessionId → 会话标题（不受 --since 影响）
   const stats = [];
 
   for (const s of SOURCES) {
@@ -296,9 +324,10 @@ async function collect(since) {
       }
       nbytes += sz;
       if (sz === 0) continue;
-      const { reqs, turns } = await scanFile(f, s.name);
+      const { reqs, turns, titles } = await scanFile(f, s.name);
       breqs.push(...reqs);
       bturns.push(...turns);
+      for (const [k, v] of titles) if (!allTitles.has(k)) allTitles.set(k, v);
     }
 
     // 去重（同一请求在会话内可能被写多条）
@@ -319,7 +348,7 @@ async function collect(since) {
     stats.push({ name: s.name, base: s.base, files: files.length, bytes: nbytes, reqs: uniq.length });
   }
 
-  return { allReqs, allTurns, stats };
+  return { allReqs, allTurns, stats, titles: allTitles };
 }
 
 // ------------------------------------------------ 看板数据（按回合聚合）
@@ -331,7 +360,7 @@ async function collect(since) {
  * token 求和，以便与积分流水「一行积分 = 一个回合」一一对齐。
  * 键统一小写，查表侧同样归一化，避免大小写差异导致漏配。
  */
-function buildTokenDataJs(reqs, light) {
+function buildTokenDataJs(reqs, light, titles) {
   const turns = new Map();
 
   for (const r of reqs) {
@@ -387,6 +416,15 @@ function buildTokenDataJs(reqs, light) {
     if (ms > to) to = ms;
   }
 
+  // 会话标题只保留真的出现在本批回合里的会话，避免数据文件里挂着无数据的键
+  const ti = {};
+  if (titles && titles.size) {
+    for (const t of turns.values()) {
+      const v = t.s ? titles.get(t.s) : null;
+      if (v) ti[t.s] = v;
+    }
+  }
+
   return {
     v: 1,
     gen: Date.now(),
@@ -397,6 +435,7 @@ function buildTokenDataJs(reqs, light) {
       sources: [...new Set(reqs.map((r) => r.source))],
       light: !!light,
     },
+    ti,
     t: out,
   };
 }
@@ -463,7 +502,7 @@ async function main() {
     since = new Date(now.getTime() - days * 86400000);
   }
 
-  const { allReqs: reqs, allTurns: turns, stats } = await collect(since);
+  const { allReqs: reqs, allTurns: turns, stats, titles } = await collect(since);
 
   // ---------------------------------------------------------- 明细 CSV
   reqs.sort((a, b) => (a.time ? a.time.getTime() : 0) - (b.time ? b.time.getTime() : 0));
@@ -489,7 +528,7 @@ async function main() {
   if (emitJs) {
     const name = args['js-out'] || 'token-usage-data.js';
     jsPath = path.isAbsolute(name) ? name : path.join(outdir, name);
-    const data = buildTokenDataJs(reqs, light);
+    const data = buildTokenDataJs(reqs, light, titles);
     const freshTurns = data.meta.turns;
 
     // 增量合并：把历次同步过、但本次本地 jsonl 里已不存在的回合保留下来，
@@ -506,6 +545,12 @@ async function main() {
           data.meta.reqs += v.n || 0;
           if (v.t0 && (!data.meta.from || v.t0 < data.meta.from)) data.meta.from = v.t0;
           if (v.t1 && v.t1 > data.meta.to) data.meta.to = v.t1;
+        }
+        // 标题同样增量保留：本地 jsonl 已清理的会话，其标题也该跟着留下
+        if (old.ti) {
+          for (const [k, v] of Object.entries(old.ti)) {
+            if (!data.ti[k]) data.ti[k] = v;
+          }
         }
         data.meta.turns = Object.keys(data.t).length;
         data.meta.kept = kept;

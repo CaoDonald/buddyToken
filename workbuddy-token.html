@@ -864,13 +864,16 @@ function computeStats(d){
   // ---- Session 维度 ----
   // token 数据里每个回合带 sessionId(s) 与工作目录(p)，按此聚合到会话粒度。
   // 未关联的行没有 session 信息，因此这里只统计已关联的部分。
+  // 会话标题由客户端生成，按会话 ID 存在数据顶层的 ti 表里（详见 token-usage-report.js
+  // 的「会话标题」口径）。本地没有 jsonl 的会话（来自其它环境）取不到，留空即可。
+  const tiMap = (TokenData.get() || {}).ti || {};
   const sessMap = new Map();
   for(const x of tkRows){
     const t = x.token;
     if(!t || !t.s) continue;
     let o = sessMap.get(t.s);
     if(!o){
-      o = { key:t.s, cwd:t.p || '', count:0, reqs:0, pts:0,
+      o = { key:t.s, title:tiMap[t.s] || '', cwd:t.p || '', count:0, reqs:0, pts:0,
             tk:0, tkIn:0, tkOut:0, tkCr:0, t0:0, t1:0, models:new Set() };
       sessMap.set(t.s, o);
     }
@@ -1786,6 +1789,7 @@ function renderModelRank(d){
  * =======================================================*/
 const SESS_COLS = [
   { k:'key',       t:'Session' },
+  { k:'title',     t:'标题' },
   { k:'cwd',       t:'工作目录' },
   { k:'t0',        t:'时间范围' },
   { k:'count',     t:'回合',        num:1 },
@@ -1830,8 +1834,12 @@ function renderSessionRank(d){
     const cwd = o.cwd || '';
     // 目录常很长，保留尾部（尾部信息量最大）
     const cwdShort = cwd.length > 34 ? '…' + cwd.slice(-33) : cwd;
+    // 标题是客户端对首轮提问生成的，本地没留下会话文件的（如来自其它环境）取不到
+    const title = o.title || '';
+    const titleShort = title.length > 28 ? title.slice(0, 28) + '…' : title;
     return `<tr>
       <td class="mono" title="${esc(o.key)}">${esc(o.key.slice(0, 8))}…</td>
+      <td title="${esc(title)}">${title ? esc(titleShort) : '<span style="color:#6b7891">—</span>'}</td>
       <td class="mono" style="color:#6b7891" title="${esc(cwd)}">${esc(cwdShort) || '—'}</td>
       <td class="mono" style="color:#6b7891;font-size:12px">${dur}</td>
       <td class="num" style="color:#6b7891">${fmt0(o.count)}</td>
@@ -2396,11 +2404,16 @@ const TokenData = (() => {
     /** 合并外部数据（本地目录直读的结果）。同键以传入的为准，并重算 meta。 */
     merge(turns, extra){
       if(!_data) _data = { v:1, gen:Date.now(),
-        meta:{ turns:0, reqs:0, from:0, to:0, sources:[], light:false }, t:{} };
+        meta:{ turns:0, reqs:0, from:0, to:0, sources:[], light:false }, ti:{}, t:{} };
+      if(!_data.ti) _data.ti = {};    // 旧版数据文件没有标题表，补一个空表
       let added = 0, updated = 0;
       for(const [k, v] of Object.entries(turns)){
         if(_data.t[k]) updated++; else added++;
         _data.t[k] = v;
+      }
+      // 会话标题（会话级，与回合不是一一对应）：已有键不覆盖
+      if(extra && extra.titles){
+        for(const [k, v] of extra.titles){ if(!_data.ti[k]) _data.ti[k] = v; }
       }
       const m = _data.meta;
       const vals = Object.values(_data.t);
@@ -2497,6 +2510,12 @@ const LocalScan = (() => {
   }
 
   /**
+   * 会话标题记录的行首特征。用锚定正则而不是 includes('ai-title')：工具输出
+   * 正文里完全可能出现这两个词，那种行里往往还带着 usage，误判会丢记录。
+   */
+  const TITLE_LINE_RE = /^\uFEFF?\{(?:"id":"[^"]*",)?"timestamp":\d+,"type":"ai-title"/;
+
+  /**
    * 解析单个 jsonl，按 conversationRequestId 聚合（与 token-usage-report.js 同口径）。
    *
    * 响应耗时同样靠时间戳推算：agent 是串行的「模型响应 → 工具执行 → 下一次模型
@@ -2504,7 +2523,7 @@ const LocalScan = (() => {
    * 与用户消息是新的等待起点，两者相减即该次请求的纯模型耗时（不含工具执行）。
    * 详见 token-usage-report.js 文件头的「响应耗时口径」。
    */
-  async function parseFile(fh, acc){
+  async function parseFile(fh, acc, titles){
     const file = await fh.getFile();
     const text = await file.text();
 
@@ -2512,6 +2531,16 @@ const LocalScan = (() => {
     const seen = new Map(); // messageId → 已产出的样本，用于合并同一次响应的流式分片
 
     for(const line of text.split('\n')){
+      // 会话标题：客户端生成的独立记录，不带 usage，单独收下（口径同 node 侧）
+      if(TITLE_LINE_RE.test(line)){
+        try{
+          const d = JSON.parse(line.replace(/^\uFEFF/, '').trim());
+          if(d.type === 'ai-title' && d.sessionId && d.aiTitle && !titles.has(d.sessionId))
+            titles.set(d.sessionId, String(d.aiTitle));
+        }catch(e){ /* 坏行忽略 */ }
+        continue;
+      }
+
       const hasUsage = line.includes('"usage"');
       const hasDelta = line.includes('"tokenDelta"');
       if(!hasUsage && !hasDelta &&
@@ -2591,14 +2620,15 @@ const LocalScan = (() => {
       for(const p of ps) await collectJsonl(p, files, 0);
     }
     const acc = {};
+    const titles = new Map();   // sessionId → 会话标题
     let done = 0;
     for(const fh of files){
-      try{ await parseFile(fh, acc); }catch(e){ /* 单个文件失败不影响整体 */ }
+      try{ await parseFile(fh, acc, titles); }catch(e){ /* 单个文件失败不影响整体 */ }
       done++;
       if(onProgress && done % 5 === 0) onProgress(done, files.length);
     }
     if(onProgress) onProgress(files.length, files.length);
-    return { turns: acc, files: files.length };
+    return { turns: acc, files: files.length, titles };
   }
 
   /** 检查并申请目录读取权限 */
@@ -2679,7 +2709,7 @@ async function scanLocal(opts){
     return false;
   }
 
-  const res = TokenData.merge(r.turns, { sources: ['本地目录'] });
+  const res = TokenData.merge(r.turns, { sources: ['本地目录'], titles: r.titles });
   state.tokenLoaded = true;
   if(state.all.length){ attachTokens(state.all); render(); }
 
@@ -3217,7 +3247,8 @@ async function loadFile(file){
       state.sess.dir = state.sess.dir === 'desc' ? 'asc' : 'desc';
     }else{
       state.sess.sort = k;
-      state.sess.dir = 'desc';
+      // 标题按字面正序更符合直觉；数值列则先看最大的
+      state.sess.dir = k === 'title' ? 'asc' : 'desc';
     }
     renderSessionRank(getFiltered());
   });
