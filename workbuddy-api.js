@@ -134,10 +134,31 @@ function atPath(obj, pathArr) {
 // ---------------------------------------------------------------- 账号发现
 
 /**
+ * 从快照文件名识别登录来源 app。
+ *
+ * 实测前缀（2026-09）：
+ *   workbuddy-desktop*.info            → WorkBuddy 桌面端
+ *   Tencent-Cloud.coding-copilot.info  → CodeBuddy CLI
+ *     （CLI 进程的产品代号即 coding copilot；本机 CLI 日志的鉴权 uid 与该文件
+ *      的 account.uid 一致，已实证归属。CodeBuddy IDE 的登录态不在此目录。）
+ * 其它前缀取首个点之前的部分原样返回，未知来源不猜。
+ */
+function appFromSnapshot(file) {
+  if (/^workbuddy-desktop/i.test(file)) return 'workbuddy-desktop';
+  if (/^tencent-cloud\.coding-copilot/i.test(file)) return 'codebuddy-cli';
+  return file.replace(/\.info$/i, '').split('.')[0] || 'unknown';
+}
+
+/**
  * 扫描登录态目录，按 uid 去重并各取最新的一份快照。
  *
  * 快照目录会同时保留多个账号的历史登录态（切换账号时旧文件不会删除），
  * 因此这里是「多账号」的唯一来源，不需要用户手动录入任何 token。
+ *
+ * 同一账号可能同时在多个 app 登录（桌面端与 CLI 各写一份快照，token 域不同），
+ * 所以先按 uid+app 双重去重、各取最新，再按 uid 聚合：凭证字段（token/domain 等）
+ * 取 mtime 最新的那份快照，与旧行为一致；另汇总每个 app 的登录信息到 apps
+ * （只有 app 名与凭证过期时间，绝不含 token）。
  */
 function discoverAccounts() {
   let files;
@@ -147,7 +168,7 @@ function discoverAccounts() {
     return [];
   }
 
-  const byUid = new Map();
+  const byKey = new Map();   // uid|app → 该 app 最新快照
   for (const file of files) {
     const full = path.join(AUTH_DIR, file);
     let raw;
@@ -163,11 +184,13 @@ function discoverAccounts() {
     if (!uid || !accessToken) continue;
 
     const mtime = fs.statSync(full).mtimeMs;
-    const prev = byUid.get(uid);
+    const key = uid + '|' + appFromSnapshot(file);
+    const prev = byKey.get(key);
     if (prev && prev._mtime >= mtime) continue;
 
-    byUid.set(uid, {
+    byKey.set(key, {
       _mtime: mtime,
+      _app: appFromSnapshot(file),
       uid,
       /** 展示名：昵称优先，缺失时退化为 uid 前 8 位。 */
       name: account.nickname || String(uid).slice(0, 8),
@@ -180,7 +203,21 @@ function discoverAccounts() {
     });
   }
 
-  return [...byUid.values()].map(({ _mtime, ...rest }) => rest);
+  // 按 uid 聚合：主快照取 mtime 最新的；apps 汇总该账号在各 app 的登录信息
+  const byUid = new Map();
+  for (const acc of byKey.values()) {
+    const prev = byUid.get(acc.uid);
+    if (!prev || acc._mtime > prev._mtime) byUid.set(acc.uid, acc);
+  }
+
+  return [...byUid.values()].map((acc) => {
+    const apps = [...byKey.values()]
+      .filter((a) => a.uid === acc.uid)
+      .sort((a, b) => b._mtime - a._mtime)
+      .map((a) => ({ app: a._app, expiresAt: a.expiresAt }));
+    const { _mtime, _app, ...rest } = acc;
+    return { ...rest, apps };
+  });
 }
 
 // ---------------------------------------------------------------- 账号归属
@@ -978,9 +1015,311 @@ async function runTravel(acct) {
   };
 }
 
+// ---------------------------------------------------------------- 桌面端账号库与切换
+
+/**
+ * 桌面端登录快照文件名（当前生效的那份）。官方客户端在登录/切号时会把
+ * 历史登录态以 `workbuddy-desktop.<时间戳>.<pid>.<uuid>.info` 备份在同目录，
+ * 这些历史快照天然构成一份「账号库」，无需自建存储。
+ */
+const DESKTOP_AUTH_FILE = 'workbuddy-desktop.info';
+/** 快照文件名前缀（备份与当前文件共用）。 */
+const DESKTOP_AUTH_PREFIX = 'workbuddy-desktop';
+
+/**
+ * 各应用的「当前登录」文件（auth 目录下无时间戳的那份）。
+ *
+ * 实测（2026-09）本机可判定当前登录的只有两个：
+ *   workbuddy-desktop.info            → WorkBuddy 桌面端
+ *   Tencent-Cloud.coding-copilot.info → CodeBuddy CLI
+ *     （归属实证：~/.codebuddy/logs 的 CLI 日志鉴权 uid 与该文件 account.uid 一致）
+ * CodeBuddy IDE 的登录态不在此目录、本机也未登录，无法判定/切换。
+ */
+const APP_AUTH_FILES = {
+  'workbuddy-desktop': DESKTOP_AUTH_FILE,
+  'codebuddy-cli': 'Tencent-Cloud.coding-copilot.info',
+};
+
+/**
+ * 扫描 auth 目录里全部登录快照，按 (uid, app) 双重分组各取最新一份。
+ *
+ * 返回：
+ *   currentByApp — 各应用当前登录的 uid（读 APP_AUTH_FILES，读不到为 null）
+ *   accounts     — 可切换账号列表（不含任何 token）：uid、展示名、
+ *                  snapshots（该账号在每个 app 的最新快照文件名）、凭证有效期。
+ * 账号在某 app「可切换」= snapshots[app] 存在；「当前登录」= currentByApp[app] === uid。
+ */
+function listSwitchableAccounts() {
+  let files;
+  try {
+    files = fs.readdirSync(AUTH_DIR).filter((f) => f.endsWith('.info'));
+  } catch {
+    return { currentByApp: {}, accounts: [] };
+  }
+
+  // 各应用当前登录账号
+  const currentByApp = {};
+  for (const [app, file] of Object.entries(APP_AUTH_FILES)) {
+    try {
+      const cur = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, file), 'utf8'));
+      currentByApp[app] = (cur.account && cur.account.uid) || cur.uid || null;
+    } catch {
+      currentByApp[app] = null;
+    }
+  }
+
+  // 按 (uid, app) 分组，各取最新快照
+  const byKey = new Map();   // uid|app → { uid, name, mtime, expiresAt, source }
+  for (const file of files) {
+    const app = appFromSnapshot(file);
+    if (!APP_AUTH_FILES[app]) continue;   // 不认识的 app 不参与
+    let raw;
+    try {
+      raw = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, file), 'utf8'));
+    } catch { continue; }
+    const uid = (raw.account && raw.account.uid) || raw.uid;
+    if (!uid) continue;
+    let mtime = 0;
+    try { mtime = fs.statSync(path.join(AUTH_DIR, file)).mtimeMs; } catch { continue; }
+    const key = uid + '|' + app;
+    const prev = byKey.get(key);
+    if (prev && prev.mtime >= mtime) continue;
+    byKey.set(key, {
+      uid,
+      name: (raw.account && raw.account.nickname) || String(uid).slice(0, 8),
+      expiresAt: num(raw.auth && raw.auth.expiresAt) || 0,
+      mtime,
+      source: file,
+    });
+  }
+
+  // 按 uid 聚合：snapshots[app] = 该账号在该 app 的最新快照文件名
+  const byUid = new Map();
+  for (const rec of byKey.values()) {
+    let acc = byUid.get(rec.uid);
+    if (!acc) {
+      acc = { uid: rec.uid, name: rec.name, expiresAt: rec.expiresAt, snapshots: {} };
+      byUid.set(rec.uid, acc);
+    }
+    const app = appFromSnapshot(rec.source);
+    if (!acc.snapshots[app] || rec.mtime > acc._mtimes[app]) {
+      acc.snapshots[app] = rec.source;
+      if (!acc._mtimes) acc._mtimes = {};
+      acc._mtimes[app] = rec.mtime;
+      // 展示名/凭证有效期取最新一份快照
+      if (rec.mtime >= (acc._latest || 0)) {
+        acc._latest = rec.mtime;
+        acc.name = rec.name;
+        acc.expiresAt = rec.expiresAt;
+      }
+    }
+  }
+
+  const accounts = [...byUid.values()].map(({ _mtimes, _latest, ...rest }) => rest);
+  accounts.sort((a, b) => (a.name > b.name ? 1 : -1));
+  return { currentByApp, accounts };
+}
+
+/**
+ * 原子写：先写同目录临时文件再 rename 覆盖（libuv 的 rename 带 REPLACE 语义）。
+ * 写失败时临时文件可能残留，清理后抛错。
+ */
+function atomicWrite(file, content) {
+  const tmp = file + '.tmp-' + process.pid;
+  try {
+    fs.writeFileSync(tmp, content, 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 已经不在了 */ }
+    throw e;
+  }
+}
+
+/** WorkBuddy.exe 的候选安装路径（覆盖常见静默安装位置）。 */
+function workbuddyExeCandidates() {
+  const local = process.env.LOCALAPPDATA
+    || path.join(process.env.USERPROFILE || '.', 'AppData', 'Local');
+  return [
+    path.join(local, 'Programs', 'workbuddy', 'WorkBuddy.exe'),
+    path.join(local, 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
+    path.join(local, 'workbuddy', 'WorkBuddy.exe'),
+    'C:\\Program Files\\workbuddy\\WorkBuddy.exe',
+    'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe',
+  ];
+}
+
+/**
+ * 定位 WorkBuddy.exe：运行中优先取进程真实路径（PowerShell），
+ * 其次注册表卸载项（HKCU/HKLM 的 Uninstall），最后常见候选目录。
+ * 找不到返回 null（切换仍可进行，只是不自动重启）。
+ */
+function findWorkbuddyExe() {
+  const { execFileSync } = require('child_process');
+  // 1. 运行中的进程（最可靠，覆盖任意自定义安装盘）
+  try {
+    const out = execFileSync('powershell', [
+      '-NoProfile', '-Command',
+      '(Get-Process WorkBuddy -ErrorAction SilentlyContinue | Select-Object -First 1).Path',
+    ], { encoding: 'utf8', timeout: 10000, windowsHide: true }).trim();
+    if (out && fs.existsSync(out)) return out;
+  } catch { /* 未运行或查询失败，走下一级 */ }
+  // 2. 注册表卸载项：InstallLocation 或 DisplayIcon（"…\WorkBuddy.exe,0" 形态）
+  const regRoots = [
+    'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+    'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+    'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  ];
+  for (const root of regRoots) {
+    try {
+      const out = execFileSync('powershell', [
+        '-NoProfile', '-Command',
+        `Get-ChildItem '${root}' -ErrorAction SilentlyContinue | ` +
+        'ForEach-Object { Get-ItemProperty $_.PSPath } | ' +
+        "Where-Object { $_.DisplayName -like '*WorkBuddy*' } | " +
+        'Select-Object -First 1 InstallLocation, DisplayIcon | ConvertTo-Json',
+      ], { encoding: 'utf8', timeout: 10000, windowsHide: true });
+      const info = JSON.parse(out || 'null');
+      if (!info) continue;
+      const icon = String(info.DisplayIcon || '').split(',')[0].trim();
+      if (icon && icon.toLowerCase().endsWith('.exe') && fs.existsSync(icon)) return icon;
+      if (info.InstallLocation) {
+        const exe = path.join(String(info.InstallLocation), 'WorkBuddy.exe');
+        if (fs.existsSync(exe)) return exe;
+      }
+    } catch { /* 该根下没有，试下一个 */ }
+  }
+  // 3. 常见候选目录
+  for (const exe of workbuddyExeCandidates()) {
+    if (fs.existsSync(exe)) return exe;
+  }
+  return null;
+}
+
+/**
+ * 切换某应用的登录账号。
+ *
+ * app = 'workbuddy-desktop'（WorkBuddy 桌面端）或 'coding-copilot'（CodeBuddy 插件宿主）。
+ *
+ * 流程对齐官方客户端自身行为：备份当前 <app>.info → 把目标账号在该 app 的
+ * 最新快照**整份原样**写回（不重建字段——快照里的加密信封、sso、deployStatus
+ * 等官方结构一律不动，重建反而会毁掉登录态）→ 写后校验 → 可选重启 WorkBuddy。
+ *
+ * 仅桌面端支持自动重启（关进程→写→拉起）；CodeBuddy 切换后提示重新打开窗口。
+ * 目标账号必须在目标应用登录过（有快照）才可切换——token 域不同
+ * （workbuddy.cn 与 codebuddy.cn），跨 app 借用快照会被网关拒。
+ *
+ * 备份落在项目目录 switch-backups/（**绝不**写进官方 auth 目录——那里的
+ * *.info 都会被客户端当登录态扫描），含 token，已加入 .gitignore。
+ */
+function switchAppAccount(app, uid, { restart = false } = {}) {
+  const currentFile = APP_AUTH_FILES[app];
+  if (!currentFile) {
+    return { ok: false, error: '不支持的应用：' + app };
+  }
+
+  const all = listSwitchableAccounts();
+  const target = all.accounts.find((a) => a.uid === uid);
+  const snapFile = target && target.snapshots && target.snapshots[app];
+  if (!snapFile) {
+    return { ok: false, error: '该账号没有此应用的登录快照，无法切换' };
+  }
+
+  const { execFileSync } = require('child_process');
+  const currentPath = path.join(AUTH_DIR, currentFile);
+  let backupPath = null;
+  try {
+    // 1. 备份当前登录态（含 token，写进项目私有目录）
+    if (fs.existsSync(currentPath)) {
+      const backupDir = path.join(__dirname, 'switch-backups');
+      fs.mkdirSync(backupDir, { recursive: true });
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      backupPath = path.join(backupDir, `${app}-${ts}.info`);
+      fs.copyFileSync(currentPath, backupPath);
+    }
+
+    // 2. 桌面端切换且要求重启：exe 路径要在进程还活着时确定，再按 PID 关进程
+    let exePath = null;
+    if (app === 'workbuddy-desktop' && restart) {
+      exePath = findWorkbuddyExe();
+      try {
+        const out = execFileSync('tasklist', ['/FI', 'IMAGENAME eq WorkBuddy.exe', '/FO', 'CSV', '/NH'],
+          { encoding: 'utf8', timeout: 10000, windowsHide: true });
+        const pids = out.split('\n')
+          .map((line) => line.split('","')[1])
+          .filter((pid) => pid && /^\d+$/.test(pid.trim()));
+        for (const pid of pids) {
+          try {
+            execFileSync('taskkill', ['/PID', pid.trim(), '/T'], { timeout: 10000, windowsHide: true });
+          } catch { /* 已退出 */ }
+        }
+        if (pids.length) {
+          // 给 3 秒优雅退出，仍存活的强制结束
+          const deadline = Date.now() + 3000;
+          while (Date.now() < deadline) {
+            const still = execFileSync('tasklist', ['/FI', 'IMAGENAME eq WorkBuddy.exe', '/FO', 'CSV', '/NH'],
+              { encoding: 'utf8', timeout: 10000, windowsHide: true });
+            if (!/WorkBuddy\.exe/i.test(still)) break;
+            execFileSync('ping', ['127.0.0.1', '-n', '2'], { windowsHide: true });
+          }
+          const left = execFileSync('tasklist', ['/FI', 'IMAGENAME eq WorkBuddy.exe', '/FO', 'CSV', '/NH'],
+            { encoding: 'utf8', timeout: 10000, windowsHide: true });
+          if (/WorkBuddy\.exe/i.test(left)) {
+            execFileSync('taskkill', ['/IM', 'WorkBuddy.exe', '/T', '/F'], { timeout: 10000, windowsHide: true });
+          }
+        }
+      } catch { /* 进程本来就没在跑 */ }
+    }
+
+    // 3. 写认证：目标快照整份原样写回 + 写后校验（按 accessToken 值比较）
+    const snapshot = fs.readFileSync(path.join(AUTH_DIR, snapFile), 'utf8');
+    const parsed = JSON.parse(snapshot);
+    const expectToken = (parsed.auth && parsed.auth.accessToken)
+      || (parsed.account && parsed.account.accessToken) || '';
+    atomicWrite(currentPath, snapshot);
+    const written = JSON.parse(fs.readFileSync(currentPath, 'utf8'));
+    const gotToken = (written.auth && written.auth.accessToken)
+      || (written.account && written.account.accessToken) || '';
+    if (expectToken && gotToken !== expectToken) {
+      return { ok: false, error: '认证文件写后校验失败，已停止（当前登录态未被替换）', backup: backupPath };
+    }
+
+    // 4. 桌面端可选启动
+    if (app === 'workbuddy-desktop' && restart) {
+      const exe = exePath || findWorkbuddyExe();
+      if (!exe || !fs.existsSync(exe)) {
+        return {
+          ok: true, uid, name: target.name, backup: backupPath, restarted: false,
+          message: '账号已切换，但未找到 WorkBuddy 程序，请手动启动',
+        };
+      }
+      const { spawn } = require('child_process');
+      const child = spawn(exe, [], { detached: true, stdio: 'ignore', windowsHide: true });
+      child.unref();
+      return { ok: true, uid, name: target.name, backup: backupPath, restarted: true, exe };
+    }
+
+    return {
+      ok: true, uid, name: target.name, backup: backupPath, restarted: false,
+      // 无感切换：不动运行中的进程。CLI 启动时才读登录态，当前会话仍用旧账号，
+      // 新开的 CLI 会话自动用新账号（与 workbuddySwitch 的「关进程强制生效」不同，
+      // 这里选择不打断用户正在跑的会话，代价是生效要等下次启动）
+      message: '已切换。正在运行的 CLI 会话仍用原账号，新开的 CLI 会话将使用新账号',
+    };
+  } catch (e) {
+    return { ok: false, error: '切换失败：' + e.message, backup: backupPath };
+  }
+}
+
+/** path.join 的备份目录辅助（上一处笔误防护）。 */
+function backupDirDir(dir) { return dir; }
+
 module.exports = {
   AUTH_DIR,
+  DESKTOP_AUTH_FILE,
+  APP_AUTH_FILES,
   discoverAccounts,
+  listSwitchableAccounts,
+  switchAppAccount,
   fetchBilling,
   fetchBillingForAccounts,
   fetchCredit,

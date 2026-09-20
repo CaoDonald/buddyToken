@@ -26,12 +26,13 @@ Windows 下 `同步Token.bat`（离线一键同步+打开看板）、`打开看�
 
 ## 架构
 
-四个模块，数据单向流动：**本地 jsonl + 官方接口 → token-usage-report.js → token-usage-data.js → 看板 HTML**。
+五个模块，数据单向流动：**本地 jsonl + 官方接口 → token-usage-report.js → token-usage-data.js → 看板 HTML**。
 
 - **`token-usage-report.js`** — CLI 主脚本。扫描 `~/.workbuddy/projects/**` 与 `~/.codebuddy/projects/**` 下的 `.jsonl` 会话记录（一条带 `message.usage` 的记录 = 一次 API 请求），产出 `token-usage-data.js`（`window.__TOKEN_DATA__ = {...}` 形式的 JS 文件，而非 JSON——因为 `file://` 下 fetch 不可用，看板靠动态注入 `<script>` 加载）、CSV 明细和 Markdown 汇总。`workbuddy-api.js` 加载失败时静默降级为纯本地扫描。
-- **`workbuddy-api.js`** — 官方接口封装：从 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info` 发现账号凭证，拉积分账单、余额、套餐，及签到/猫猫旅行。**两个域不能混用**：账单在 `workbuddy.cn`，签到/活动在 `codebuddy.cn`。凭证只在内存使用，绝不写盘。
-- **`server.js`** — 薄 HTTP 服务。`POST /api/sync[/credits|/tokens]` 用 `execFile` 子进程跑 `token-usage-report.js --emit-js`（保证与手动跑行为一致，超时 5 分钟）；`/api/checkin`、`/api/travel` 在进程内直接调 `wbApi`；`/api/checkin-status`（只读）供看板渲染签到日历，顺带把查到的日期并入 `checkin-history.json`；`/api/status` 报告同步状态与扫描目录。同一时间只允许一次同步（409 拒绝并发）。CORS 全放行（看板从 `file://` 发跨域请求，Origin 为 null）。
-- **`workbuddy-token.html`** — 单文件看板，约 18 万字符，双击即用。所有 UI/逻辑/样式内联，支持本地快照（IndexedDB）、Excel 手工导入、Markdown/CSV 导出。
+- **`workbuddy-api.js`** — 官方接口封装：从 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info` 发现账号凭证，拉积分账单、余额、套餐，及签到/猫猫旅行。**两个域不能混用**：账单在 `workbuddy.cn`，签到/活动在 `codebuddy.cn`。凭证只在内存使用，绝不写盘。另有账号库与切换：auth 目录的历史快照按 (uid, app) 分组即「可切换账号」——`workbuddy-desktop*.info` 属 WorkBuddy 桌面端、`Tencent-Cloud.coding-copilot*.info` 属 CodeBuddy CLI（归属已用 CLI 日志鉴权 uid 实证），切换 = 把目标快照整份写回该 app 的当前登录文件（原子写 + 备份到项目 `switch-backups/`，含 token 已 gitignore）；桌面端切换可选重启 WorkBuddy（exe 路径：进程路径→注册表→常见候选），IDE 登录态不在此目录、不支持。
+- **`rate-limits.js`** — 模型限流（429）台账：扫 `~/.workbuddy/logs` 与 `~/.codebuddy/logs` 最近 2 天日志，从「超出频率限制」行提取官方恢复时刻（`将在 … UTC+8 重置`），按 sessionId→`resolved model` 归因模型、uid 行/sessions 表归因账号。模块内 60s 缓存，不发网络请求。
+- **`server.js`** — 薄 HTTP 服务。`POST /api/sync[/credits|/tokens]` 用 `execFile` 子进程跑 `token-usage-report.js --emit-js`（保证与手动跑行为一致，超时 5 分钟）；`/api/checkin`、`/api/travel` 在进程内直接调 `wbApi`；`/api/checkin-status`（只读）返回签到+旅行状态供看板渲染，顺带把查到的日期并入 `checkin-history.json`；`/api/limits` 返回 429 台账；`POST /api/switch` 切换桌面端账号（互斥锁，与同步同款 409 拒并发）；`/api/status` 报告同步状态、扫描目录与 switchable 账号。同一时间只允许一次同步。CORS 全放行（看板从 `file://` 发跨域请求，Origin 为 null）。
+- **`workbuddy-token.html`** — 单文件看板，约 18 万字符，双击即用。所有 UI/逻辑/样式内联，支持本地快照（IndexedDB）、Excel 手工导入、Markdown/CSV 导出。账号卡片渲染状态 chips（签到/旅行/429/建议优先）、登录徽标、余额更新时间与「设为当前」切换按钮；30s 重渲染倒计时、60s 轮询数据。
 
 ## token-usage-data.js 字段速查
 
@@ -41,7 +42,7 @@ Windows 下 `同步Token.bat`（离线一键同步+打开看板）、`打开看�
 - `ti` — 会话标题映射（会话ID → `ai-title` 记录），会话级而非回合级。
 - `bill` — 官方账单紧凑行 `[requestId, credit, model, client, 时间ms, 账号下标]`，下标指向 `uids`。
 - `uids` — 账号下标表（行里存下标，避免每行重复写 uid）。
-- `acct` — 各账号余额快照（当前值，非累加量）。
+- `acct` — 各账号余额快照（当前值，非累加量）；每行可带 `login`（本机登录态：`app` 为最近登录来源、`apps` 为各 app 的凭证到期时间，仅 app 名与时间戳、不含 token），看板据此在账号卡片右上角渲染登录徽标。
 - `su` — 会话ID → 账号 uid 映射，来自 `~/.workbuddy/workbuddy.db` 的 `sessions.user_id`（经 `node:sqlite` 只读，Node 22.5+ 可用，低版本静默返回空）。CLI 会话不在库里，靠账单 requestId 反向标注补。
 - `hist` — 余额历史 `{uid: [[ts, remaining], …]}`（同账号同天只留最后一条），趋势图用。
 

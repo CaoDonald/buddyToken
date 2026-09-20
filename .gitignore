@@ -8,6 +8,7 @@ checkin-history.json
 # 账号凭证与官方账单：含明文 accessToken/refreshToken、真实 requestId，切勿提交
 wb-accounts.json
 billing-data.js
+switch-backups/
 
 # 自己导出的账单文件
 *.xlsx

@@ -63,6 +63,14 @@ const MIME = {
 
 /** 同一时间只允许一次同步：重复点击直接拒绝，避免两个脚本抢写数据文件。 */
 let syncing = false;
+/** 切换账号同理：写认证文件期间不允许并发（备份→写→重启必须原子）。 */
+let switching = false;
+
+/** 模型限流台账（本地日志扫描，模块内自带 60s 缓存）。 */
+let rateLimits = null;
+try {
+  rateLimits = require('./rate-limits');
+} catch { /* 文件缺失时 429 状态不可用，不影响其它功能 */ }
 
 /** 官方接口封装。签到/旅行这两类操作直接在服务进程内调用，不走子进程。 */
 let wbApi = null;
@@ -256,7 +264,7 @@ async function handleCheckin(req, res) {
   json(res, 200, { ok: results.some((r) => r.ok), results });
 }
 
-/** 签到状态（只读，不改变任何服务端状态）。供看板渲染签到日历。 */
+/** 签到与旅行状态（只读，不改变任何服务端状态）。供看板渲染账号卡片状态。 */
 async function handleCheckinStatus(req, res) {
   if (!wbApi) {
     json(res, 503, { ok: false, error: '缺少 workbuddy-api.js' });
@@ -273,6 +281,19 @@ async function handleCheckinStatus(req, res) {
     const r = await wbApi.fetchCheckin(acct);
     // 接口每次只回最近若干天，这里并入本地累积，日历才能显示更长的记录
     if (r.ok) r.checkinDatesAll = wbApi.recordCheckinDates(acct.uid, r.checkinDates);
+    // 顺带查旅行状态（只读），账号卡片一次拿到两个活动状态，省一轮轮询
+    try {
+      const t = await wbApi.fetchTravel(acct);
+      r.travel = t.ok
+        ? {
+            state: t.state,                    // idle / traveling / arrived
+            arriveAt: t.arriveAt,              // 旅行中：预计到达时刻（ms）
+            locationName: t.location ? t.location.name : '',
+            rewardCredit: t.rewardCredit,
+            dailyLimitReached: t.dailyLimitReached,
+          }
+        : null;
+    } catch { r.travel = null; }
     results.push(r);
   }
   json(res, 200, { ok: results.some((r) => r.ok), results });
@@ -298,11 +319,68 @@ async function handleTravel(req, res) {
   json(res, 200, { ok: results.some((r) => r.ok), results });
 }
 
+/**
+ * 切换某应用的登录账号（写对应登录文件；桌面端可选重启 WorkBuddy）。
+ *
+ * body: { uid, app?, restart? }——app 缺省为 workbuddy-desktop（兼容旧调用）。
+ * 与同步同款互斥：切换过程中再来的请求直接 409。restart 会杀掉 WorkBuddy
+ * 进程再拉起，属于破坏性动作，看板侧会先弹确认框。
+ */
+async function handleSwitch(req, res) {
+  if (!wbApi || !wbApi.switchAppAccount) {
+    json(res, 503, { ok: false, error: '缺少 workbuddy-api.js（旧版文件，请更新项目）' });
+    return;
+  }
+  if (switching) {
+    json(res, 409, { ok: false, error: '已有切换进行中，请稍候' });
+    return;
+  }
+  const body = await readBody(req);
+  const uid = String(body.uid || '').trim();
+  if (!uid) {
+    json(res, 400, { ok: false, error: '缺少 uid' });
+    return;
+  }
+  const app = String(body.app || 'workbuddy-desktop').trim();
+  const restart = body.restart !== false;   // 默认重启（不重启登录态可能不被客户端重读）
+
+  switching = true;
+  try {
+    const result = wbApi.switchAppAccount(app, uid, { restart });
+    json(res, result.ok ? 200 : 500, result);
+  } catch (e) {
+    json(res, 500, { ok: false, error: e.message });
+  } finally {
+    switching = false;
+  }
+}
+
+/** 模型限流台账（本机日志扫描，60s 缓存在模块内）。 */
+function handleLimits(req, res) {
+  if (!rateLimits) {
+    json(res, 503, { ok: false, error: '缺少 rate-limits.js' });
+    return;
+  }
+  let currentUid = null;
+  try {
+    if (wbApi && wbApi.listSwitchableAccounts) currentUid = wbApi.listSwitchableAccounts().current;
+  } catch { /* 取不到就少了归因兜底 */ }
+  const force = new URL(req.url, 'http://x').searchParams.get('force') === '1';
+  json(res, 200, { ok: true, ...rateLimits.getRateLimits({ force, currentUid }) });
+}
+
 function handleStatus(req, res) {
+  // 可切换账号（auth 目录快照发现，不含 token）+ 当前桌面端登录 uid
+  let switchable = { current: null, accounts: [] };
+  try {
+    if (wbApi && wbApi.listSwitchableAccounts) switchable = wbApi.listSwitchableAccounts();
+  } catch { /* 无 auth 目录时保持空 */ }
   json(res, 200, {
     ok: true,
     syncing,
+    switching,
     meta: readDataMeta(),
+    switchable,
     // 页面据此把「连接本地会话」换成「服务已读取的路径」，省掉授权步骤
     scanDirs: SCAN_DIRS.map((s) => ({
       name: s.name,
@@ -327,6 +405,9 @@ const server = http.createServer((req, res) => {
   if (pathname === '/api/checkin' && req.method === 'POST') return handleCheckin(req, res);
   if (pathname === '/api/checkin-status') return handleCheckinStatus(req, res);
   if (pathname === '/api/travel' && req.method === 'POST') return handleTravel(req, res);
+  if (pathname === '/api/travel-status') return handleCheckinStatus(req, res);
+  if (pathname === '/api/switch' && req.method === 'POST') return handleSwitch(req, res);
+  if (pathname === '/api/limits') return handleLimits(req, res);
   if (pathname === '/api/status') return handleStatus(req, res);
   serveStatic(req, res);
 });

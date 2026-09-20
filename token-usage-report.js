@@ -560,6 +560,13 @@ async function fetchOfficial(days) {
     idxOf.has(r.uid) ? idxOf.get(r.uid) : -1,
   ]);
 
+  // 登录态：本机快照信息（app 来源与凭证有效期），与官方接口无关。
+  // 只放 app 名和时间戳，不含任何 token；旧数据/离线场景缺席，消费方按无数据处理。
+  const loginByUid = new Map(
+    accounts.filter((a) => Array.isArray(a.apps) && a.apps.length)
+      .map((a) => [a.uid, { app: a.apps[0].app, apps: a.apps }])
+  );
+
   const accountList = credits.filter((c) => c.ok).map((c) => ({
     uid: c.uid,
     name: c.name,
@@ -573,6 +580,7 @@ async function fetchOfficial(days) {
     expiredRemaining: Math.round(c.expiredRemaining),
     updatedAt: c.updatedAt,
     packages: groupPackages(c.resources),
+    login: loginByUid.get(c.uid) || null,
   }));
 
   if (!accountList.length && !bill.length) return null;

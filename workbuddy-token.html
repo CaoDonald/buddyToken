@@ -165,6 +165,21 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .card h3 .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
 .card h3 .tag{font-weight:500;font-size:11px;color:var(--muted);background:#f2f5fc;
   padding:1px 8px;border-radius:6px}
+.login-badges{margin-left:auto;display:inline-flex;gap:5px;flex-wrap:wrap}
+.lg-ico{position:relative;display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 4px;border-radius:6px;border:none;font-size:10px;font-weight:700;cursor:default;font-family:inherit}
+.lg-cur{background:#e8f6ee;color:#0a7d43}
+.lg-switch{background:#eef2fb;color:#3d5a9e;cursor:pointer;transition:background .15s,color .15s}
+.lg-switch:hover{background:#dde7fa;color:#1d3f85}
+.lg-dim{background:#f2f4f8;color:#b6c0d4}
+.lg-mark{position:absolute;top:-5px;right:-5px;width:12px;height:12px;border-radius:50%;background:#0a7d43;color:#fff;font-size:8px;font-style:normal;font-weight:700;display:inline-flex;align-items:center;justify-content:center}
+.st-chip{position:relative;font-size:12px;line-height:1;padding:3px 6px;border-radius:6px;font-weight:500;background:#f2f5fc;color:#8b98b3;white-space:nowrap;cursor:default}
+.st-chip.ok{background:#e8f6ee}
+.st-chip.warn{background:#fff4e0}
+.st-chip.bad{background:#fdeceb}
+.st-chip.pri{background:#fdf6df}
+.st-ico{padding-right:8px}
+.st-num{position:absolute;top:-5px;right:-3px;background:#b3261e;color:#fff;font-size:9px;min-width:14px;height:14px;padding:0 3px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;font-style:normal;font-weight:700}
+.acct-upd{margin-left:auto;font-size:11px;color:#8b98b3;font-variant-numeric:tabular-nums}
 .c3{grid-column:span 3}.c4{grid-column:span 4}.c5{grid-column:span 5}
 .c6{grid-column:span 6}.c7{grid-column:span 7}.c8{grid-column:span 8}.c12{grid-column:span 12}
 .chart-box{position:relative;height:260px}
@@ -769,7 +784,9 @@ const state = {
   tokenLoaded: false,   // token-usage-data.js 是否成功加载
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
   detail: { mode:'all', q:'', page:0, expanded:null },   // expanded = 展开步骤明细的回合 ID
-  checkins: {},           // uid → 签到状态（服务模式下异步拉取）
+  checkins: {},           // uid → 签到状态（服务模式下异步拉取；含 travel 旅行状态）
+  limits: { scannedAt: 0, byUid: {} },   // uid → 429 受限模型列表（服务模式异步拉取）
+  serverStatus: null,     // /api/status 缓存（switchable 账号列表等）
   rank: { sort:'perPoint', dir:'desc' },  // 模型性价比卡的表头排序
   sess: { sort:'pts', dir:'desc' },       // Session 消耗卡的表头排序
   day:  { sort:'date', dir:'asc' }        // 每日汇总卡的表头排序（默认时间正序）
@@ -1165,6 +1182,97 @@ function daysLater(at, now){
   return `${Math.max(0, Math.ceil((at - now) / 86400000))} 天后`;
 }
 
+/** 倒计时人话：`2小时14分` / `45分钟`；不足 1 分钟为「即将恢复」。 */
+function fmtCountdown(ms){
+  if(ms <= 0) return '即将恢复';
+  const mins = Math.max(1, Math.ceil(ms / 60000));
+  const h = Math.floor(mins / 60), m = mins % 60;
+  if(h && m) return `${h}小时${m}分`;
+  if(h) return `${h}小时`;
+  return `${m}分钟`;
+}
+
+/** 恢复时刻：今天 `17:59`、明天 `明天 09:00`、更远 `9/21 09:00`。 */
+function fmtResetClock(resetAt, now){
+  const d = new Date(resetAt);
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const midnight = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((midnight(d) - midnight(new Date(now))) / 86400000);
+  if(days <= 0) return hm;
+  if(days === 1) return `明天 ${hm}`;
+  return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+
+/** 该账号当前生效的 429 受限条目（数据可能比页面时钟旧，过期的直接滤掉）。 */
+function activeLimits(uid, now){
+  const list = (state.limits.byUid && state.limits.byUid[uid]) || [];
+  return list.filter(l => l.resetAt > now).sort((a, b) => a.resetAt - b.resetAt);
+}
+
+/**
+ * 底部「设为当前」按钮：仅针对 WorkBuddy 桌面端（各应用切换已由右上角图标承担）。
+ * 当前登录账号显示禁用的「当前使用」；无桌面端快照不显示。
+ */
+function switchBtnFor(a){
+  const sw = state.serverStatus && state.serverStatus.switchable;
+  if(!sw || !Array.isArray(sw.accounts)) return '';
+  const cur = sw.currentByApp || {};
+  if(cur['workbuddy-desktop'] === a.uid){
+    return '<button class="acct-btn" disabled title="该账号正在 WorkBuddy 桌面端登录">✓ 当前使用</button>';
+  }
+  if(!sw.accounts.some(x => x.uid === a.uid && x.snapshots && x.snapshots['workbuddy-desktop'])) return '';
+  return `<button class="acct-btn" data-act="switch" data-uid="${esc(a.uid)}"
+            title="把 WorkBuddy 桌面端切换到该账号（会关闭并重启 WorkBuddy）">🔀 设为当前</button>`;
+}
+
+/**
+ * 账号卡片状态 chips：签到 / 旅行 / 模型限流 / 建议优先。
+ *
+ * 形态对齐 workbuddySwitch 的卡片：**纯图标 badge** 挤在标题行内，状态由
+ * 图标 + 色调 + tooltip 共同表达，不占文案宽度。数据来自只读查询，缺席即省略。
+ */
+function renderStatusChips(a, uid, isPriority){
+  const now = Date.now();
+  const chips = [];
+  const ck = state.checkins[uid];
+
+  // 签到：日历打勾（已签）/ 空日历（未签）
+  if(ck && ck.ok !== false){
+    chips.push(ck.checkedIn
+      ? '<span class="st-chip ok" title="今日已签到">✅</span>'
+      : '<span class="st-chip dim" title="今日未签到">📅</span>');
+  }
+
+  // 旅行：只有「有信息量」的状态才显示（空闲不占位）
+  const tv = ck && ck.travel;
+  if(tv && tv.state === 'traveling'){
+    const left = tv.arriveAt ? fmtCountdown(tv.arriveAt - now) : '';
+    chips.push(`<span class="st-chip warn" title="旅行中${
+      tv.locationName ? ` · ${esc(tv.locationName)}` : ''}${
+      tv.rewardCredit ? ` · 预计 +${fmt0(tv.rewardCredit)} 积分` : ''}${left ? ` · ${left}后到达` : ''}">🐱</span>`);
+  }else if(tv && tv.state === 'arrived'){
+    chips.push('<span class="st-chip ok" title="猫猫已到达，点「派猫猫」领取奖励">🐱</span>');
+  }else if(tv && !tv.state){
+    chips.push('<span class="st-chip dim" title="无 Buddy">无 Buddy</span>');
+  }else if(tv && tv.state === 'idle' && tv.dailyLimitReached){
+    chips.push('<span class="st-chip dim" title="今日已派出过，明天再来">🐱</span>');
+  }
+
+  // 模型限流（429）：受限模型数 >1 时图标带数量角标，tooltip 按恢复时间升序逐行列出
+  const lims = activeLimits(uid, now);
+  if(lims.length){
+    const lines = lims.map(l =>
+      `${l.model || '未知模型'} · ${fmtCountdown(l.resetAt - now)}后恢复（${fmtResetClock(l.resetAt, now)}）`);
+    chips.push(`<span class="st-chip bad st-ico" title="${esc(lines.join('\n'))}">⚡${
+      lims.length > 1 ? `<i class="st-num">${lims.length}</i>` : ''}</span>`);
+  }
+
+  // 建议优先（该账号是「最早到期」的那个）
+  if(isPriority) chips.push('<span class="st-chip pri" title="积分最早到期，建议优先使用该账号">⭐</span>');
+
+  return chips.join('');
+}
+
 /**
  * 账号内「仍有剩余、且 SOON_DAYS 天内到期」的最早到期时间；没有则返回 null。
  *
@@ -1224,6 +1332,43 @@ function renderExpiryTip(list, now){
     </div>`;
 }
 
+/**
+ * 应用图标定义：固定呈现三个（顺序对齐参考卡片：桌面端 / IDE / CLI）。
+ * `>_`（终端符）是 CLI 的图标；CodeBuddy IDE 本机未登录、无登录数据源，恒置灰。
+ */
+const APP_BADGES = [
+  { app: 'workbuddy-desktop', icon: 'W',   label: 'WorkBuddy 桌面端' },
+  { app: 'codebuddy-ide',     icon: 'C',   label: 'CodeBuddy IDE' },
+  { app: 'codebuddy-cli',     icon: '>_',  label: 'CodeBuddy CLI' },
+];
+
+/**
+ * 账号卡片右上角的应用登录图标（三个恒定呈现，图标即状态）：
+ *   · 该应用当前登录的就是此账号 → 亮色 + ✓ 角标，不可点；
+ *   · 此账号在该应用有登录快照 → 可点击（点击切换为该应用当前账号，有二次确认）；
+ *   · 无快照 / 无登录数据源（IDE）→ 置灰。
+ */
+function renderAppBadges(a){
+  const sw = state.serverStatus && state.serverStatus.switchable;
+  const cur = (sw && sw.currentByApp) || {};
+  // 该账号在各应用的可切换快照（来自 /api/status；只有存在性会出现在前端，token 不下发）
+  const snapOf = (sw && Array.isArray(sw.accounts) && sw.accounts.find(x => x.uid === a.uid)) || null;
+  return '<span class="login-badges">' + APP_BADGES.map(b => {
+    const supported = b.app !== 'codebuddy-ide';
+    const isCurrent = supported && cur[b.app] === a.uid;
+    const hasSnap = supported && !!(snapOf && snapOf.snapshots && snapOf.snapshots[b.app]);
+    if (isCurrent) {
+      return `<span class="lg-ico lg-cur" title="${esc(b.label)} · 当前登录账号">${esc(b.icon)}<i class="lg-mark">✓</i></span>`;
+    }
+    if (hasSnap) {
+      return `<button class="lg-ico lg-switch" data-act="appswitch" data-app="${esc(b.app)}"
+                data-uid="${esc(a.uid)}" title="设为${esc(b.label)}的当前登录账号">${esc(b.icon)}</button>`;
+    }
+    const why = supported ? '该账号无此应用的登录快照' : '暂不支持（本机未检测到登录数据源）';
+    return `<span class="lg-ico lg-dim" title="${esc(b.label)} · ${why}">${esc(b.icon)}</span>`;
+  }).join('') + '</span>';
+}
+
 function renderAccounts(){
   const host = $('acctGrid');
   if(!host) return;
@@ -1238,6 +1383,10 @@ function renderAccounts(){
     const kx = urgencyKey(x, now), ky = urgencyKey(y, now);
     return kx === ky ? 0 : kx - ky;
   });
+
+  // 建议优先的账号 = 到期紧迫度排序（已过期垫底）后的第一个仍有余额的账号。
+  // 不限「7 天内到期」——那太苛刻，平时没有任何账号会命中，星标就永远不出现
+  const priorityUid = (ordered.find(a => (a.remaining > 0) || soonExpireAt(a, now) !== null) || {}).uid || null;
 
   const cards = ordered.map(a => {
     const usedPct = a.total ? (a.used / a.total * 100) : 0;
@@ -1265,15 +1414,22 @@ function renderAccounts(){
       expiry = `最近到期 ${fmtDate(new Date(a.soonestExpireAt))}（${days} 天后）`;
     }
 
+    const updTime = a.updatedAt
+      ? `<span class="acct-upd" title="余额数据更新于 ${new Date(a.updatedAt).toLocaleString('zh-CN')}">🕒 ${pad(new Date(a.updatedAt).getHours())}:${pad(new Date(a.updatedAt).getMinutes())} 更新</span>`
+      : '';
+
     return `
       <div class="card c6">
         <h3>
           <span class="dot"></span>${esc(a.name)}
           <span class="tag">${esc(String(a.uid).slice(0, 8))}…</span>
+          ${renderStatusChips(a, a.uid, a.uid === priorityUid)}
+          ${renderAppBadges(a)}
         </h3>
         <div class="acct-head">
           <span class="acct-remain">${fmt0(a.remaining)}</span>
           <span class="acct-total">剩余积分 · 总量 ${fmt0(a.total)} · 已用 ${fmt0(a.used)}</span>
+          ${updTime}
         </div>
         <div class="acct-bar"><i style="width:${Math.min(100, usedPct).toFixed(1)}%"></i></div>
         <div class="kpi-sub">${expiry}${
@@ -1285,6 +1441,7 @@ function renderAccounts(){
                   title="每日签到领积分。已签到会自动识别，不会重复提交">✅ 签到</button>
           <button class="acct-btn" data-act="travel" data-uid="${esc(a.uid)}"
                   title="按状态自动判断：空闲就派出去，已到达就领奖励，旅行中会提示还要等多久">🐱 派猫猫</button>
+          ${switchBtnFor(a)}
         </div>
       </div>`;
   }).join('');
@@ -1309,16 +1466,24 @@ function renderAccounts(){
 }
 
 /**
- * 拉各账号签到状态（只读），拿到后重渲染账号卡片。
- * 页面加载时异步调用，不阻塞首屏。
+ * 拉各账号签到/旅行状态与模型限流台账（只读），拿到后重渲染账号卡片。
+ * 页面加载时异步调用，不阻塞首屏；之后由定时器周期刷新。
  */
 async function loadCheckinStatus(){
   if(!await ServerSync.available()) return;
-  const list = await ServerSync.checkinStatus();
-  if(!list || !list.length) return;
-  state.checkins = {};
-  for(const c of list){
-    if(c && c.uid) state.checkins[c.uid] = c;
+  // 服务状态（含可切换账号列表）随本轮一并缓存，切换按钮据此渲染
+  state.serverStatus = await ServerSync.status();
+  const [list, lim] = await Promise.all([ServerSync.checkinStatus(), ServerSync.limits()]);
+  if(list && list.length){
+    state.checkins = {};
+    for(const c of list){
+      if(c && c.uid) state.checkins[c.uid] = c;
+    }
+  }
+  if(lim){
+    const byUid = {};
+    for(const acc of (lim.accounts || [])) byUid[acc.uid] = acc.limits || [];
+    state.limits = { scannedAt: lim.scannedAt, byUid };
   }
   renderAccounts();
 }
@@ -1339,12 +1504,44 @@ async function onAcctAction(btn){
   const act = btn.dataset.act;
   const uid = btn.dataset.uid;
   const label = btn.textContent;
+
+  // 切换账号是破坏性动作，按目标应用给出对应提示，先二次确认
+  if(act === 'switch' || act === 'appswitch'){
+    const sw = state.serverStatus && state.serverStatus.switchable;
+    const target = sw && sw.accounts ? sw.accounts.find(x => x.uid === uid) : null;
+    const name = (target && target.name) || uid.slice(0, 8);
+    const app = act === 'appswitch' ? (btn.dataset.app || 'workbuddy-desktop') : 'workbuddy-desktop';
+    const appName = app === 'codebuddy-cli' ? 'CodeBuddy CLI' : 'WorkBuddy 桌面端';
+    const effect = app === 'codebuddy-cli'
+      ? '无感切换：不打断正在运行的 CLI 会话（仍用原账号），新开的 CLI 会话将使用新账号'
+      : '将关闭并重新启动 WorkBuddy';
+    if(!confirm(`把${appName}切换到「${name}」？\n\n${effect}，切换前会自动备份当前登录态。`)) return;
+
+    btn.disabled = true;
+    let r;
+    try {
+      r = await ServerSync.switchAccount(uid, app);
+    } finally {
+      btn.disabled = false;
+    }
+    if(!r || !r.ok){
+      toast('切换失败：' + (r && r.error || '未知错误'));
+      return;
+    }
+    toast(`${r.name || '账号'}：${r.message || '已切换为当前登录账号'}` +
+      (r.backup ? '（原登录态已备份）' : ''));
+    // 切换后各应用当前账号变了，重拉服务状态与账号卡片
+    state.serverStatus = await ServerSync.status();
+    renderAccounts();
+    return;
+  }
+
   btn.disabled = true;
   btn.textContent = '⏳ 处理中…';
 
-  const r = act === 'checkin'
-    ? await ServerSync.checkin(uid)
-    : await ServerSync.travel(uid);
+  let r;
+  if(act === 'checkin') r = await ServerSync.checkin(uid);
+  else r = await ServerSync.travel(uid);
 
   btn.disabled = false;
   btn.textContent = label;
@@ -1363,6 +1560,7 @@ async function onAcctAction(btn){
     loadCheckinStatus();   // 刷新签到日历
   }else{
     toast(`${one.name || '账号'}：${one.message || '已处理'}`);
+    loadCheckinStatus();   // 刷新旅行状态
   }
 }
 
@@ -2884,6 +3082,13 @@ const ServerSync = (() => {
   const checkin = (uid) => postJson('/api/checkin', uid ? { uid } : {});
   const travel  = (uid) => postJson('/api/travel',  uid ? { uid } : {});
 
+  /**
+   * 切换某应用的登录账号。app：'workbuddy-desktop'（默认，会重启 WorkBuddy）
+   * 或 'coding-copilot'（CodeBuddy，切完需重开窗口）。
+   */
+  const switchAccount = (uid, app = 'workbuddy-desktop', restart = true) =>
+    postJson('/api/switch', { uid, app, restart });
+
   /** 各账号签到状态（只读，页面加载时拉一次）。 */
   async function checkinStatus(){
     const b = await base();
@@ -2897,7 +3102,23 @@ const ServerSync = (() => {
     }
   }
 
-  return { available, status, scanDirs, run, checkin, travel, checkinStatus };
+  /**
+   * 模型限流台账（服务端扫本机日志，60s 缓存）。
+   * 返回 { scannedAt, accounts: [{uid, limits:[{model, resetAt}]}] }，失败为 null。
+   */
+  async function limits(){
+    const b = await base();
+    if(!b) return null;
+    try{
+      const r = await fetch(b + '/api/limits', { cache: 'no-store' });
+      const j = await r.json();
+      return (j && j.ok) ? j : null;
+    }catch{
+      return null;
+    }
+  }
+
+  return { available, status, scanDirs, run, checkin, travel, checkinStatus, limits, switchAccount };
 })();
 
 /* =========================================================
@@ -3249,6 +3470,21 @@ async function runServerSync(part, btn){
     toast(`Token 已同步 · 本地回合 ${fmt0(m.turns)} · 请求 ${fmt0(m.reqs)} · 耗时 ${secs}s`);
     setSaveState('saved', `Token 已同步 · ${secs}s`);
   }
+}
+
+/**
+ * 积分自动刷新：定时静默跑一次「同步积分」（与手动点击走同一条服务端命令），
+ * 让卡片余额/到期信息保持新鲜。成功后静默重载数据；
+ * 失败（409 撞上手动同步、服务未启动等）一律静默跳过，不打扰用户。
+ */
+async function autoRefreshCredits(){
+  if(document.hidden) return;                    // 页面不可见时不浪费
+  if(!await ServerSync.available()) return;      // 非服务模式不管
+  const r = await ServerSync.run('credits');
+  if(!r.ok) return;
+  await syncTokens({});
+  setSaveState('saved', '积分已自动刷新 · ' +
+    new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
 }
 
 /* =========================================================
@@ -3936,9 +4172,9 @@ async function loadFile(file){
     else                   await syncTokens({ toast: true });
   });
 
-  /* 账号卡片上的签到 / 派猫猫（卡片是动态渲染的，用事件委托） */
+  /* 账号卡片上的签到 / 派猫猫 / 应用切换图标（卡片是动态渲染的，用事件委托） */
   $('acctGrid').addEventListener('click', (e) => {
-    const btn = e.target.closest('.acct-btn');
+    const btn = e.target.closest('.acct-btn, .lg-switch');
     if(btn) onAcctAction(btn);
   });
 
@@ -3983,8 +4219,13 @@ async function loadFile(file){
     await tryRestore();
     // 官方账单（脚本自动同步）合并进来，与手工导入的 Excel 并存
     await mergeOfficialBill();
-    // 签到状态是只读查询，异步拉取，不阻塞首屏
+    // 签到/旅行/限流状态是只读查询，异步拉取，不阻塞首屏
     loadCheckinStatus();
+    // 倒计时走动：旅行剩余、429 恢复时刻都在卡片上实时显示，30s 重渲染一次
+    setInterval(renderAccounts, 30000);
+    // 数据刷新：签到/旅行状态与限流台账每 60s 重拉（服务端日志扫描自带 60s 缓存）
+    setInterval(loadCheckinStatus, 60000);
+    // 积分自动刷新（autoRefreshCredits）暂不启用：余额仍以手动「同步积分」为准
   })();
 })();
 </script>
