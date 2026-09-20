@@ -41,6 +41,11 @@
  *   同名回合以本次扫描为准（正在进行的会话会在后续同步里被补齐）。
  *   想丢弃历史、只保留本次扫描结果，加 --no-merge。
  *
+ * 官方账单拉取窗口
+ *   默认跟随 --days（兜底 7 天）。已有数据里账单一条都没有时视为「初始化」，
+ *   自动改为一次性拉全部历史（近 3 年，30 天窗口由 API 层自动切分），之后的
+ *   同步回到常规窗口只做增量。--official-days 显式指定时优先于以上规则。
+ *
  * 回合（turn）口径
  *   providerData.conversationRequestId 是「回合 ID」，粒度比 messageId 粗：
  *   一次用户提问 = 一个回合，但 agent 会在其中发起多次 API 请求（实测均 7.65 次）。
@@ -509,7 +514,11 @@ async function fetchOfficial(days) {
     console.warn('  [官方] 本机未找到登录态，跳过自动同步（仍可手动导入账单 Excel）');
     return null;
   }
-  console.log(`  [官方] 发现 ${accounts.length} 个账号，拉取最近 ${days} 天账单…`);
+  const isFull = days >= FULL_HISTORY_DAYS;
+  console.log(`  [官方] 发现 ${accounts.length} 个账号，` +
+    (isFull
+      ? `账单还是空的，首次拉取全部历史（近 ${days} 天，按 30 天窗口切分）…`
+      : `拉取最近 ${days} 天账单…`));
 
   const since = Date.now() - days * 86400000;
   let billing;
@@ -652,9 +661,29 @@ function mergeOfficialData(prev, fresh, canMerge) {
 
 // ---------------------------------------------------------------- 只刷新官方数据
 
-/** 官方数据拉取窗口：优先显式参数，否则跟随本地扫描范围，最后兜底 7 天。 */
-function resolveOfficialDays(args, days) {
-  return args['official-days'] ? parseInt(args['official-days'], 10) : (days > 0 ? days : 7);
+/**
+ * 官方数据「全量拉取」窗口（天）。
+ *
+ * 「初始化」＝已有数据文件里账单一条都没有（首次生成、--no-official 离线首跑、
+ * 或官方同步一直失败）。此时若仍按默认 7 天拉，窗口外的历史账单永远不会被补回
+ * ——增量合并只保留已经拉到的行，没拉到的等于永久丢失。所以初始化时一次拉全量：
+ * 窗口取 3 年，足以覆盖产品上线以来的全部历史；服务端「窗口 >31 天返回空」的
+ * 限制由 workbuddy-api.js 按 30 天自动切分兜住。之后每次同步只需拉最近几天做增量。
+ */
+const FULL_HISTORY_DAYS = 365 * 3;
+
+/**
+ * 官方数据拉取窗口：优先显式参数；账单还是空的（初始化）时取全量窗口；
+ * 否则跟随本地扫描范围，最后兜底 7 天。
+ *
+ * prevData：已有的 token-usage-data.js 数据（读不到为 null），用它的 bill
+ * 行数判断是否初始化。null（文件不存在＝首次生成）同样视为初始化。
+ */
+function resolveOfficialDays(args, days, prevData) {
+  if (args['official-days']) return parseInt(args['official-days'], 10);
+  const prevBill = prevData && Array.isArray(prevData.bill) ? prevData.bill : [];
+  if (!prevBill.length) return FULL_HISTORY_DAYS;
+  return days > 0 ? days : 7;
 }
 
 /**
@@ -664,7 +693,7 @@ function resolveOfficialDays(args, days) {
  * 换成最新的。这样「同步积分」和「同步 Token」就是两个互不干扰的操作，
  * 各跑各的，谁也不会把对方的结果覆盖掉。
  */
-async function syncCreditsOnly({ outdir, jsOut, officialDays, noMerge }) {
+async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge }) {
   if (!wbApi) {
     console.error('缺少 workbuddy-api.js，无法同步官方数据');
     process.exit(1);
@@ -681,6 +710,8 @@ async function syncCreditsOnly({ outdir, jsOut, officialDays, noMerge }) {
     process.exit(1);
   }
 
+  // 已有账单一条都没有＝初始化：自动改拉全部历史，之后的同步再回到常规窗口
+  const officialDays = resolveOfficialDays(args, days, data);
   const official = await fetchOfficial(officialDays);
   if (!official) {
     console.error('官方数据拉取失败，数据文件保持不变。');
@@ -700,7 +731,9 @@ async function syncCreditsOnly({ outdir, jsOut, officialDays, noMerge }) {
   } catch { /* 无历史时省略 */ }
 
   const head = '/* 由 token-usage-report.js 自动生成，请勿手工编辑 */\n' +
-    `/* ${fmtTime(new Date())} · 仅刷新官方账单（近 ${officialDays} 天）· ` +
+    `/* ${fmtTime(new Date())} · 仅刷新官方账单（` +
+    (officialDays >= FULL_HISTORY_DAYS ? `初始化全量，近 ${officialDays} 天` : `近 ${officialDays} 天`) +
+    `）· ` +
     `本次新增 ${fmt(merged.meta.addedRows)} 条 + 历史保留 ${fmt(merged.meta.keptRows)} 条 ` +
     `= 账单 ${fmt(merged.bill.length)} 条 · 账号 ${merged.accounts.length} 个 · ` +
     `本地回合沿用 ${fmt(data.meta.turns)} 个 */\n`;
@@ -761,7 +794,8 @@ async function main() {
     await syncCreditsOnly({
       outdir,
       jsOut: args['js-out'],
-      officialDays: resolveOfficialDays(args, days),
+      args,
+      days,
       noMerge: !!args['no-merge'],
     });
     return;
@@ -837,7 +871,9 @@ async function main() {
     // 官方账单与积分余额：自动同步。任一步失败都只降级，不影响本地数据产出。
     // `--only=tokens` 时跳过，这样「只扫本地」不会覆盖掉已有的官方数据。
     if (only !== 'tokens' && wbApi && !args['no-official']) {
-      const officialDays = resolveOfficialDays(args, days);
+      // prev 为 null（首次生成）或账单为空时 resolveOfficialDays 会返回全量窗口，
+      // 与「同步积分」按钮的初始化行为保持一致
+      const officialDays = resolveOfficialDays(args, days, prev);
       const official = await fetchOfficial(officialDays);
       if (official) {
         // 增量合并：窗口外的历史账单保留下来，只往里补新拉到的
