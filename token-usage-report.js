@@ -532,6 +532,10 @@ async function fetchOfficial(days) {
   for (const c of credits.filter((x) => !x.ok)) {
     console.warn(`  [官方] ${c.name} 积分查询失败：${c.error}`);
   }
+  // 余额快照：官方只给当前值，趋势得自己攒（同账号同天只留最后一条）
+  try {
+    if (credits.some((c) => c.ok)) wbApi.recordCreditHistory(credits);
+  } catch { /* 快照失败不影响主流程 */ }
 
   // 账号下标表：账单行只存下标，避免把 uid 重复写进每一条记录
   const uids = accounts.map((a) => a.uid);
@@ -583,11 +587,74 @@ async function fetchOfficial(days) {
   };
 }
 
+/**
+ * 官方数据的增量合并（本地回合早就是增量合并，官方这边必须一致）。
+ *
+ * 为什么必须合并：官方接口只能按窗口拉取，窗口外的账单根本不在响应里。
+ * 直接替换（旧的 `data.bill = official.bill`）会让每次同步都把窗口外的历史
+ * 抹掉——只要同步过一次近 7 天，更早的账单就永久消失了。
+ *
+ * 合并规则：
+ *   · bill 按 RequestID 去重，历史行先入表、本次同名行覆盖它（本次为准）
+ *   · uids 是账号下标表，行里只存下标，所以必须重排：本次账号保持原顺序在前，
+ *     历史行用到的旧账号按需追加到后面，否则历史行的账号归属会指错人
+ *   · acct（余额）是当前快照、不是累加量，直接取本次结果
+ *
+ * canMerge=false（--no-merge）时退回纯覆盖，用于明确要丢弃历史重开的场景。
+ */
+function mergeOfficialData(prev, fresh, canMerge) {
+  const freshBill = Array.isArray(fresh.bill) ? fresh.bill : [];
+  const freshUids = Array.isArray(fresh.uids) ? fresh.uids : [];
+  const prevBill = canMerge && prev && Array.isArray(prev.bill) ? prev.bill : [];
+  const prevUids = canMerge && prev && Array.isArray(prev.uids) ? prev.uids : [];
+
+  const uids = [...freshUids];
+  const idxOf = new Map(uids.map((uid, i) => [uid, i]));
+  const mapUid = (uid) => {
+    if (!idxOf.has(uid)) {
+      idxOf.set(uid, uids.length);
+      uids.push(uid);
+    }
+    return idxOf.get(uid);
+  };
+
+  const byId = new Map();
+  for (const r of prevBill) {
+    if (!Array.isArray(r) || !r[0]) continue;
+    // 老下标 → 老 uid → 新下标；老行没有账号归属（-1）时保持未知
+    const uid = r[5] >= 0 ? prevUids[r[5]] : null;
+    byId.set(String(r[0]), [r[0], r[1], r[2], r[3], r[4], uid ? mapUid(uid) : -1]);
+  }
+  let added = 0;
+  for (const r of freshBill) {
+    if (!Array.isArray(r) || !r[0]) continue;
+    const id = String(r[0]);
+    if (!byId.has(id)) added++;
+    byId.set(id, r);
+  }
+
+  const bill = [...byId.values()].sort((a, b) => (a[4] || 0) - (b[4] || 0));
+  const keptRows = bill.length - added;
+
+  return {
+    accounts: fresh.accounts,
+    uids,
+    bill,
+    meta: {
+      ...fresh.meta,
+      billRows: bill.length,        // 合并后的总条数
+      creditTotal: bill.reduce((s, r) => s + (Number(r[1]) || 0), 0),
+      addedRows: added,             // 本次新增
+      keptRows,                     // 历史保留
+    },
+  };
+}
+
 // ---------------------------------------------------------------- 只刷新官方数据
 
-/** 官方数据拉取窗口：优先显式参数，否则跟随本地扫描范围，最后兜底 30 天。 */
+/** 官方数据拉取窗口：优先显式参数，否则跟随本地扫描范围，最后兜底 7 天。 */
 function resolveOfficialDays(args, days) {
-  return args['official-days'] ? parseInt(args['official-days'], 10) : (days > 0 ? days : 30);
+  return args['official-days'] ? parseInt(args['official-days'], 10) : (days > 0 ? days : 7);
 }
 
 /**
@@ -597,7 +664,7 @@ function resolveOfficialDays(args, days) {
  * 换成最新的。这样「同步积分」和「同步 Token」就是两个互不干扰的操作，
  * 各跑各的，谁也不会把对方的结果覆盖掉。
  */
-async function syncCreditsOnly({ outdir, jsOut, officialDays }) {
+async function syncCreditsOnly({ outdir, jsOut, officialDays, noMerge }) {
   if (!wbApi) {
     console.error('缺少 workbuddy-api.js，无法同步官方数据');
     process.exit(1);
@@ -620,19 +687,29 @@ async function syncCreditsOnly({ outdir, jsOut, officialDays }) {
     process.exit(1);
   }
 
-  data.acct = official.accounts;
-  data.uids = official.uids;
-  data.bill = official.bill;
-  data.official = official.meta;
+  // 增量合并：窗口外的历史账单原样保留，本地回合一个字节都不动
+  const merged = mergeOfficialData(data, official, !noMerge);
+  data.acct = merged.accounts;
+  data.uids = merged.uids;
+  data.bill = merged.bill;
+  data.official = merged.meta;
+  // 余额历史同样要刷新（快照已在 fetchOfficial 里记过）
+  try {
+    const h = wbApi.loadCreditHistory();
+    if (h && h.byUid) data.hist = h.byUid;
+  } catch { /* 无历史时省略 */ }
 
   const head = '/* 由 token-usage-report.js 自动生成，请勿手工编辑 */\n' +
     `/* ${fmtTime(new Date())} · 仅刷新官方账单（近 ${officialDays} 天）· ` +
-    `账单 ${fmt(official.bill.length)} 条 · 账号 ${official.accounts.length} 个 · ` +
+    `本次新增 ${fmt(merged.meta.addedRows)} 条 + 历史保留 ${fmt(merged.meta.keptRows)} 条 ` +
+    `= 账单 ${fmt(merged.bill.length)} 条 · 账号 ${merged.accounts.length} 个 · ` +
     `本地回合沿用 ${fmt(data.meta.turns)} 个 */\n`;
   fs.writeFileSync(jsPath, head + 'window.__TOKEN_DATA__=' + JSON.stringify(data) + ';\n', 'utf8');
 
   console.log('');
   console.log('  已刷新官方数据（本地 Token 数据未改动）');
+  console.log(`  账单增量合并：本次新增 ${fmt(merged.meta.addedRows)} 条 + ` +
+    `历史保留 ${fmt(merged.meta.keptRows)} 条 = ${fmt(merged.bill.length)} 条，窗口外的历史未丢弃`);
   console.log('  看板数据 : ' + jsPath);
 }
 
@@ -685,6 +762,7 @@ async function main() {
       outdir,
       jsOut: args['js-out'],
       officialDays: resolveOfficialDays(args, days),
+      noMerge: !!args['no-merge'],
     });
     return;
   }
@@ -730,16 +808,30 @@ async function main() {
     const data = buildTokenDataJs(reqs, light, titles);
     const freshTurns = data.meta.turns;
 
+    // 旧文件只读一次：官方账单合并、本地回合增量、--only=tokens 保留官方字段都要用
+    const prev = loadExistingTokenData(jsPath);
+
     // `--only=tokens` 不管官方数据，但也不能把它抹掉：
     // 本次构建只含本地部分，需把旧文件里的官方字段原样带回。
     if (only === 'tokens') {
-      const prev = loadExistingTokenData(jsPath);
       if (prev) {
         if (prev.acct) data.acct = prev.acct;
         if (prev.uids) data.uids = prev.uids;
         if (prev.bill) data.bill = prev.bill;
         if (prev.official) data.official = prev.official;
+        if (prev.su) data.su = prev.su;
+        if (prev.hist) data.hist = prev.hist;
       }
+    }
+
+    // 账号归属：会话 ID → 账号 uid。
+    // 本地 jsonl 里没有账号字段，这份映射来自 WorkBuddy 的 SQLite 库；
+    // 与官方接口无关，所以放在官方同步块之外，接口挂了也能拿到。
+    if (wbApi) {
+      try {
+        const su = wbApi.readSessionsFromDb();
+        if (su && Object.keys(su).length) data.su = su;
+      } catch { /* 读库失败不影响主流程 */ }
     }
 
     // 官方账单与积分余额：自动同步。任一步失败都只降级，不影响本地数据产出。
@@ -748,10 +840,21 @@ async function main() {
       const officialDays = resolveOfficialDays(args, days);
       const official = await fetchOfficial(officialDays);
       if (official) {
-        data.acct = official.accounts;
-        data.uids = official.uids;
-        data.bill = official.bill;
-        data.official = official.meta;
+        // 增量合并：窗口外的历史账单保留下来，只往里补新拉到的
+        const merged = mergeOfficialData(prev, official, !args['no-merge']);
+        data.acct = merged.accounts;
+        data.uids = merged.uids;
+        data.bill = merged.bill;
+        data.official = merged.meta;
+        if (merged.meta.keptRows) {
+          console.log(`  [官方] 账单增量合并：本次新增 ${fmt(merged.meta.addedRows)} 条 + ` +
+            `历史保留 ${fmt(merged.meta.keptRows)} 条 = ${fmt(merged.bill.length)} 条`);
+        }
+        // 余额历史（趋势图用）：按 uid 存 [[ts, remaining], ...]
+        try {
+          const h = wbApi.loadCreditHistory();
+          if (h && h.byUid) data.hist = h.byUid;
+        } catch { /* 无历史时省略该字段 */ }
       }
     }
 
@@ -760,7 +863,7 @@ async function main() {
     // （正在进行的会话会在后续同步里被补齐）。
     let kept = 0;
     if (!args['no-merge']) {
-      const old = loadExistingTokenData(jsPath);
+      const old = prev;
       if (old) {
         for (const [k, v] of Object.entries(old.t)) {
           if (data.t[k]) continue;

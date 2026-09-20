@@ -2,6 +2,8 @@
 token-usage-data.js
 token-usage-detail.csv
 token-usage-summary.md
+credit-history.json
+checkin-history.json
 
 # 账号凭证与官方账单：含明文 accessToken/refreshToken、真实 requestId，切勿提交
 wb-accounts.json

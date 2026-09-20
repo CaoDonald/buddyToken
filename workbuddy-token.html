@@ -132,11 +132,28 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .acct-bar i{display:block;height:100%;border-radius:3px;
   background:linear-gradient(90deg,var(--accent),var(--accent2))}
 .acct-warn{color:#c2410c;font-weight:600}
+/* 跨账号到期提醒：把各账号的到期时间放在一起比，直接给出先用哪个的结论 */
+.acct-tip{padding:12px 18px;border-color:#f0c9a8;background:linear-gradient(180deg,#fff8f2,#fffdfb)}
+.acct-tip-main{font-size:13px;line-height:1.7}
+.acct-tip-main b{color:#c2410c;font-weight:700;font-variant-numeric:tabular-nums}
+.acct-tip-sub{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.7}
 .acct-pkg{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;
   gap:10px;padding:3px 0;border-top:1px dashed var(--line)}
 .acct-pkg:first-child{border-top:0}
 .acct-pkg span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .acct-pkg b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+.acct-ops{display:flex;gap:8px;margin-top:12px;padding-top:10px;border-top:1px dashed var(--line)}
+.acct-btn{flex:1;padding:6px 10px;font-size:12px;border:1px solid var(--line);border-radius:8px;
+  background:#f7f9fd;color:var(--text);cursor:pointer;font-family:inherit;transition:.15s}
+.acct-btn:hover:not(:disabled){border-color:#b9c5e6;background:#eef3fc}
+.acct-btn:disabled{opacity:.55;cursor:default}
+/* 签到日历 */
+.ck-row{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap}
+.ck-strip{display:flex;gap:2px}
+.ck-cell{width:9px;height:9px;border-radius:2px;background:#eef1f8;border:1px solid #e2e7f2}
+.ck-cell.on{background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent}
+.ck-meta{font-size:11px;color:var(--muted);white-space:nowrap}
+.ck-meta b{color:var(--text);font-weight:600}
 
 /* ---------- 网格 ---------- */
 .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;margin-bottom:16px}
@@ -355,7 +372,7 @@ table.cal td.cal-cell.has:hover{
     <div class="spacer"></div>
     <div class="save-dot" id="saveDot" hidden><i></i><span id="saveTxt">已自动保存</span></div>
     <button class="btn" id="btnScan" title="授权本地会话目录（~/.workbuddy 或 ~/.codebuddy），让页面自己扫描会话记录。只需授权一次，之后导入账单会自动匹配">📁 连接本地会话</button>
-    <button class="btn" id="btnSyncCredits" title="只同步积分：拉取官方账单（近 30 天）与各账号积分余额。需要本地服务——请用「打开看板.bat」打开看板">💰 同步积分</button>
+    <button class="btn" id="btnSyncCredits" title="只同步积分：拉取官方账单（近 7 天）与各账号积分余额。需要本地服务——请用「打开看板.bat」打开看板">💰 同步积分</button>
     <button class="btn" id="btnSyncTokens" title="只同步 Token：重扫本地会话记录（~/.workbuddy、~/.codebuddy）。不开服务也能用；通过本地服务打开时会连带刷新页面数据">🔄 同步 Token</button>
     <button class="btn" id="btnAppend" hidden title="再选一份积分账单 Excel 合并进来。按 RequestID 去重，已存在的记录会自动跳过">➕ 追加数据</button>
     <button class="btn" id="btnSnap" hidden title="立刻把当前数据集存一份快照到浏览器本地，用于以后恢复">💾 手动快照</button>
@@ -400,6 +417,7 @@ table.cal td.cal-cell.has:hover{
       </div>
       <div class="fgroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
+      <div class="fgroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
       <div class="statline" id="statLine"></div>
     </section>
 
@@ -746,11 +764,12 @@ function mergeByRequestId(oldRows, newRows){
  * =======================================================*/
 const state = {
   all: [], fileName: '', sheetName: '',
-  filters: { from:'', to:'', models:new Set(), clients:new Set() },
+  filters: { from:'', to:'', models:new Set(), clients:new Set(), accounts:new Set() },
   charts: {},
   tokenLoaded: false,   // token-usage-data.js 是否成功加载
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
   detail: { mode:'all', q:'', page:0, expanded:null },   // expanded = 展开步骤明细的回合 ID
+  checkins: {},           // uid → 签到状态（服务模式下异步拉取）
   rank: { sort:'perPoint', dir:'desc' },  // 模型性价比卡的表头排序
   sess: { sort:'pts', dir:'desc' },       // Session 消耗卡的表头排序
   day:  { sort:'date', dir:'asc' }        // 每日汇总卡的表头排序（默认时间正序）
@@ -783,8 +802,10 @@ function getFiltered(){
   return state.all.filter(x => {
     if(f.from && x.date < f.from) return false;
     if(f.to   && x.date > f.to)   return false;
-    if(f.models.size  && !f.models.has(x.model))   return false;
-    if(f.clients.size && !f.clients.has(x.client)) return false;
+    if(f.models.size   && !f.models.has(x.model))       return false;
+    if(f.clients.size  && !f.clients.has(x.client))     return false;
+    // 账号：空串代表「未知」（手工导入的 Excel 行没有账号归属）
+    if(f.accounts.size && !f.accounts.has(x.acct || '')) return false;
     return true;
   });
 }
@@ -1099,6 +1120,110 @@ function renderKPIs(d){
  * 本地 jsonl 里没有账号维度，这张卡片是看板上唯一按账号组织的信息。
  * 数据缺失（没跑脚本 / 接口失败）时整块隐藏，不影响其余内容。
  * =======================================================*/
+/**
+ * 签到格子：右端为今天，向左铺。
+ *
+ * 窗口默认 14 天；服务端会把「本地累积到的更早日期」一并发来（接口单次只回最近
+ * 若干天），有更早记录时窗口自动加长，最多 31 天。数据来自服务端只读查询，
+ * 还没拿到时整体不渲染。
+ */
+function renderCheckinStrip(uid){
+  const c = state.checkins[uid];
+  if(!c || !c.ok) return '';
+
+  // 服务端累积后的完整日期；拿不到时退回本次查询结果
+  const done = new Set(c.checkinDatesAll || c.checkinDates || []);
+
+  let span = 14;
+  const earliest = [...done].sort()[0];
+  if(earliest){
+    const d0 = new Date(earliest + 'T00:00:00');
+    if(!isNaN(d0)) span = Math.max(span, Math.round((Date.now() - d0.getTime()) / 86400000) + 1);
+  }
+  span = Math.min(span, 31);
+
+  const today = new Date();
+  const cells = [];
+  for(let i = span - 1; i >= 0; i--){
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
+    const key = fmtDate(d);
+    const on = done.has(key);
+    cells.push(`<span class="ck-cell${on?' on':''}" title="${key}${on?' 已签到':' 未签到'}"></span>`);
+  }
+  return `
+    <div class="ck-row">
+      <div class="ck-strip" title="最近 ${span} 天签到（右端为今天）">${cells.join('')}</div>
+      <div class="ck-meta">连续 <b>${c.streakDays}</b> 天 · 累计 <b>${done.size}</b> 天 · <b>${fmt0(c.totalCredits)}</b> 积分</div>
+    </div>`;
+}
+
+/** 「即将到期」的判定窗口（天），与后端 EXPIRING_SOON_DAYS 保持一致。 */
+const SOON_DAYS = 7;
+
+/** 到期日期的人话表述。 */
+function daysLater(at, now){
+  return `${Math.max(0, Math.ceil((at - now) / 86400000))} 天后`;
+}
+
+/**
+ * 账号内「仍有剩余、且 SOON_DAYS 天内到期」的最早到期时间；没有则返回 null。
+ *
+ * 不能直接用 soonestExpireAt：它把已过期的包也算进「最早到期」，一个既有已过期
+ * 积分、又有新积分的账号会被误判成整体已过期，从而漏掉提醒。这里逐包看，只认未过期的。
+ */
+function soonExpireAt(a, now){
+  let at = null;
+  for(const p of a.packages || []){
+    if(!p.expireAt || !(p.remaining > 0)) continue;
+    if(p.expireAt <= now || p.expireAt - now > SOON_DAYS * 86400000) continue;
+    if(at === null || p.expireAt < at) at = p.expireAt;
+  }
+  return at;
+}
+
+/** 排序键：越紧急越小。SOON_DAYS 内到期的按到期时间排最前，其次是未过期的最早到期时间，其余垫底。 */
+function urgencyKey(a, now){
+  const soon = soonExpireAt(a, now);
+  if(soon !== null) return soon;
+  return (a.soonestExpireAt && a.soonestExpireAt > now) ? a.soonestExpireAt : Infinity;
+}
+
+/**
+ * 跨账号到期提醒：账号多了以后最该关心的就是「先用哪个」。
+ *
+ * 按到期日升序——积分是账号级扣减，账号内先扣最早到期的包，
+ * 因此到期日最早的那个账号就是该优先消耗的。
+ * 已过期的积分不参与建议（已经过期，提醒也拿不回来），只在各自卡片上展示状态。
+ */
+function renderExpiryTip(list, now){
+  const soon = list
+    .map(a => ({ a, at: soonExpireAt(a, now) }))
+    .filter(x => x.at !== null)
+    .sort((x, y) => x.at - y.at);
+  if(!soon.length) return '';
+
+  const creditsOf = x => Number(x.a.expiringSoonRemaining) || 0;
+  const total = soon.reduce((s, x) => s + creditsOf(x), 0);
+  const head = soon[0];
+  const headCredits = creditsOf(head);
+
+  // 明细只在多账号时才有意义，单账号时上行已说清
+  const detail = soon.length > 1
+    ? `共 ${soon.length} 个账号有 ${SOON_DAYS} 天内到期积分，合计 ${fmt0(total)} 积分 · `
+      + soon.slice(1).map(x => `${esc(x.a.name)} ${fmt0(creditsOf(x))}（${daysLater(x.at, now)}到期）`).join(' · ')
+    : '';
+
+  return `
+    <div class="card c12 acct-tip">
+      <div class="acct-tip-main">
+        💡 ${soon.length > 1 ? '建议优先消耗' : '积分即将到期'}：<b>${esc(head.a.name)}</b>
+        —— ${daysLater(head.at, now)}到期（${fmtDate(new Date(head.at))}）${
+          headCredits ? `，涉及 <b>${fmt0(headCredits)}</b> 积分` : ''}
+      </div>
+      ${detail ? `<div class="acct-tip-sub">${detail}</div>` : ''}
+    </div>`;
+}
+
 function renderAccounts(){
   const host = $('acctGrid');
   if(!host) return;
@@ -1108,10 +1233,16 @@ function renderAccounts(){
   host.hidden = false;
 
   const now = Date.now();
-  const cards = list.map(a => {
+  // 紧迫的排前面，让「该先用哪个」一眼可见；已过期或没有到期信息的垫底
+  const ordered = [...list].sort((x, y) => {
+    const kx = urgencyKey(x, now), ky = urgencyKey(y, now);
+    return kx === ky ? 0 : kx - ky;
+  });
+
+  const cards = ordered.map(a => {
     const usedPct = a.total ? (a.used / a.total * 100) : 0;
     const days = a.soonestExpireAt ? Math.ceil((a.soonestExpireAt - now) / 86400000) : null;
-    const warn = a.expiringSoon || (days !== null && days <= 7);
+    const warn = a.expiringSoon || (days !== null && days <= SOON_DAYS);
 
     const pkgs = (a.packages || []).slice(0, 4).map(p => `
       <div class="acct-pkg">
@@ -1129,7 +1260,7 @@ function renderAccounts(){
     }else if(warn){
       expiry = `<span class="acct-warn">⚠ 最近到期 ${fmtDate(new Date(a.soonestExpireAt))}` +
         `（${days} 天后）` +
-        (a.expiringSoon ? ` · 7 天内到期部分 ${fmt0(a.expiringSoonRemaining)} 积分</span>` : '</span>');
+        (a.expiringSoon ? ` · ${SOON_DAYS} 天内到期部分 ${fmt0(a.expiringSoonRemaining)} 积分</span>` : '</span>');
     }else{
       expiry = `最近到期 ${fmtDate(new Date(a.soonestExpireAt))}（${days} 天后）`;
     }
@@ -1148,22 +1279,91 @@ function renderAccounts(){
         <div class="kpi-sub">${expiry}${
           a.expired ? ` · <span class="acct-warn">已过期 ${fmt0(a.expiredRemaining)}</span>` : ''}</div>
         <div style="margin-top:10px">${pkgs}${more}</div>
+        ${renderCheckinStrip(a.uid)}
+        <div class="acct-ops">
+          <button class="acct-btn" data-act="checkin" data-uid="${esc(a.uid)}"
+                  title="每日签到领积分。已签到会自动识别，不会重复提交">✅ 签到</button>
+          <button class="acct-btn" data-act="travel" data-uid="${esc(a.uid)}"
+                  title="按状态自动判断：空闲就派出去，已到达就领奖励，旅行中会提示还要等多久">🐱 派猫猫</button>
+        </div>
       </div>`;
   }).join('');
 
   const m = OfficialBill.meta();
+  // 账单是增量累积的：条数/积分是历史总量，窗口天数只描述最近一次拉取。
+  // 老数据没有 addedRows（那时还是整体覆盖），字段缺席就不显示。
+  const added = Number(m && m.addedRows) || 0;
   const foot = m ? `
     <div class="card c12" style="padding:10px 18px">
       <div class="kpi-sub">
         余额由官方接口自动同步 · 数据时间 ${
-          new Date(m.generatedAt).toLocaleString('zh-CN')} · 账单窗口 ${m.windowDays} 天
-        · 账单 ${fmt0(m.billRows)} 条 / ${fmt2(m.creditTotal)} 积分${
+          new Date(m.generatedAt).toLocaleString('zh-CN')} · 累计账单 ${fmt0(m.billRows)} 条 / ${
+          fmt2(m.creditTotal)} 积分${added ? `（本次新增 ${fmt0(added)} 条）` : ''}
+        · 最近一次窗口 ${m.windowDays} 天${
           (m.errors && m.errors.length)
             ? ` · <span class="acct-warn">${m.errors.length} 个账号拉取失败</span>` : ''}
       </div>
     </div>` : '';
 
-  host.innerHTML = cards + foot;
+  host.innerHTML = renderExpiryTip(ordered, now) + cards + foot;
+}
+
+/**
+ * 拉各账号签到状态（只读），拿到后重渲染账号卡片。
+ * 页面加载时异步调用，不阻塞首屏。
+ */
+async function loadCheckinStatus(){
+  if(!await ServerSync.available()) return;
+  const list = await ServerSync.checkinStatus();
+  if(!list || !list.length) return;
+  state.checkins = {};
+  for(const c of list){
+    if(c && c.uid) state.checkins[c.uid] = c;
+  }
+  renderAccounts();
+}
+
+/**
+ * 账号卡片上的操作按钮（签到 / 派猫猫）。
+ *
+ * 这两个动作会真的调用官方接口改变服务端状态，所以：
+ *   · 必须通过本地服务（浏览器直开 HTML 时没有凭证）；
+ *   · 按钮处理期间禁用，避免连点。
+ */
+async function onAcctAction(btn){
+  if(!await ServerSync.available()){
+    toast('需要本地服务：请用「打开看板.bat」打开看板');
+    return;
+  }
+
+  const act = btn.dataset.act;
+  const uid = btn.dataset.uid;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ 处理中…';
+
+  const r = act === 'checkin'
+    ? await ServerSync.checkin(uid)
+    : await ServerSync.travel(uid);
+
+  btn.disabled = false;
+  btn.textContent = label;
+
+  const one = ((r && r.results) || [])[0] || {};
+  if(!r || !r.ok){
+    toast((act === 'checkin' ? '签到失败：' : '操作失败：') +
+      (one.error || (r && r.error) || '未知错误'));
+    return;
+  }
+
+  if(act === 'checkin'){
+    toast(one.already
+      ? `${one.name || '账号'}：今日已签到 · 连续 ${one.streakDays} 天 · 累计 ${fmt0(one.totalCredits)} 积分`
+      : `${one.name || '账号'}：签到成功 · 连续 ${one.streakDays} 天 · 今日 +${fmt0(one.todayCredit)} 积分`);
+    loadCheckinStatus();   // 刷新签到日历
+  }else{
+    toast(`${one.name || '账号'}：${one.message || '已处理'}`);
+  }
 }
 
 /* =========================================================
@@ -2579,27 +2779,55 @@ const OfficialBill = (() => {
 })();
 
 /* =========================================================
- * 10.66 本地服务同步通道
+ * 10.66 本地服务同步通道（file:// 下同样可用）
  *
- * 浏览器不能直接调官方接口——跨域预检会被网关 401 拒掉，而且 JS 改不了
- * Origin/Referer（伪装不了官方 Web 端）。所以「拉最新账单」必须由本地
- * 服务（server.js）代劳，页面通过同源的 /api/sync 触发。
+ * 看板统一用 file:// 打开——浏览器存储按地址（origin）隔离，只要有人用
+ * http://127.0.0.1:8099、有人双击 HTML，「本地快照」就会分裂成互相看不见的两份。
  *
- * 页面若是双击 HTML 打开的（file://），服务不可用，这里会静默降级，
- * 同步按钮退回「重新加载已有数据文件」的离线行为。
+ * 代价是 file:// 下没有同源接口，请求本地服务属于跨域（Origin 是字面量 "null"），
+ * 所以两边配合：
+ *   · server.js 放行 CORS；
+ *   · 这里按端口顺序探测服务的真实地址——服务在端口被占用时会往后挪一个，
+ *     地址不能写死 8099。
+ * 若页面本来就是 http 打开的（旧习惯），走同源分支，行为与以前完全一致。
  * =======================================================*/
 const ServerSync = (() => {
-  let _checked = null;
+  /** 探测范围，与 server.js 的 DEFAULT_PORT / PORT_SCAN_LIMIT 对应。 */
+  const PORT_FROM = 8099, PORT_TO = 8108;
+
+  let _base;            // 服务地址；undefined=还没探测，null=不可用
   let _status = null;
+
+  /**
+   * 找到本地服务地址。
+   * 探测成功时顺手把 /api/status 的结果存下来，省掉一次往返。
+   */
+  async function base(){
+    if(_base !== undefined) return _base;
+
+    if(location.protocol === 'http:' || location.protocol === 'https:'){
+      _base = location.origin;          // 同源，直接用
+      return _base;
+    }
+
+    for(let p = PORT_FROM; p <= PORT_TO; p++){
+      const b = `http://127.0.0.1:${p}`;
+      try{
+        const r = await fetch(b + '/api/status', { cache: 'no-store' });
+        if(r.ok){ _base = b; _status = await r.json(); return _base; }
+      }catch{ /* 该端口没服务：连接被拒，试下一个 */ }
+    }
+    _base = null;
+    return null;
+  }
 
   /** 取服务状态（含服务端会扫描的本地会话目录）。结果缓存。 */
   async function status(){
     if(_status) return _status;
-    if(location.protocol !== 'http:' && location.protocol !== 'https:'){
-      return null;                 // file:// 下不存在同源接口
-    }
+    const b = await base();
+    if(!b) return null;
     try{
-      const r = await fetch('/api/status', { cache: 'no-store' });
+      const r = await fetch(b + '/api/status', { cache: 'no-store' });
       if(!r.ok) return null;
       _status = await r.json();
     }catch{
@@ -2608,11 +2836,9 @@ const ServerSync = (() => {
     return _status;
   }
 
-  /** 本地服务是否在线（结果缓存，避免每次点击都探测）。 */
+  /** 本地服务是否在线（base() 自带缓存，不会反复探测）。 */
   async function available(){
-    if(_checked !== null) return _checked;
-    _checked = !!(await status());
-    return _checked;
+    return !!(await base());
   }
 
   /** 服务端会自动扫描的本地会话目录。 */
@@ -2626,7 +2852,9 @@ const ServerSync = (() => {
    * part：'credits' 只刷积分 / 'tokens' 只扫本地 / 省略＝全量。
    */
   async function run(part){
-    const url = (part === 'credits' || part === 'tokens') ? `/api/sync/${part}` : '/api/sync';
+    const b = await base();
+    if(!b) return { ok:false, error:'本地服务未启动：请先用「打开看板.bat」启动' };
+    const url = (part === 'credits' || part === 'tokens') ? `${b}/api/sync/${part}` : `${b}/api/sync`;
     try{
       const r = await fetch(url, { method: 'POST' });
       const j = await r.json();
@@ -2636,7 +2864,40 @@ const ServerSync = (() => {
     }
   }
 
-  return { available, status, scanDirs, run };
+  /** 通用 POST（签到 / 旅行这类不落盘的操作）。 */
+  async function postJson(path, payload){
+    const b = await base();
+    if(!b) return { ok:false, error:'本地服务未启动' };
+    try{
+      const r = await fetch(b + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {}),
+      });
+      const j = await r.json();
+      return j || { ok:false, error:'服务返回空响应' };
+    }catch(e){
+      return { ok:false, error: String((e && e.message) || e) };
+    }
+  }
+
+  const checkin = (uid) => postJson('/api/checkin', uid ? { uid } : {});
+  const travel  = (uid) => postJson('/api/travel',  uid ? { uid } : {});
+
+  /** 各账号签到状态（只读，页面加载时拉一次）。 */
+  async function checkinStatus(){
+    const b = await base();
+    if(!b) return [];
+    try{
+      const r = await fetch(b + '/api/checkin-status', { cache: 'no-store' });
+      const j = await r.json();
+      return (j && j.results) || [];
+    }catch{
+      return [];
+    }
+  }
+
+  return { available, status, scanDirs, run, checkin, travel, checkinStatus };
 })();
 
 /* =========================================================
@@ -2993,17 +3254,32 @@ async function runServerSync(part, btn){
 /* =========================================================
  * 11. chips
  * =======================================================*/
+/** uid → 展示名。名称来自官方账号列表；没有归属的行显示为「未知」。 */
+function acctLabel(uid){
+  if(!uid) return '未知';
+  const hit = OfficialBill.accounts().find(a => a.uid === uid);
+  return hit ? hit.name : String(uid).slice(0, 8) + '…';
+}
+
 function renderChips(){
   const models  = [...new Set(state.all.map(x => x.model))].sort();
   const clients = [...new Set(state.all.map(x => x.client))].sort();
+  const accts   = [...new Set(state.all.map(x => x.acct || ''))].sort();
+
+  const empty = '<span style="color:#a8b3c8;font-size:12px">—</span>';
 
   $('modelChips').innerHTML = models.map(m =>
     `<button class="chip${state.filters.models.has(m)?' on':''}" data-type="model" data-val="${esc(m)}">${esc(m)}</button>`
-  ).join('') || '<span style="color:#a8b3c8;font-size:12px">—</span>';
+  ).join('') || empty;
 
   $('clientChips').innerHTML = clients.map(c =>
     `<button class="chip${state.filters.clients.has(c)?' on':''}" data-type="client" data-val="${esc(c)}">${esc(c)}</button>`
-  ).join('') || '<span style="color:#a8b3c8;font-size:12px">—</span>';
+  ).join('') || empty;
+
+  // 账号 chip 的值是 uid（空串＝未知），显示名另取，避免同名账号混淆
+  $('acctChips').innerHTML = accts.map(u =>
+    `<button class="chip${state.filters.accounts.has(u)?' on':''}" data-type="acct" data-val="${esc(u)}">${esc(acctLabel(u))}</button>`
+  ).join('') || empty;
 }
 
 function bindChips(){
@@ -3011,12 +3287,16 @@ function bindChips(){
     const b = e.target.closest('.chip');
     if(!b) return;
     const {type, val} = b.dataset;
-    const set = type === 'model' ? state.filters.models : state.filters.clients;
+    const set = type === 'model' ? state.filters.models
+              : type === 'acct'  ? state.filters.accounts
+              : state.filters.clients;
+    // val 可能是空串（未知账号），所以用 dataset 是否存在来判定，而非真值判断
     set.has(val) ? set.delete(val) : set.add(val);
     render();
   };
   $('modelChips').addEventListener('click', handler);
   $('clientChips').addEventListener('click', handler);
+  $('acctChips').addEventListener('click', handler);
 }
 
 /* =========================================================
@@ -3210,8 +3490,10 @@ function applyDataset(rows, sheet, fileName){
   // 只清理已不存在的筛选项，保留用户当前选择
   const validModels  = new Set(rows.map(x => x.model));
   const validClients = new Set(rows.map(x => x.client));
-  state.filters.models  = new Set([...state.filters.models ].filter(m => validModels.has(m)));
-  state.filters.clients = new Set([...state.filters.clients].filter(c => validClients.has(c)));
+  const validAccts   = new Set(rows.map(x => x.acct || ''));
+  state.filters.models   = new Set([...state.filters.models  ].filter(m => validModels.has(m)));
+  state.filters.clients  = new Set([...state.filters.clients ].filter(c => validClients.has(c)));
+  state.filters.accounts = new Set([...state.filters.accounts].filter(a => validAccts.has(a)));
 
   const dates = [...new Set(rows.map(x => x.date))].sort();
   const minD = dates[0], maxD = dates[dates.length - 1];
@@ -3654,6 +3936,12 @@ async function loadFile(file){
     else                   await syncTokens({ toast: true });
   });
 
+  /* 账号卡片上的签到 / 派猫猫（卡片是动态渲染的，用事件委托） */
+  $('acctGrid').addEventListener('click', (e) => {
+    const btn = e.target.closest('.acct-btn');
+    if(btn) onAcctAction(btn);
+  });
+
   /* ---- 本地会话直读 ----
      服务模式（页面由 server.js 提供）：服务端本来就能读文件系统，直接用默认目录，
        不需要浏览器弹授权框——点击只做说明。
@@ -3695,6 +3983,8 @@ async function loadFile(file){
     await tryRestore();
     // 官方账单（脚本自动同步）合并进来，与手工导入的 Excel 并存
     await mergeOfficialBill();
+    // 签到状态是只读查询，异步拉取，不阻塞首屏
+    loadCheckinStatus();
   })();
 })();
 </script>

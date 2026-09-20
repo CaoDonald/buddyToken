@@ -6,8 +6,8 @@
  *   2. JS 无法设置 Origin / Referer（浏览器禁止），也就伪装不了官方 Web 端。
  * 所以「拉数据」这件事必须在 Node 侧完成。
  *
- * 看板页面由本服务提供，页面里的 /api/sync 是同源请求，天然没有跨域问题，
- * 也就不需要用户授权任何目录。
+ * 看板页面统一用 file:// 打开（见 BOARD_FILE 处的说明），页面请求本服务属于
+ * 跨域，因此这里要放行 CORS；服务只监听回环地址、不持有任何凭证，全放行是安全的。
  *
  * 服务本身很薄：收到同步请求就去跑 token-usage-report.js（与双击 bat 完全相同
  * 的那条命令），跑完返回结果摘要，页面再重新加载生成好的数据文件。
@@ -26,8 +26,18 @@ const { exec, execFile } = require('child_process');
 const ROOT = __dirname;
 const DEFAULT_PORT = 8099;
 const PORT_SCAN_LIMIT = 10;
-/** 单次同步的最长等待时间（30 天账单全量拉取实测约 3 秒，给足余量）。 */
+/** 单次同步的最长等待时间（默认只拉近 7 天账单，给足余量）。 */
 const SYNC_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * 看板文件路径：统一用它打开，而不是 http://127.0.0.1:端口/workbuddy-token.html。
+ *
+ * 浏览器的存储（IndexedDB / localStorage）按地址隔离，http 与 file 是两个
+ * 互不相干的仓库。混着用的话「本地快照」会分裂成两份，换个入口就"看不到"了。
+ * 所以固定用 file://，服务只当后台接口。页面侧会自动探测服务端口（见页面里的
+ * ServerSync），端口被占用时也不用担心。
+ */
+const BOARD_FILE = path.join(ROOT, 'workbuddy-token.html');
 
 /**
  * 本地会话目录：服务端有文件系统权限，直接读这两个路径即可，
@@ -53,6 +63,26 @@ const MIME = {
 
 /** 同一时间只允许一次同步：重复点击直接拒绝，避免两个脚本抢写数据文件。 */
 let syncing = false;
+
+/** 官方接口封装。签到/旅行这两类操作直接在服务进程内调用，不走子进程。 */
+let wbApi = null;
+try {
+  wbApi = require('./workbuddy-api');
+} catch { /* 缺失时相关接口返回 503 */ }
+
+// ---------------------------------------------------------------- CORS
+
+/**
+ * 放行跨域：看板用 file:// 打开，请求本服务就是跨域请求，Origin 是字面量 "null"。
+ * 服务只监听回环地址、不持有任何凭证，所以直接全放行。
+ * 不处理预检的话，带 Content-Type 的 POST（签到 / 派猫猫）会被浏览器拦下。
+ */
+function applyCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Max-Age', '86400');
+}
 
 // ---------------------------------------------------------------- 静态文件
 
@@ -177,6 +207,97 @@ async function handleSync(req, res) {
   }
 }
 
+/** 读取 POST 的 JSON body（体积很小，够用即可）。 */
+function readBody(req) {
+  return new Promise((resolve) => {
+    let raw = '';
+    req.on('data', (c) => {
+      raw += c;
+      if (raw.length > 64 * 1024) req.destroy();   // 防滥用
+    });
+    req.on('end', () => {
+      if (!raw.trim()) return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        resolve({});
+      }
+    });
+    req.on('error', () => resolve({}));
+  });
+}
+
+/** 按 uid 挑账号：给了 uid 就只处理那一个，否则处理全部。 */
+function pickAccounts(uid) {
+  if (!wbApi) return [];
+  const all = wbApi.discoverAccounts();
+  if (!uid) return all;
+  const one = all.filter((a) => a.uid === uid);
+  return one.length ? one : all;
+}
+
+/** 签到：对指定账号（或全部）执行一次，已签到不会重复提交。 */
+async function handleCheckin(req, res) {
+  if (!wbApi) {
+    json(res, 503, { ok: false, error: '缺少 workbuddy-api.js' });
+    return;
+  }
+  const body = await readBody(req);
+  const accounts = pickAccounts(body.uid);
+  if (!accounts.length) {
+    json(res, 200, { ok: false, error: '本机未找到登录态' });
+    return;
+  }
+
+  const results = [];
+  for (const acct of accounts) {
+    results.push(await wbApi.doCheckin(acct));
+  }
+  json(res, 200, { ok: results.some((r) => r.ok), results });
+}
+
+/** 签到状态（只读，不改变任何服务端状态）。供看板渲染签到日历。 */
+async function handleCheckinStatus(req, res) {
+  if (!wbApi) {
+    json(res, 503, { ok: false, error: '缺少 workbuddy-api.js' });
+    return;
+  }
+  const accounts = pickAccounts();
+  if (!accounts.length) {
+    json(res, 200, { ok: false, error: '本机未找到登录态', results: [] });
+    return;
+  }
+
+  const results = [];
+  for (const acct of accounts) {
+    const r = await wbApi.fetchCheckin(acct);
+    // 接口每次只回最近若干天，这里并入本地累积，日历才能显示更长的记录
+    if (r.ok) r.checkinDatesAll = wbApi.recordCheckinDates(acct.uid, r.checkinDates);
+    results.push(r);
+  }
+  json(res, 200, { ok: results.some((r) => r.ok), results });
+}
+
+/** 猫猫旅行：按状态机决定派发或领奖。 */
+async function handleTravel(req, res) {
+  if (!wbApi) {
+    json(res, 503, { ok: false, error: '缺少 workbuddy-api.js' });
+    return;
+  }
+  const body = await readBody(req);
+  const accounts = pickAccounts(body.uid);
+  if (!accounts.length) {
+    json(res, 200, { ok: false, error: '本机未找到登录态' });
+    return;
+  }
+
+  const results = [];
+  for (const acct of accounts) {
+    results.push(await wbApi.runTravel(acct));
+  }
+  json(res, 200, { ok: results.some((r) => r.ok), results });
+}
+
 function handleStatus(req, res) {
   json(res, 200, {
     ok: true,
@@ -194,17 +315,27 @@ function handleStatus(req, res) {
 // ---------------------------------------------------------------- 启动
 
 const server = http.createServer((req, res) => {
+  applyCors(res);
+  if (req.method === 'OPTIONS') {          // 跨域预检：放行
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   const pathname = req.url.split('?')[0];
   if (pathname.startsWith('/api/sync') && req.method === 'POST') return handleSync(req, res);
+  if (pathname === '/api/checkin' && req.method === 'POST') return handleCheckin(req, res);
+  if (pathname === '/api/checkin-status') return handleCheckinStatus(req, res);
+  if (pathname === '/api/travel' && req.method === 'POST') return handleTravel(req, res);
   if (pathname === '/api/status') return handleStatus(req, res);
   serveStatic(req, res);
 });
 
-/** 用系统默认浏览器打开看板。端口可能是探测出来的，所以由服务自己打开。 */
-function openBrowser(url) {
-  const cmd = process.platform === 'win32' ? `start "" "${url}"`
-    : process.platform === 'darwin' ? `open "${url}"`
-      : `xdg-open "${url}"`;
+/** 用系统默认浏览器打开看板。传文件路径（file://），原因见 BOARD_FILE 处的说明。 */
+function openBrowser(target) {
+  const cmd = process.platform === 'win32' ? `start "" "${target}"`
+    : process.platform === 'darwin' ? `open "${target}"`
+      : `xdg-open "${target}"`;
   exec(cmd, () => { /* 打不开也不影响服务本身 */ });
 }
 
@@ -216,15 +347,16 @@ function listen(port, remaining) {
   server.removeAllListeners('error');
 
   server.once('listening', () => {
-    const url = `http://127.0.0.1:${port}/workbuddy-token.html`;
     console.log('');
     console.log('  buddyToken 本地服务已启动');
-    console.log('  地址：' + url);
+    console.log('  接口：http://127.0.0.1:' + port + '/api/…');
     console.log('');
     console.log('  看板里的「💰 同步积分」「🔄 同步 Token」会真正去拉数据。');
-    console.log('  关闭本窗口即停止服务（看板仍可双击 HTML 直接打开，只是积分按钮会退回离线模式）。');
+    console.log('  看板固定用 file:// 打开（与双击 HTML 是同一个地址），快照只存一份，');
+    console.log('  请勿再用 http://127.0.0.1:' + port + ' 打开它，否则快照会分成两份。');
+    console.log('  关闭本窗口即停止服务（看板照常能看，只是同步按钮会提示服务未启动）。');
     console.log('');
-    if (!process.argv.includes('--no-open')) openBrowser(url);
+    if (!process.argv.includes('--no-open')) openBrowser(BOARD_FILE);
   });
 
   server.once('error', (err) => {
