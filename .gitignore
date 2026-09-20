@@ -3,6 +3,10 @@ token-usage-data.js
 token-usage-detail.csv
 token-usage-summary.md
 
+# 账号凭证与官方账单：含明文 accessToken/refreshToken、真实 requestId，切勿提交
+wb-accounts.json
+billing-data.js
+
 # 自己导出的账单文件
 *.xlsx
 *.xls

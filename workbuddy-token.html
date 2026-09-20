@@ -124,6 +124,20 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .kpi-sub{font-size:12px;color:#93a0b8}
 .kpi-sub b{color:var(--text);font-weight:600}
 
+/* ---------- 账号积分 ---------- */
+.acct-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.acct-remain{font-size:26px;font-weight:800;letter-spacing:-.5px;font-variant-numeric:tabular-nums}
+.acct-total{font-size:12px;color:var(--muted)}
+.acct-bar{height:6px;border-radius:3px;background:#eef1f8;overflow:hidden;margin:10px 0 8px}
+.acct-bar i{display:block;height:100%;border-radius:3px;
+  background:linear-gradient(90deg,var(--accent),var(--accent2))}
+.acct-warn{color:#c2410c;font-weight:600}
+.acct-pkg{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;
+  gap:10px;padding:3px 0;border-top:1px dashed var(--line)}
+.acct-pkg:first-child{border-top:0}
+.acct-pkg span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acct-pkg b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+
 /* ---------- 网格 ---------- */
 .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;margin-bottom:16px}
 .card{
@@ -341,7 +355,8 @@ table.cal td.cal-cell.has:hover{
     <div class="spacer"></div>
     <div class="save-dot" id="saveDot" hidden><i></i><span id="saveTxt">已自动保存</span></div>
     <button class="btn" id="btnScan" title="授权本地会话目录（~/.workbuddy 或 ~/.codebuddy），让页面自己扫描会话记录。只需授权一次，之后导入账单会自动匹配">📁 连接本地会话</button>
-    <button class="btn" id="btnSync" title="重新同步一次数据。已连接本地目录时＝重扫会话记录；未连接时＝重读 token-usage-data.js（bat 生成的那个文件）">🔄 同步 Token</button>
+    <button class="btn" id="btnSyncCredits" title="只同步积分：拉取官方账单（近 30 天）与各账号积分余额。需要本地服务——请用「打开看板.bat」打开看板">💰 同步积分</button>
+    <button class="btn" id="btnSyncTokens" title="只同步 Token：重扫本地会话记录（~/.workbuddy、~/.codebuddy）。不开服务也能用；通过本地服务打开时会连带刷新页面数据">🔄 同步 Token</button>
     <button class="btn" id="btnAppend" hidden title="再选一份积分账单 Excel 合并进来。按 RequestID 去重，已存在的记录会自动跳过">➕ 追加数据</button>
     <button class="btn" id="btnSnap" hidden title="立刻把当前数据集存一份快照到浏览器本地，用于以后恢复">💾 手动快照</button>
     <button class="btn" id="btnHist" hidden title="查看历史快照列表，可恢复到任意一次保存过的状态">📂 历史</button>
@@ -387,6 +402,9 @@ table.cal td.cal-cell.has:hover{
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
       <div class="statline" id="statLine"></div>
     </section>
+
+    <!-- 账号积分余额：由官方接口自动同步，与本地 Token 数据无关 -->
+    <section class="grid" id="acctGrid" hidden></section>
 
     <section class="kpis" id="kpis"></section>
 
@@ -1073,6 +1091,79 @@ function renderKPIs(d){
       <div class="kpi-value${i.small?' small':''}">${i.value}</div>
       <div class="kpi-sub">${i.sub}</div>
     </div>`).join('');
+}
+
+/* =========================================================
+ *  4.6 账号积分余额（官方接口自动同步）
+ *
+ * 本地 jsonl 里没有账号维度，这张卡片是看板上唯一按账号组织的信息。
+ * 数据缺失（没跑脚本 / 接口失败）时整块隐藏，不影响其余内容。
+ * =======================================================*/
+function renderAccounts(){
+  const host = $('acctGrid');
+  if(!host) return;
+
+  const list = OfficialBill.accounts();
+  if(!list.length){ host.hidden = true; return; }
+  host.hidden = false;
+
+  const now = Date.now();
+  const cards = list.map(a => {
+    const usedPct = a.total ? (a.used / a.total * 100) : 0;
+    const days = a.soonestExpireAt ? Math.ceil((a.soonestExpireAt - now) / 86400000) : null;
+    const warn = a.expiringSoon || (days !== null && days <= 7);
+
+    const pkgs = (a.packages || []).slice(0, 4).map(p => `
+      <div class="acct-pkg">
+        <span title="${esc(p.name)}（${p.count} 个包）">${esc(p.name)}</span>
+        <span><b>${fmt0(p.remaining)}</b> / ${fmt0(p.total)}${
+          p.expireAt ? ` · ${fmtDate(new Date(p.expireAt))}` : ''}</span>
+      </div>`).join('');
+    const more = (a.packages || []).length > 4
+      ? `<div class="acct-pkg" style="justify-content:flex-end;opacity:.7">还有 ${
+          a.packages.length - 4} 类套餐未展开</div>` : '';
+
+    let expiry;
+    if(days === null){
+      expiry = '无到期信息';
+    }else if(warn){
+      expiry = `<span class="acct-warn">⚠ 最近到期 ${fmtDate(new Date(a.soonestExpireAt))}` +
+        `（${days} 天后）` +
+        (a.expiringSoon ? ` · 7 天内到期部分 ${fmt0(a.expiringSoonRemaining)} 积分</span>` : '</span>');
+    }else{
+      expiry = `最近到期 ${fmtDate(new Date(a.soonestExpireAt))}（${days} 天后）`;
+    }
+
+    return `
+      <div class="card c6">
+        <h3>
+          <span class="dot"></span>${esc(a.name)}
+          <span class="tag">${esc(String(a.uid).slice(0, 8))}…</span>
+        </h3>
+        <div class="acct-head">
+          <span class="acct-remain">${fmt0(a.remaining)}</span>
+          <span class="acct-total">剩余积分 · 总量 ${fmt0(a.total)} · 已用 ${fmt0(a.used)}</span>
+        </div>
+        <div class="acct-bar"><i style="width:${Math.min(100, usedPct).toFixed(1)}%"></i></div>
+        <div class="kpi-sub">${expiry}${
+          a.expired ? ` · <span class="acct-warn">已过期 ${fmt0(a.expiredRemaining)}</span>` : ''}</div>
+        <div style="margin-top:10px">${pkgs}${more}</div>
+      </div>`;
+  }).join('');
+
+  const m = OfficialBill.meta();
+  const foot = m ? `
+    <div class="card c12" style="padding:10px 18px">
+      <div class="kpi-sub">
+        余额由官方接口自动同步 · 数据时间 ${
+          new Date(m.generatedAt).toLocaleString('zh-CN')} · 账单窗口 ${m.windowDays} 天
+        · 账单 ${fmt0(m.billRows)} 条 / ${fmt2(m.creditTotal)} 积分${
+          (m.errors && m.errors.length)
+            ? ` · <span class="acct-warn">${m.errors.length} 个账号拉取失败</span>` : ''}
+      </div>
+    </div>` : '';
+
+  host.innerHTML = cards + foot;
 }
 
 /* =========================================================
@@ -2433,6 +2524,122 @@ const TokenData = (() => {
 })();
 
 /* =========================================================
+ * 10.65 官方账单与积分余额（脚本自动同步，无需手工导 Excel）
+ *
+ * token-usage-report.js 会调用官方接口，把结果内嵌进 token-usage-data.js：
+ *   .bill = [[请求ID, 积分, 模型, 客户端, 时间戳ms, 账号下标], ...]
+ *   .uids = [账号 uid, ...]        .acct = [账号积分余额, ...]
+ *
+ * bill 与 Excel 解析出的行结构同构，所以匹配、统计、导出等全部逻辑
+ * 无需改动——手工导入 Excel 的通道也照旧保留，两条路可以并存。
+ *
+ * 隐私：官方接口的响应含提问正文（input），脚本侧已按白名单丢弃，
+ * 内嵌数据里只有上表这几个字段，不含任何正文或路径。
+ * =======================================================*/
+const OfficialBill = (() => {
+  /** 内嵌账单 → 与 Excel 解析一致的行结构；无数据时返回空数组。 */
+  function rows(){
+    const d = TokenData.get();
+    if(!d || !Array.isArray(d.bill)) return [];
+    const uids = Array.isArray(d.uids) ? d.uids : [];
+    const out = [];
+    for(const r of d.bill){
+      if(!Array.isArray(r) || !r[0]) continue;
+      const time = new Date(r[4]);
+      if(isNaN(time.getTime())) continue;
+      out.push({
+        id: String(r[0]),
+        points: Number(r[1]) || 0,
+        model: r[2] || '未知模型',
+        client: r[3] || '未知客户端',
+        time,
+        date: fmtDate(time),
+        hour: time.getHours(),
+        min: time.getMinutes(),
+        // 账号归属只可能来自账单侧：本地 jsonl 里没有账号标识
+        acct: uids[r[5]] || ''
+      });
+    }
+    return out;
+  }
+
+  /** 各账号的积分余额（已按套餐名聚合）。 */
+  function accounts(){
+    const d = TokenData.get();
+    return (d && Array.isArray(d.acct)) ? d.acct : [];
+  }
+
+  /** 本次同步的元信息（时间窗、条数、错误）。 */
+  function meta(){
+    const d = TokenData.get();
+    return (d && d.official) ? d.official : null;
+  }
+
+  return { rows, accounts, meta };
+})();
+
+/* =========================================================
+ * 10.66 本地服务同步通道
+ *
+ * 浏览器不能直接调官方接口——跨域预检会被网关 401 拒掉，而且 JS 改不了
+ * Origin/Referer（伪装不了官方 Web 端）。所以「拉最新账单」必须由本地
+ * 服务（server.js）代劳，页面通过同源的 /api/sync 触发。
+ *
+ * 页面若是双击 HTML 打开的（file://），服务不可用，这里会静默降级，
+ * 同步按钮退回「重新加载已有数据文件」的离线行为。
+ * =======================================================*/
+const ServerSync = (() => {
+  let _checked = null;
+  let _status = null;
+
+  /** 取服务状态（含服务端会扫描的本地会话目录）。结果缓存。 */
+  async function status(){
+    if(_status) return _status;
+    if(location.protocol !== 'http:' && location.protocol !== 'https:'){
+      return null;                 // file:// 下不存在同源接口
+    }
+    try{
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if(!r.ok) return null;
+      _status = await r.json();
+    }catch{
+      return null;
+    }
+    return _status;
+  }
+
+  /** 本地服务是否在线（结果缓存，避免每次点击都探测）。 */
+  async function available(){
+    if(_checked !== null) return _checked;
+    _checked = !!(await status());
+    return _checked;
+  }
+
+  /** 服务端会自动扫描的本地会话目录。 */
+  async function scanDirs(){
+    const st = await status();
+    return (st && Array.isArray(st.scanDirs)) ? st.scanDirs : [];
+  }
+
+  /**
+   * 触发一次同步，返回服务端的执行结果。
+   * part：'credits' 只刷积分 / 'tokens' 只扫本地 / 省略＝全量。
+   */
+  async function run(part){
+    const url = (part === 'credits' || part === 'tokens') ? `/api/sync/${part}` : '/api/sync';
+    try{
+      const r = await fetch(url, { method: 'POST' });
+      const j = await r.json();
+      return j || { ok:false, error:'服务返回空响应' };
+    }catch(e){
+      return { ok:false, error: String((e && e.message) || e) };
+    }
+  }
+
+  return { available, status, scanDirs, run };
+})();
+
+/* =========================================================
  * 10.7 本地会话直读（File System Access API）
  *
  * 浏览器在 file:// 下无法执行 node 脚本，但可以直接读文件。
@@ -2724,7 +2931,9 @@ async function syncTokens(opts){
   opts = opts || {};
   state.tokenLoaded = await TokenData.load();
 
-  if(state.all.length){
+  // 官方账单随数据文件一起更新：合并逻辑自带 render，成功时无需重复渲染
+  const merged = await mergeOfficialBill();
+  if(!merged && state.all.length){
     attachTokens(state.all);
     render();
   }
@@ -2742,6 +2951,43 @@ async function syncTokens(opts){
       : `Token 数据已加载，但当前数据没有命中${when}`);
   }
   return state.tokenLoaded;
+}
+
+/**
+ * 通过本地服务同步一部分数据（credits＝积分 / tokens＝本地 Token）。
+ *
+ * 服务端做完之后只需重新加载数据文件——两边不会互相覆盖，
+ * 因为脚本对「只刷积分」「只扫本地」各自保留了对方的字段。
+ */
+async function runServerSync(part, btn){
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ 同步中…';
+  setSaveState('saving', part === 'credits' ? '正在拉取官方账单…' : '正在扫描本地会话…');
+
+  const r = await ServerSync.run(part);
+
+  btn.disabled = false;
+  btn.textContent = label;
+
+  if(!r.ok){
+    toast('同步失败：' + (r.error || '未知错误'));
+    setSaveState('saved', '同步失败，数据未更新');
+    return;
+  }
+
+  await syncTokens({});          // 重新加载刚生成的数据文件
+
+  const m = r.meta || {};
+  const secs = (r.elapsedMs / 1000).toFixed(1);
+  if(part === 'credits'){
+    toast(`积分已同步 · 账单 ${fmt0(m.billRows)} 条 · ${m.accounts} 个账号 · 耗时 ${secs}s`
+      + ((m.errors && m.errors.length) ? `（${m.errors.length} 个账号失败）` : ''));
+    setSaveState('saved', `积分已同步 · ${secs}s`);
+  }else{
+    toast(`Token 已同步 · 本地回合 ${fmt0(m.turns)} · 请求 ${fmt0(m.reqs)} · 耗时 ${secs}s`);
+    setSaveState('saved', `Token 已同步 · ${secs}s`);
+  }
 }
 
 /* =========================================================
@@ -2780,6 +3026,7 @@ function render(){
   const d = getFiltered();
   renderChips();
   renderKPIs(d);
+  renderAccounts();          // 账号余额是账号级信息，不随筛选变化
   renderDateHeatmap(d);
   renderCharts(d);
   renderHeatmap(d);
@@ -3013,6 +3260,35 @@ async function tryRestore(){
     console.warn('[Persist] 恢复失败', e);
     return false;
   }
+}
+
+/**
+ * 把内嵌的官方账单合并进当前数据集。
+ *
+ * 与手工导入 Excel 走同一条合并路径（mergeByRequestId 按 RequestID 去重），
+ * 所以两种来源可以并存、互补：
+ *   · 首次使用、还没导入过 Excel → 官方账单直接成为数据集；
+ *   · 已导入过 Excel → 官方账单作为增量补充，同名行以官方（更新）为准。
+ */
+async function mergeOfficialBill(){
+  const off = OfficialBill.rows();
+  if(!off.length) return false;
+
+  const before = state.all.length;
+  const res = mergeByRequestId(state.all, off);
+  applyDataset(res.rows, state.sheetName, state.fileName || '官方账单（自动同步）');
+
+  const m = OfficialBill.meta();
+  if(m){
+    setSaveState('saved',
+      `官方账单已同步 ${fmt0(res.rows.length)} 条` +
+      (before ? `（新增 ${fmt0(res.added)}）` : '') +
+      ` · 窗口 ${m.windowDays} 天 · ${m.accountCount} 个账号`);
+    if(m.errors && m.errors.length){
+      toast(`官方账单已同步，但有 ${m.errors.length} 个账号拉取失败，详见脚本输出`);
+    }
+  }
+  return true;
 }
 
 async function openHistory(){
@@ -3358,16 +3634,35 @@ async function loadFile(file){
     toast('已清空本地缓存');
   });
 
-  /* 「同步 Token」= 真的去同步一次数据
-     已连接本地目录 → 直接重扫（符合「同步」的直觉）
-     未连接目录     → 退回重读 token-usage-data.js（bat 生成的那个文件） */
-  $('btnSync').addEventListener('click', async () => {
+  /* 「💰 同步积分」= 只拉官方账单与账号余额，必须走本地服务
+     「🔄 同步 Token」= 只扫本地会话；没有服务时退回重扫/重载 */
+  $('btnSyncCredits').addEventListener('click', async () => {
+    if(!await ServerSync.available()){
+      toast('积分同步需要本地服务：请用「打开看板.bat」打开看板（浏览器直接开 HTML 时无法拉账单）');
+      return;
+    }
+    await runServerSync('credits', $('btnSyncCredits'));
+  });
+
+  $('btnSyncTokens').addEventListener('click', async () => {
+    if(await ServerSync.available()){
+      await runServerSync('tokens', $('btnSyncTokens'));
+      return;
+    }
+    // 离线（file://）：能重扫已授权的目录就重扫，否则至少重读一次数据文件
     if(LocalScan.count()) await scanLocal({ toast: true });
     else                   await syncTokens({ toast: true });
   });
 
-  /* ---- 本地会话直读：授权一次，之后导入即自动匹配 ---- */
+  /* ---- 本地会话直读 ----
+     服务模式（页面由 server.js 提供）：服务端本来就能读文件系统，直接用默认目录，
+       不需要浏览器弹授权框——点击只做说明。
+     file:// 打开：没有文件系统权限，才需要用户授权一次目录。 */
   $('btnScan').addEventListener('click', async () => {
+    if(await ServerSync.available()){
+      toast('本地服务已自动读取会话目录，点「🔄 同步 Token」即可重扫');
+      return;
+    }
     try{
       await LocalScan.add();
     }catch(e){
@@ -3378,6 +3673,17 @@ async function loadFile(file){
     await scanLocal();
   });
 
+  /* 服务模式下把「连接本地会话」改成路径提示，让用户知道数据从哪来 */
+  (async () => {
+    const dirs = await ServerSync.scanDirs();
+    if(!dirs.length) return;
+    const btn = $('btnScan');
+    if(!btn) return;
+    const list = dirs.map(d => `${d.name}：${d.dir}${d.exists ? '' : '（不存在）'}`).join('\n');
+    btn.textContent = '📁 本地会话 · 服务已读取';
+    btn.title = `通过本地服务打开，无需授权目录。服务端直接扫描：\n${list}\n\n想立刻重扫就点「🔄 同步 Token」。`;
+  })();
+
   bindChips();
 
   // 先静默加载 token 数据（失败不能阻塞快照恢复），再恢复历史数据集
@@ -3387,6 +3693,8 @@ async function loadFile(file){
     const n = await LocalScan.loadHandles();
     if(n) $('btnScan').textContent = `📁 本地会话 (${n})`;
     await tryRestore();
+    // 官方账单（脚本自动同步）合并进来，与手工导入的 Excel 并存
+    await mergeOfficialBill();
   })();
 })();
 </script>

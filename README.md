@@ -6,6 +6,10 @@
 
 纯本地运行，零服务端、零依赖安装（脚本只用 Node 标准库，看板的图表库走 CDN）。
 
+**积分账单自动同步**：脚本从本机 WorkBuddy 登录态里读取凭证，直接调用官方接口拉取账单，
+并查询每个账号的**剩余积分与到期时间**——不用再手动导出 Excel。本机登录过的账号会被自动发现，
+多账号一并同步。
+
 ---
 
 ## 它解决什么问题
@@ -98,23 +102,105 @@ cache_read_input_tokens <= input_tokens              恒成立
 - **Node.js 18+**（脚本用到 `util.parseArgs`）
 - 看板需要联网加载 CDN 的 `xlsx` 和 `chart.js`
 
-### 1. 生成 Token 数据
+### 1. 生成数据
 
 ```bash
 node token-usage-report.js --emit-js
 ```
 
-Windows 上也可以直接双击 **`同步Token.bat`**：自动探测 Node → 扫描 → 生成 → 打开看板。
+Windows 上也可以直接双击 **`同步Token.bat`**：自动探测 Node → 扫描本地会话 → 同步官方账单与账号积分 → 生成 → 打开看板。
 
 ### 2. 打开看板
 
-双击 `workbuddy-token.html`，把积分账单 Excel **拖进去**即可。
+有两种用法，区别只在于「🔄 同步」按钮能干什么：
 
-看板会自动按 `RequestID` 关联本地 Token 数据。之后有新数据时，点顶栏的「🔄 同步 Token」重新加载即可，不必刷新页面。
+**方式一：本地服务（推荐）**
+
+双击 **`打开看板.bat`**——打开看板（同时起一个本地服务）。顶栏有两个独立按钮：
+
+- **「💰 同步积分」** → 只拉官方账单（近 30 天）与各账号积分余额，约 5 秒
+- **「🔄 同步 Token」** → 只重扫本地会话记录，约 2 秒
+
+两者**互不覆盖**：只同步积分时，本地 Token 数据原样保留；只同步 Token 时，已有的账单与账号余额也不会被抹掉。
+各自只更新自己那一半，所以你可以按需单独同步。
+
+关掉那个命令行窗口即停止服务。
+
+**方式二：直接双击 HTML（离线）**
+
+双击 `workbuddy-token.html`，零进程。数据用上次生成的结果：
+
+- 「🔄 同步 Token」仍可用——重新加载已有数据，或重扫你授权的本地会话目录
+- 「💰 同步积分」**不可用**（会提示需要本地服务），因为浏览器调不了官方接口
+
+要更新账单就双击 `同步Token.bat`（一次性全量同步并打开看板）。
+
+> 为什么离线模式拉不了账单：官方接口的跨域预检会被网关返回 401 且不带 CORS 头，
+> 而且浏览器禁止 JS 设置 `Origin` / `Referer`，伪装不了官方 Web 端。所以拉数据必须由 Node 侧代劳。
+
+无论哪种方式，看板都会按 `RequestID` 把账单与本地 Token 数据关联起来。
+
+> 手工导入的通道仍然保留：把积分账单 Excel 拖进去同样有效，两种来源按 `RequestID` 合并，同名记录以官方（更新）为准。
+
+---
+
+## 自动同步官方账单
+
+脚本会自己找到凭证并拉数据，全程不需要你导出任何文件。
+
+### 账号从哪来
+
+WorkBuddy 桌面端把每次登录的凭证写成快照文件，放在：
+
+```
+%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info
+```
+
+这些快照**不会被删除**，所以你在这台机器上登录过的每个账号都在里面。脚本按 `uid` 去重、
+每个账号取最新的一份，就得到了全部账号——不需要 OAuth 扫码，也不需要手动录 token。
+
+### 拉什么数据
+
+| 数据 | 接口 | 用途 |
+| --- | --- | --- |
+| 积分账单 | `/billing/meter/get-user-request-usage` | 替代手动导出的 Excel |
+| 积分余额 | `/billing/meter/get-user-resource-summary` | 账号还剩多少积分 |
+| 套餐明细 | `…-paid-packages` / `…-free-packages` | 每个包的剩余量与到期时间 |
+
+账单里的 `requestId` **就是**会话记录里的 `providerData.conversationRequestId`（回合级 ID），
+所以两端天然对得上，不需要额外映射。
+
+### 两个必须绕开的服务端行为
+
+1. **查询窗口超过约 31 天会直接返回空**——脚本按 30 天自动切分时间段。
+2. **单次最多返回 3000 条，且是从窗口起点往新取**——天真地拉一次会静默丢掉最新数据。
+   脚本按「取回本页最新时间 → 作为下一轮起点」推进，直到不再增长。
+
+### 相关参数
+
+```bash
+node token-usage-report.js --emit-js                   # 全量：扫本地 + 同步官方（默认 30 天）
+node token-usage-report.js --emit-js --official-days 7 # 官方数据只取最近 7 天
+node token-usage-report.js --emit-js --only=credits    # 只刷官方账单与积分余额，不动本地部分
+node token-usage-report.js --emit-js --only=tokens     # 只扫本地会话，不动官方部分
+node token-usage-report.js --emit-js --no-official     # 完全跳过官方同步
+```
+
+`--only=credits` 是**部分更新**：它读取已有数据文件，只替换其中的官方字段，本地 Token 部分原样保留
+（也不会重写 CSV 与汇总报告）。所以第一次必须先跑一次全量，之后才能只刷积分。
+
+官方同步**全程可失败**：账号找不到、token 失效、接口变更都只打印警告并继续，
+本地扫描与看板产出不受影响。失败时看板仍可用手工导入的 Excel。
 
 ---
 
 ## 看板能看什么
+
+**账号积分余额**（来自官方接口，每账号一张卡）
+
+- 剩余积分 / 总量 / 已用比例，带进度条
+- 最近到期时间；7 天内到期会变红警告，并标出快过期的积分数量
+- 套餐明细按名称聚合——几十个零散赠包会合并成几行，不会刷屏
 
 **KPI**
 
@@ -169,6 +255,17 @@ Windows 上也可以直接双击 **`同步Token.bat`**：自动探测 Node → �
 
 每个 `.jsonl` 是一个会话，一条带 `message.usage` 的记录 = 一次 API 请求。
 
+积分账单与账号余额来自官方接口，凭证读自本机登录态：
+
+| 数据 | 来源 |
+| --- | --- |
+| 登录凭证 | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\*.info` |
+| 积分账单 / 余额 | `https://www.workbuddy.cn/billing/meter/*` |
+
+**提问正文不会被采集**：账单接口的响应里其实带了 `input`（你提问的原文），
+脚本按白名单只提取 `requestId / credit / model / client / requestTime` 五个字段，
+正文在解析时即被丢弃，不会进入内存结构，更不会写盘。
+
 ### 常用参数
 
 ```bash
@@ -193,8 +290,11 @@ node token-usage-report.js -o D:\out            # 指定输出目录
 | 文件 | 说明 |
 | --- | --- |
 | `workbuddy-token.html` | 单文件看板，双击即用 |
+| `打开看板.bat` | **推荐入口**：打开看板（同时起本地服务），之后点「💰 同步积分」即可拉最新数据 |
+| `server.js` | 本地 HTTP 服务：提供看板页面 + `/api/sync`（一键同步接口） |
 | `token-usage-report.js` | 零依赖 Node 脚本，扫描会话记录并生成数据 |
-| `同步Token.bat` | Windows 一键脚本：探测 Node → 扫描 → 生成 → 打开看板 |
+| `workbuddy-api.js` | 官方接口封装：账号发现、账单拉取、积分余额查询 |
+| `同步Token.bat` | 离线模式的一键脚本：同步官方数据并生成，跑完打开看板 |
 | `token-usage-data.js` | **脚本产物，不入库**（见下） |
 | `token-usage-detail.csv` | 逐条请求明细，**不入库** |
 | `token-usage-summary.md` | 汇总报告，**不入库** |
@@ -203,7 +303,9 @@ node token-usage-report.js -o D:\out            # 指定输出目录
 
 ## 为什么数据文件不入库
 
-`token-usage-data.js` 里包含**真实的会话 UUID、回合 ID 和完整的本机项目路径**（例如 `C:\Users\<你的用户名>\...`）。这些属于个人使用痕迹，仓库里的 `.gitignore` 已默认排除它们。
+`token-usage-data.js` 里包含**真实的会话 UUID、回合 ID 和完整的本机项目路径**（例如 `C:\Users\<你的用户名>\...`），启用官方同步后还包括**账号 uid 与昵称**（昵称可能是手机号）。这些都属于个人使用痕迹，仓库里的 `.gitignore` 已默认排除它们。
+
+**账号登录凭证（accessToken / refreshToken）不会写入任何数据文件**——脚本只在内存中使用，用完即弃。
 
 所以你 clone 下来后打开看板会看到**空看板**——这是正常的，先跑一次 `同步Token.bat`（或 `node token-usage-report.js --emit-js`）就有数据了。
 

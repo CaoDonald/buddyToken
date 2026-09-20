@@ -1,13 +1,14 @@
 @echo off
 chcp 65001 >nul
 setlocal enabledelayedexpansion
-title 积分消耗看板 - 同步本地记录与官方账单
+title 积分消耗看板 - 本地服务
 
 set "HERE=%~dp0"
 if "%HERE:~-1%"=="\" set "HERE=%HERE:~0,-1%"
 
 echo ============================================
-echo   扫描本地会话记录 + 同步官方账单/账号积分
+echo   启动本地服务
+echo   看板里的「同步」按钮需要它才能拉最新账单
 echo ============================================
 echo.
 
@@ -63,30 +64,15 @@ echo [OK] Node: !NODE!
 "!NODE!" --version
 echo.
 
-echo 正在生成 token-usage-data.js（含官方账单与账号积分）...
-"!NODE!" "%HERE%\token-usage-report.js" --emit-js
-if errorlevel 1 (
-  echo.
-  echo [错误] 脚本执行失败，请查看上方输出。
-  echo.
-  pause
-  exit /b 1
-)
+echo 正在启动服务，数秒后会自动打开看板 ...
+echo 关闭本窗口即停止服务。
+echo.
 
-if not exist "%HERE%\token-usage-data.js" (
-  echo.
-  echo [错误] 未生成 token-usage-data.js，请检查脚本输出目录。
-  echo.
-  pause
-  exit /b 1
-)
+rem 前台运行服务；它启动后会自己判断端口并用默认浏览器打开看板
+"!NODE!" "%HERE%\server.js"
 
 echo.
-echo 正在打开看板 ...
-start "" "%HERE%\workbuddy-token.html"
-
+echo 服务已停止。看板仍可双击 workbuddy-token.html 打开（只是同步按钮会退回离线模式）。
 echo.
-echo 完成。若看板已经打开，请按 F5 刷新，或点击顶栏「同步 Token」。
-rem 显式调用系统目录下的 timeout，避免 PATH 中同名程序（如 Git 自带的）抢到
-"%SystemRoot%\System32\timeout.exe" /t 5 /nobreak >nul 2>nul
+pause
 exit /b 0

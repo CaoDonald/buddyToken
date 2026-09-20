@@ -76,6 +76,13 @@ const path = require('path');
 const readline = require('readline');
 const { parseArgs } = require('util');
 
+// 官方接口封装（拉账单 / 查积分余额）。读取失败时降级为纯本地扫描，
+// 不影响脚本原有行为。见 workbuddy-api.js。
+let wbApi = null;
+try {
+  wbApi = require('./workbuddy-api');
+} catch { /* 文件缺失时静默降级 */ }
+
 const HOME = os.homedir();
 
 const SOURCES = [
@@ -457,6 +464,178 @@ function loadExistingTokenData(file) {
   }
 }
 
+// ---------------------------------------------------------------- 官方数据
+
+/**
+ * 把套餐明细按名称聚合成一行，避免几十个零散赠包刷屏。
+ * 到期时间取该组内最早的一个（最紧迫的先提醒）。
+ */
+function groupPackages(resources) {
+  const map = new Map();
+  for (const r of resources) {
+    const key = r.packageName || r.packageCode || '未知套餐';
+    let cur = map.get(key);
+    if (!cur) {
+      cur = { name: key, code: r.packageCode || '', total: 0, remaining: 0, count: 0, expireAt: null };
+      map.set(key, cur);
+    }
+    cur.total += r.total;
+    cur.remaining += r.remaining;
+    cur.count++;
+    if (r.expireAt && (!cur.expireAt || r.expireAt < cur.expireAt)) cur.expireAt = r.expireAt;
+  }
+  return [...map.values()]
+    .map((p) => ({ ...p, total: Math.round(p.total), remaining: Math.round(p.remaining) }))
+    .sort((a, b) => (a.expireAt || Infinity) - (b.expireAt || Infinity));
+}
+
+/**
+ * 拉取官方账单与各账号积分余额。
+ *
+ * 全程「可失败」：任何一步出错都只打印警告并返回 null，绝不中断本地扫描
+ * 与数据产出——看板拿不到官方数据时，仍可按原有方式手动导入 Excel。
+ */
+async function fetchOfficial(days) {
+  if (!wbApi) return null;
+
+  let accounts;
+  try {
+    accounts = wbApi.discoverAccounts();
+  } catch (e) {
+    console.warn('  [官方] 账号发现失败：' + e.message);
+    return null;
+  }
+  if (!accounts.length) {
+    console.warn('  [官方] 本机未找到登录态，跳过自动同步（仍可手动导入账单 Excel）');
+    return null;
+  }
+  console.log(`  [官方] 发现 ${accounts.length} 个账号，拉取最近 ${days} 天账单…`);
+
+  const since = Date.now() - days * 86400000;
+  let billing;
+  try {
+    billing = await wbApi.fetchBillingForAccounts(accounts, since);
+  } catch (e) {
+    console.warn('  [官方] 账单拉取失败：' + e.message);
+    return null;
+  }
+  for (const e of billing.errors) {
+    console.warn(`  [官方] ${e.account} 账单拉取失败：${e.error}`);
+  }
+
+  let credits = [];
+  try {
+    credits = await wbApi.fetchCreditForAccounts(accounts);
+  } catch (e) {
+    console.warn('  [官方] 积分余额查询失败：' + e.message);
+  }
+  for (const c of credits.filter((x) => !x.ok)) {
+    console.warn(`  [官方] ${c.name} 积分查询失败：${c.error}`);
+  }
+
+  // 账号下标表：账单行只存下标，避免把 uid 重复写进每一条记录
+  const uids = accounts.map((a) => a.uid);
+  const idxOf = new Map(uids.map((uid, i) => [uid, i]));
+
+  // 紧凑行：[请求ID, 积分, 模型, 客户端, 时间戳ms, 账号下标]
+  const bill = billing.all.map((r) => [
+    r.requestId,
+    r.credit,
+    r.model,
+    r.client,
+    Date.parse(r.requestTime.replace(' ', 'T')) || 0,
+    idxOf.has(r.uid) ? idxOf.get(r.uid) : -1,
+  ]);
+
+  const accountList = credits.filter((c) => c.ok).map((c) => ({
+    uid: c.uid,
+    name: c.name,
+    total: Math.round(c.totalCapacity),
+    remaining: Math.round(c.totalRemaining),
+    used: Math.round(c.used),
+    soonestExpireAt: c.soonestExpireAt,
+    expiringSoon: c.expiringSoon,
+    expiringSoonRemaining: Math.round(c.expiringSoonRemaining),
+    expired: c.expired,
+    expiredRemaining: Math.round(c.expiredRemaining),
+    updatedAt: c.updatedAt,
+    packages: groupPackages(c.resources),
+  }));
+
+  if (!accountList.length && !bill.length) return null;
+
+  const creditTotal = bill.reduce((a, r) => a + r[1], 0);
+  console.log(`  [官方] 账单 ${fmt(bill.length)} 条 · 积分 ${creditTotal.toFixed(2)} · ` +
+    `账号余额 ${accountList.length} 个`);
+
+  return {
+    accounts: accountList,
+    uids,
+    bill,
+    meta: {
+      generatedAt: Date.now(),
+      windowDays: days,
+      accountCount: accounts.length,
+      billRows: bill.length,
+      creditTotal,
+      errors: billing.errors,
+    },
+  };
+}
+
+// ---------------------------------------------------------------- 只刷新官方数据
+
+/** 官方数据拉取窗口：优先显式参数，否则跟随本地扫描范围，最后兜底 30 天。 */
+function resolveOfficialDays(args, days) {
+  return args['official-days'] ? parseInt(args['official-days'], 10) : (days > 0 ? days : 30);
+}
+
+/**
+ * 只刷新官方账单与积分余额（`--only=credits`）。
+ *
+ * 完全不扫本地会话、不重写 CSV 与汇总报告——只把已有数据文件里的官方字段
+ * 换成最新的。这样「同步积分」和「同步 Token」就是两个互不干扰的操作，
+ * 各跑各的，谁也不会把对方的结果覆盖掉。
+ */
+async function syncCreditsOnly({ outdir, jsOut, officialDays }) {
+  if (!wbApi) {
+    console.error('缺少 workbuddy-api.js，无法同步官方数据');
+    process.exit(1);
+  }
+
+  const name = jsOut || 'token-usage-data.js';
+  const jsPath = path.isAbsolute(name) ? name : path.join(outdir, name);
+
+  // 部分更新必须建立在已有数据之上：本地 Token 部分要原样保留
+  const data = loadExistingTokenData(jsPath);
+  if (!data) {
+    console.error(`未找到已有数据文件：${jsPath}`);
+    console.error('请先完整同步一次（双击「同步Token.bat」），之后才能只刷新积分。');
+    process.exit(1);
+  }
+
+  const official = await fetchOfficial(officialDays);
+  if (!official) {
+    console.error('官方数据拉取失败，数据文件保持不变。');
+    process.exit(1);
+  }
+
+  data.acct = official.accounts;
+  data.uids = official.uids;
+  data.bill = official.bill;
+  data.official = official.meta;
+
+  const head = '/* 由 token-usage-report.js 自动生成，请勿手工编辑 */\n' +
+    `/* ${fmtTime(new Date())} · 仅刷新官方账单（近 ${officialDays} 天）· ` +
+    `账单 ${fmt(official.bill.length)} 条 · 账号 ${official.accounts.length} 个 · ` +
+    `本地回合沿用 ${fmt(data.meta.turns)} 个 */\n`;
+  fs.writeFileSync(jsPath, head + 'window.__TOKEN_DATA__=' + JSON.stringify(data) + ';\n', 'utf8');
+
+  console.log('');
+  console.log('  已刷新官方数据（本地 Token 数据未改动）');
+  console.log('  看板数据 : ' + jsPath);
+}
+
 // ---------------------------------------------------------------- 主流程
 
 async function main() {
@@ -471,6 +650,9 @@ async function main() {
         'light': { type: 'boolean' },
         'no-merge': { type: 'boolean' },
         'js-out': { type: 'string' },
+        'no-official': { type: 'boolean' },
+        'official-days': { type: 'string' },
+        only: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     }).values;
@@ -488,7 +670,24 @@ async function main() {
   const outdir = args.outdir ? path.resolve(args.outdir) : __dirname;
   const emitJs = !!args['emit-js'];
   const light  = !!args.light;
+
+  const only = (args.only || '').trim();
+  if (only && only !== 'credits' && only !== 'tokens') {
+    console.error('--only 只支持 credits（只刷积分）或 tokens（只扫本地会话）');
+    process.exit(1);
+  }
+
   fs.mkdirSync(outdir, { recursive: true });
+
+  // 只刷新积分：不扫本地、不重写 CSV 与报告，走独立路径后直接结束
+  if (only === 'credits') {
+    await syncCreditsOnly({
+      outdir,
+      jsOut: args['js-out'],
+      officialDays: resolveOfficialDays(args, days),
+    });
+    return;
+  }
 
   const now = new Date();
   let since = null;
@@ -530,6 +729,31 @@ async function main() {
     jsPath = path.isAbsolute(name) ? name : path.join(outdir, name);
     const data = buildTokenDataJs(reqs, light, titles);
     const freshTurns = data.meta.turns;
+
+    // `--only=tokens` 不管官方数据，但也不能把它抹掉：
+    // 本次构建只含本地部分，需把旧文件里的官方字段原样带回。
+    if (only === 'tokens') {
+      const prev = loadExistingTokenData(jsPath);
+      if (prev) {
+        if (prev.acct) data.acct = prev.acct;
+        if (prev.uids) data.uids = prev.uids;
+        if (prev.bill) data.bill = prev.bill;
+        if (prev.official) data.official = prev.official;
+      }
+    }
+
+    // 官方账单与积分余额：自动同步。任一步失败都只降级，不影响本地数据产出。
+    // `--only=tokens` 时跳过，这样「只扫本地」不会覆盖掉已有的官方数据。
+    if (only !== 'tokens' && wbApi && !args['no-official']) {
+      const officialDays = resolveOfficialDays(args, days);
+      const official = await fetchOfficial(officialDays);
+      if (official) {
+        data.acct = official.accounts;
+        data.uids = official.uids;
+        data.bill = official.bill;
+        data.official = official.meta;
+      }
+    }
 
     // 增量合并：把历次同步过、但本次本地 jsonl 里已不存在的回合保留下来，
     // 避免会话记录被清理后旧数据凭空消失。同名回合以本次扫描为准
