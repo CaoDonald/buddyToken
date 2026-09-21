@@ -49,6 +49,32 @@ body{
 .save-dot.saving i{background:var(--warn);animation:pulse .9s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
 
+/* 「⋯ 更多」下拉菜单：把低频按钮收起来，工具栏只留一键同步 */
+.menu-wrap{position:relative}
+.menu{
+  position:absolute; right:0; top:calc(100% + 6px); z-index:60;
+  min-width:186px; padding:6px; display:flex; flex-direction:column;
+  background:#fff; border:1px solid var(--line); border-radius:11px;
+  box-shadow:0 10px 28px rgba(20,30,60,.14);
+}
+.menu[hidden]{display:none}
+.menu-item{
+  display:block; width:100%; text-align:left; padding:8px 12px; font-size:13px;
+  border:0; border-radius:7px; background:transparent; color:var(--text);
+  cursor:pointer; font-family:inherit; font-weight:500; white-space:nowrap;
+}
+.menu-item:hover:not(:disabled){background:#f2f5fc}
+.menu-item:disabled{opacity:.55;cursor:default}
+.menu-item.danger{color:#d9463f}
+
+/* GitHub 仓库入口：右上角纯图标，与主流开源项目的位置一致 */
+.gh-link{
+  display:inline-flex;align-items:center;justify-content:center;flex:none;
+  width:34px;height:34px;border-radius:9px;color:var(--muted);
+  transition:.15s;text-decoration:none;
+}
+.gh-link:hover{color:var(--text);background:#f2f5fc}
+
 /* ---------- 上传 ---------- */
 .uploader{padding:60px 20px}
 .drop{
@@ -89,10 +115,10 @@ body{
 /* ---------- 筛选 ---------- */
 .filters{
   background:var(--card);border:1px solid var(--line);border-radius:14px;
-  padding:14px 16px;margin:20px 0;box-shadow:var(--shadow);
-  display:flex;gap:18px;flex-wrap:wrap;align-items:center;
+  padding:12px 16px;margin:16px 0;box-shadow:var(--shadow);
+  display:flex;gap:10px 18px;flex-wrap:wrap;align-items:center;
 }
-.fgroup{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.fgroup{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .fgroup>label{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.3px}
 input[type=date]{
   border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px;
@@ -107,6 +133,9 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 }
 .chip:hover{border-color:#b9c5e6;color:var(--text)}
 .chip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+/* 折叠开关：虚线圈，和筛选用的实心 chip 区分开 */
+.chip-more{color:var(--accent);border-style:dashed;font-weight:600}
+.chip-more:hover{border-color:var(--accent);color:var(--accent)}
 .statline{font-size:12px;color:var(--muted);margin-left:auto}
 
 /* ---------- KPI ---------- */
@@ -391,18 +420,27 @@ table.cal td.cal-cell.has:hover{
     <div class="brand">📊 积分消耗看板 <small id="srcName"></small></div>
     <div class="spacer"></div>
     <div class="save-dot" id="saveDot" hidden><i></i><span id="saveTxt">已自动保存</span></div>
-    <button class="btn" id="btnScan" title="授权本地会话目录（~/.workbuddy 或 ~/.codebuddy），让页面自己扫描会话记录。只需授权一次，之后导入账单会自动匹配">📁 连接本地会话</button>
     <button class="btn" id="btnSyncAll" title="一次性同步积分与 Token：先拉官方账单与各账号积分余额，再重扫本地会话记录（~/.workbuddy、~/.codebuddy）。等于依次点「💰 同步积分」和「🔄 同步 Token」，完成后自动重载看板数据。需要本地服务——请用「打开看板.bat」打开看板">⚡ 一键同步</button>
-    <button class="btn" id="btnSyncCredits" title="只同步积分：拉取官方账单与各账号积分余额。账单还是空的（初始化）时自动拉全部历史，之后每次只拉最近 7 天增量。需要本地服务——请用「打开看板.bat」打开看板">💰 同步积分</button>
-    <button class="btn" id="btnSyncTokens" title="只同步 Token：重扫本地会话记录（~/.workbuddy、~/.codebuddy）。不开服务也能用；通过本地服务打开时会连带刷新页面数据">🔄 同步 Token</button>
-    <button class="btn" id="btnAppend" hidden title="再选一份积分账单 Excel 合并进来。按 RequestID 去重，已存在的记录会自动跳过">➕ 追加数据</button>
-    <button class="btn" id="btnSnap" hidden title="立刻把当前数据集存一份快照到浏览器本地，用于以后恢复">💾 手动快照</button>
-    <button class="btn" id="btnHist" hidden title="查看历史快照列表，可恢复到任意一次保存过的状态">📂 历史</button>
-    <button class="btn" id="btnWipe" hidden title="清除浏览器本地保存的全部数据：快照、筛选条件、自动保存的草稿">🗑 清空本地</button>
-    <button class="btn" id="btnPrint" hidden title="打印当前看板，或另存为 PDF（浏览器打印时会自动隐藏按钮和输入框）">🖨 打印 / PDF</button>
-    <button class="btn" id="btnMd" hidden title="导出分析报告为 Markdown 文件，可直接贴到文档或提交到仓库">⬇ Markdown</button>
-    <button class="btn" id="btnCsv" hidden title="导出聚合维度的汇总表：模型 / 客户端 / 日期 / 时段 / 工具。要逐条明细请用「完整明细」卡片里的导出">⬇ CSV</button>
-    <button class="btn" id="btnReset" hidden title="清空当前数据集，回到上传界面重新开始（本地快照不会被删除）">🗑 清空重来</button>
+    <div class="menu-wrap">
+      <button class="btn" id="btnMore" title="同步、数据管理与导出等操作">⋯ 更多</button>
+      <div class="menu" id="moreMenu" hidden>
+        <button class="menu-item" id="btnSyncCredits" title="只同步积分：拉取官方账单与各账号积分余额。账单还是空的（初始化）时自动拉全部历史，之后每次只拉最近 7 天增量。需要本地服务——请用「打开看板.bat」打开看板">💰 同步积分</button>
+        <button class="menu-item" id="btnSyncTokens" title="只同步 Token：重扫本地会话记录（~/.workbuddy、~/.codebuddy）。不开服务也能用；通过本地服务打开时会连带刷新页面数据">🔄 同步 Token</button>
+        <button class="menu-item" id="btnScan" title="授权本地会话目录（~/.workbuddy 或 ~/.codebuddy），让页面自己扫描会话记录。只需授权一次，之后导入账单会自动匹配">📁 连接本地会话</button>
+        <button class="menu-item" id="btnAppend" hidden title="再选一份积分账单 Excel 合并进来。按 RequestID 去重，已存在的记录会自动跳过">➕ 追加数据</button>
+        <button class="menu-item" id="btnSnap" hidden title="立刻把当前数据集存一份快照到浏览器本地，用于以后恢复">💾 手动快照</button>
+        <button class="menu-item" id="btnHist" hidden title="查看历史快照列表，可恢复到任意一次保存过的状态">📂 历史</button>
+        <button class="menu-item" id="btnPrint" hidden title="打印当前看板，或另存为 PDF（浏览器打印时会自动隐藏按钮和输入框）">🖨 打印 / PDF</button>
+        <button class="menu-item" id="btnMd" hidden title="导出分析报告为 Markdown 文件，可直接贴到文档或提交到仓库">⬇ Markdown</button>
+        <button class="menu-item" id="btnCsv" hidden title="导出聚合维度的汇总表：模型 / 客户端 / 日期 / 时段 / 工具。要逐条明细请用「完整明细」卡片里的导出">⬇ CSV</button>
+        <button class="menu-item danger" id="btnWipe" hidden title="清除浏览器本地保存的全部数据：快照、筛选条件、自动保存的草稿">🗑 清空本地</button>
+        <button class="menu-item danger" id="btnReset" hidden title="清空当前数据集，回到上传界面重新开始（本地快照不会被删除）">🗑 清空重来</button>
+      </div>
+    </div>
+    <a class="gh-link" href="https://github.com/CaoDonald/buddyToken" target="_blank" rel="noopener noreferrer"
+       aria-label="在 GitHub 上查看 buddyToken 源码" title="在 GitHub 上查看 buddyToken 源码（新标签打开）">
+      <svg viewBox="0 0 16 16" width="19" height="19" aria-hidden="true" fill="currentColor"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>
+    </a>
   </div>
 </div>
 
@@ -3619,24 +3657,43 @@ function acctLabel(uid){
   return hit ? hit.name : String(uid).slice(0, 8) + '…';
 }
 
+/** 模型 chip 是否展开。render() 每次都会重建 chips，靠它记住展开状态。 */
+let modelsOpen = false;
+
 function renderChips(){
   const models  = [...new Set(state.all.map(x => x.model))].sort();
   const clients = [...new Set(state.all.map(x => x.client))].sort();
   const accts   = [...new Set(state.all.map(x => x.acct || ''))].sort();
 
   const empty = '<span style="color:#a8b3c8;font-size:12px">—</span>';
+  const chip = (type, val, label, on) =>
+    `<button class="chip${on ? ' on' : ''}" data-type="${type}" data-val="${esc(val)}">${esc(label)}</button>`;
 
-  $('modelChips').innerHTML = models.map(m =>
-    `<button class="chip${state.filters.models.has(m)?' on':''}" data-type="model" data-val="${esc(m)}">${esc(m)}</button>`
-  ).join('') || empty;
+  // 模型动辄十几个，全铺开能把筛选区撑到三四行。默认只留一行的量，但「已选中」的
+  // 必须始终露在外面——否则用户看不到自己选了什么，再点一下就莫名取消了。
+  const LIMIT = 8;
+  let shown = models;
+  if(!modelsOpen && models.length > LIMIT){
+    const picked = models.filter(m => state.filters.models.has(m));
+    const rest   = models.filter(m => !state.filters.models.has(m));
+    shown = [...picked, ...rest.slice(0, Math.max(0, LIMIT - picked.length))];
+  }
+  const hiddenCnt = models.length - shown.length;
+  const more = hiddenCnt > 0
+    ? `<button class="chip chip-more" data-chips="more" title="展开其余 ${hiddenCnt} 个模型">+${hiddenCnt}</button>`
+    : (modelsOpen && models.length > LIMIT
+        ? '<button class="chip chip-more" data-chips="less" title="收起模型列表">收起</button>' : '');
+
+  $('modelChips').innerHTML =
+    (shown.map(m => chip('model', m, m, state.filters.models.has(m))).join('') + more) || empty;
 
   $('clientChips').innerHTML = clients.map(c =>
-    `<button class="chip${state.filters.clients.has(c)?' on':''}" data-type="client" data-val="${esc(c)}">${esc(c)}</button>`
+    chip('client', c, c, state.filters.clients.has(c))
   ).join('') || empty;
 
   // 账号 chip 的值是 uid（空串＝未知），显示名另取，避免同名账号混淆
   $('acctChips').innerHTML = accts.map(u =>
-    `<button class="chip${state.filters.accounts.has(u)?' on':''}" data-type="acct" data-val="${esc(u)}">${esc(acctLabel(u))}</button>`
+    chip('acct', u, acctLabel(u), state.filters.accounts.has(u))
   ).join('') || empty;
 }
 
@@ -3644,6 +3701,14 @@ function bindChips(){
   const handler = e => {
     const b = e.target.closest('.chip');
     if(!b) return;
+
+    // 「+N / 收起」只负责折叠，不参与筛选
+    if(b.dataset.chips){
+      modelsOpen = b.dataset.chips === 'more';
+      renderChips();
+      return;
+    }
+
     const {type, val} = b.dataset;
     const set = type === 'model' ? state.filters.models
               : type === 'acct'  ? state.filters.accounts
@@ -4273,6 +4338,19 @@ async function loadFile(file){
     Persist.clearMeta();
     toast('已清空本地缓存');
   });
+
+  /* 「⋯ 更多」下拉菜单：点按钮开合，点页面别处或 Esc 收起 */
+  (() => {
+    const btn = $('btnMore'), menu = $('moreMenu');
+    if(!btn || !menu) return;
+    btn.addEventListener('click', e => {
+      e.stopPropagation();          // 不拦的话会冒泡到 document，菜单开了就被关掉
+      menu.hidden = !menu.hidden;
+    });
+    // 菜单项自己的 click 会冒泡到 document，顺带收起菜单，不必单独处理
+    document.addEventListener('click', () => { menu.hidden = true; });
+    document.addEventListener('keydown', e => { if(e.key === 'Escape') menu.hidden = true; });
+  })();
 
   /* ⚡ 一键同步 = 积分 + Token 串行跑一遍（离线时退化为只重扫 Token） */
   $('btnSyncAll').addEventListener('click', () => runServerSyncAll($('btnSyncAll')));
