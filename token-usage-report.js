@@ -743,13 +743,12 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid }) {
   const name = jsOut || 'token-usage-data.js';
   const jsPath = path.isAbsolute(name) ? name : path.join(outdir, name);
 
-  // 部分更新必须建立在已有数据之上：本地 Token 部分要原样保留
-  const data = loadExistingTokenData(jsPath);
-  if (!data) {
-    console.error(`未找到已有数据文件：${jsPath}`);
-    console.error('请先完整同步一次（双击「同步Token.bat」），之后才能只刷新积分。');
-    process.exit(1);
-  }
+  // 数据文件不存在＝首次使用（刚 clone、或刚清过产物）：按初始化处理，用空骨架
+  // 继续往下走，让 resolveOfficialDays 自动改拉全部历史（见其注释里的 null 分支）。
+  // 本地 Token 部分由紧随其后的「🔄 同步 Token」补上——看板的「⚡ 一键同步」正是
+  // 「先积分后 Token」两步串行，所以首次点它一次就能拿到完整数据。
+  const existing = loadExistingTokenData(jsPath);
+  const data = existing || { meta: { turns: 0 } };
 
   // 已有账单一条都没有＝初始化：自动改拉全部历史，之后的同步再回到常规窗口
   const officialDays = resolveOfficialDays(args, days, data);
@@ -781,13 +780,17 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid }) {
     `）· ` +
     `本次新增 ${fmt(merged.meta.addedRows)} 条 + 历史保留 ${fmt(merged.meta.keptRows)} 条 ` +
     `= 账单 ${fmt(merged.bill.length)} 条 · 账号 ${merged.accounts.length} 个 · ` +
-    `本地回合沿用 ${fmt(data.meta.turns)} 个 */\n`;
+    (existing
+      ? `本地回合沿用 ${fmt(data.meta.turns)} 个 */\n`
+      : '本地回合待「🔄 同步 Token」补齐 */\n');
   fs.writeFileSync(jsPath, head + 'window.__TOKEN_DATA__=' + JSON.stringify(data) + ';\n', 'utf8');
 
   console.log('');
   console.log(uid
     ? `  已刷新官方数据：只更新 ${scope}（本地 Token 数据未改动）`
-    : '  已刷新官方数据（本地 Token 数据未改动）');
+    : (existing
+        ? '  已刷新官方数据（本地 Token 数据未改动）'
+        : '  已初始化官方数据（首次，尚无本地 Token，请再点一次「🔄 同步 Token」）'));
   console.log(`  账单增量合并：本次新增 ${fmt(merged.meta.addedRows)} 条 + ` +
     `历史保留 ${fmt(merged.meta.keptRows)} 条 = ${fmt(merged.bill.length)} 条，窗口外的历史未丢弃`);
   console.log('  看板数据 : ' + jsPath);
