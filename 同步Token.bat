@@ -86,7 +86,7 @@ echo 正在打开看板 ...
 start "" "%HERE%\workbuddy-token.html"
 
 echo.
-echo 完成。若看板已经打开，请按 F5 刷新，或点击顶栏「同步 Token」。
+echo 完成。若看板已经打开，按 F5 刷新即可看到最新数据（本地会话与官方账单都已更新）。
 rem 显式调用系统目录下的 timeout，避免 PATH 中同名程序（如 Git 自带的）抢到
 "%SystemRoot%\System32\timeout.exe" /t 5 /nobreak >nul 2>nul
 exit /b 0

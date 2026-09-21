@@ -14,7 +14,7 @@
  *   每一条带 message.usage 的记录 = 一次模型 API 请求。
  *   按 providerData.messageId（缺失时回退 message.id / 记录 id）去重。
  *
- *   字段口径（已对全量数据实测校验，7857 条无一例外）：
+ *   字段口径（已对全量数据逐条实测校验，无一例外）：
  *     total_tokens = input_tokens + output_tokens      恒成立
  *     cache_read_input_tokens <= input_tokens           恒成立（命中缓存的子集）
  *   即 input_tokens 已经是「该次请求的全量上下文」，cache_read 只是它的
@@ -34,6 +34,8 @@
  *   node token-usage-report.js --emit-js           # 额外生成看板数据 token-usage-data.js
  *   node token-usage-report.js --emit-js --light   # 同上，省略每步明细（文件约小一半）
  *   node token-usage-report.js --emit-js --no-merge # 关闭增量合并，纯全量覆盖
+ *   node token-usage-report.js --emit-js --only=credits            # 只刷官方账单与积分余额
+ *   node token-usage-report.js --emit-js --only=credits --uid <uid> # 只刷某个账号（看板卡片上的刷新）
  *
  * 看板数据是「增量合并」写入的（默认）
  *   生成前会读取已有的 token-usage-data.js，把历次同步过、但本次本地已扫不到的
@@ -48,7 +50,7 @@
  *
  * 回合（turn）口径
  *   providerData.conversationRequestId 是「回合 ID」，粒度比 messageId 粗：
- *   一次用户提问 = 一个回合，但 agent 会在其中发起多次 API 请求（实测均 7.65 次）。
+ *   一次用户提问 = 一个回合，但 agent 会在其中发起多次 API 请求（实测均值 7~8 次）。
  *   积分看板按回合 ID 与本脚本产出的 token 数据对齐，因此 --emit-js 会按
  *   conversationRequestId 把整回合的 token 求和，与一行积分一一对应。
  *
@@ -497,10 +499,13 @@ function groupPackages(resources) {
 /**
  * 拉取官方账单与各账号积分余额。
  *
+ * onlyUid 只拉指定账号（看板卡片上的「刷新」按钮走这条路）；其余账号的账单
+ * 与余额由调用方在合并时原样保留，不在这里处理。
+ *
  * 全程「可失败」：任何一步出错都只打印警告并返回 null，绝不中断本地扫描
  * 与数据产出——看板拿不到官方数据时，仍可按原有方式手动导入 Excel。
  */
-async function fetchOfficial(days) {
+async function fetchOfficial(days, onlyUid) {
   if (!wbApi) return null;
 
   let accounts;
@@ -510,15 +515,22 @@ async function fetchOfficial(days) {
     console.warn('  [官方] 账号发现失败：' + e.message);
     return null;
   }
+  const allCount = accounts.length;
+  if (onlyUid) accounts = accounts.filter((a) => a.uid === onlyUid);
   if (!accounts.length) {
-    console.warn('  [官方] 本机未找到登录态，跳过自动同步（仍可手动导入账单 Excel）');
+    console.warn(onlyUid
+      ? `  [官方] 未找到账号 ${onlyUid} 的登录态，跳过刷新`
+      : '  [官方] 本机未找到登录态，跳过自动同步（仍可手动导入账单 Excel）');
     return null;
   }
   const isFull = days >= FULL_HISTORY_DAYS;
-  console.log(`  [官方] 发现 ${accounts.length} 个账号，` +
-    (isFull
-      ? `账单还是空的，首次拉取全部历史（近 ${days} 天，按 30 天窗口切分）…`
-      : `拉取最近 ${days} 天账单…`));
+  console.log(onlyUid
+    ? `  [官方] 只刷新账号 ${accounts[0].name}，` +
+      (isFull ? `拉取全部历史（近 ${days} 天，按 30 天窗口切分）…` : `拉取最近 ${days} 天账单…`)
+    : `  [官方] 发现 ${accounts.length} 个账号，` +
+      (isFull
+        ? `账单还是空的，首次拉取全部历史（近 ${days} 天，按 30 天窗口切分）…`
+        : `拉取最近 ${days} 天账单…`));
 
   const since = Date.now() - days * 86400000;
   let billing;
@@ -618,8 +630,11 @@ async function fetchOfficial(days) {
  *   · acct（余额）是当前快照、不是累加量，直接取本次结果
  *
  * canMerge=false（--no-merge）时退回纯覆盖，用于明确要丢弃历史重开的场景。
+ *
+ * partialUid 是「只刷一个账号」：此时 fresh 只含该账号的数据，acct 必须按 uid
+ * 覆盖到旧快照上——直接取本次结果会把其余账号的余额卡片整块抹掉。
  */
-function mergeOfficialData(prev, fresh, canMerge) {
+function mergeOfficialData(prev, fresh, canMerge, partialUid) {
   const freshBill = Array.isArray(fresh.bill) ? fresh.bill : [];
   const freshUids = Array.isArray(fresh.uids) ? fresh.uids : [];
   const prevBill = canMerge && prev && Array.isArray(prev.bill) ? prev.bill : [];
@@ -653,12 +668,27 @@ function mergeOfficialData(prev, fresh, canMerge) {
   const bill = [...byId.values()].sort((a, b) => (a[4] || 0) - (b[4] || 0));
   const keptRows = bill.length - added;
 
+  // 余额快照：整体刷新直接取本次；只刷一个账号时按 uid 覆盖，其余账号沿用旧快照
+  let accounts = fresh.accounts;
+  let accountCount = fresh.meta && fresh.meta.accountCount;
+  if (partialUid) {
+    const byUid = new Map();
+    for (const a of (canMerge && prev && Array.isArray(prev.acct)) ? prev.acct : []) {
+      if (a && a.uid) byUid.set(a.uid, a);
+    }
+    for (const a of fresh.accounts) byUid.set(a.uid, a);
+    accounts = [...byUid.values()];
+    // 账号总数描述的是「本机一共有几个账号」，单账号刷新时不该被改成 1
+    accountCount = (prev && prev.official && prev.official.accountCount) || accounts.length;
+  }
+
   return {
-    accounts: fresh.accounts,
+    accounts,
     uids,
     bill,
     meta: {
       ...fresh.meta,
+      accountCount,
       billRows: bill.length,        // 合并后的总条数
       creditTotal: bill.reduce((s, r) => s + (Number(r[1]) || 0), 0),
       addedRows: added,             // 本次新增
@@ -700,8 +730,11 @@ function resolveOfficialDays(args, days, prevData) {
  * 完全不扫本地会话、不重写 CSV 与汇总报告——只把已有数据文件里的官方字段
  * 换成最新的。这样「同步积分」和「同步 Token」就是两个互不干扰的操作，
  * 各跑各的，谁也不会把对方的结果覆盖掉。
+ *
+ * uid 非空时只刷新该账号（看板账号卡片上的「刷新」按钮）：账单按 RequestID
+ * 合并、余额按 uid 覆盖，其余账号的账单与余额原样保留。
  */
-async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge }) {
+async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid }) {
   if (!wbApi) {
     console.error('缺少 workbuddy-api.js，无法同步官方数据');
     process.exit(1);
@@ -720,14 +753,16 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge }) {
 
   // 已有账单一条都没有＝初始化：自动改拉全部历史，之后的同步再回到常规窗口
   const officialDays = resolveOfficialDays(args, days, data);
-  const official = await fetchOfficial(officialDays);
+  const official = await fetchOfficial(officialDays, uid);
   if (!official) {
-    console.error('官方数据拉取失败，数据文件保持不变。');
+    console.error(uid
+      ? `账号 ${uid} 刷新失败，数据文件保持不变。`
+      : '官方数据拉取失败，数据文件保持不变。');
     process.exit(1);
   }
 
   // 增量合并：窗口外的历史账单原样保留，本地回合一个字节都不动
-  const merged = mergeOfficialData(data, official, !noMerge);
+  const merged = mergeOfficialData(data, official, !noMerge, uid);
   data.acct = merged.accounts;
   data.uids = merged.uids;
   data.bill = merged.bill;
@@ -738,8 +773,10 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge }) {
     if (h && h.byUid) data.hist = h.byUid;
   } catch { /* 无历史时省略 */ }
 
+  const scope = `账号 ${(official.accounts[0] && official.accounts[0].name) || uid}（其余账号保留）`;
   const head = '/* 由 token-usage-report.js 自动生成，请勿手工编辑 */\n' +
     `/* ${fmtTime(new Date())} · 仅刷新官方账单（` +
+    (uid ? `只刷 ${scope} · ` : '') +
     (officialDays >= FULL_HISTORY_DAYS ? `初始化全量，近 ${officialDays} 天` : `近 ${officialDays} 天`) +
     `）· ` +
     `本次新增 ${fmt(merged.meta.addedRows)} 条 + 历史保留 ${fmt(merged.meta.keptRows)} 条 ` +
@@ -748,7 +785,9 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge }) {
   fs.writeFileSync(jsPath, head + 'window.__TOKEN_DATA__=' + JSON.stringify(data) + ';\n', 'utf8');
 
   console.log('');
-  console.log('  已刷新官方数据（本地 Token 数据未改动）');
+  console.log(uid
+    ? `  已刷新官方数据：只更新 ${scope}（本地 Token 数据未改动）`
+    : '  已刷新官方数据（本地 Token 数据未改动）');
   console.log(`  账单增量合并：本次新增 ${fmt(merged.meta.addedRows)} 条 + ` +
     `历史保留 ${fmt(merged.meta.keptRows)} 条 = ${fmt(merged.bill.length)} 条，窗口外的历史未丢弃`);
   console.log('  看板数据 : ' + jsPath);
@@ -771,6 +810,7 @@ async function main() {
         'no-official': { type: 'boolean' },
         'official-days': { type: 'string' },
         only: { type: 'string' },
+        uid: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
     }).values;
@@ -795,6 +835,18 @@ async function main() {
     process.exit(1);
   }
 
+  // --uid：只刷新某个账号（看板账号卡片的「刷新」按钮）。它只对「只刷积分」
+  // 有意义——扫描本地会话是按目录而非按账号组织的，没有「只扫某账号」这回事。
+  const uid = (args.uid || '').trim();
+  if (uid && !/^[0-9a-zA-Z_-]{1,64}$/.test(uid)) {
+    console.error('--uid 格式不合法（只接受字母、数字、下划线、连字符）');
+    process.exit(1);
+  }
+  if (uid && only !== 'credits') {
+    console.error('--uid 只能与 --only=credits 一起使用（只刷新单个账号的积分）');
+    process.exit(1);
+  }
+
   fs.mkdirSync(outdir, { recursive: true });
 
   // 只刷新积分：不扫本地、不重写 CSV 与报告，走独立路径后直接结束
@@ -805,6 +857,7 @@ async function main() {
       args,
       days,
       noMerge: !!args['no-merge'],
+      uid,
     });
     return;
   }

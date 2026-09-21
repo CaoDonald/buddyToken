@@ -65,7 +65,6 @@ body{
 }
 .menu-item:hover:not(:disabled){background:#f2f5fc}
 .menu-item:disabled{opacity:.55;cursor:default}
-.menu-item.danger{color:#d9463f}
 
 /* GitHub 仓库入口：右上角纯图标，与主流开源项目的位置一致 */
 .gh-link{
@@ -433,8 +432,6 @@ table.cal td.cal-cell.has:hover{
         <button class="menu-item" id="btnPrint" hidden title="打印当前看板，或另存为 PDF（浏览器打印时会自动隐藏按钮和输入框）">🖨 打印 / PDF</button>
         <button class="menu-item" id="btnMd" hidden title="导出分析报告为 Markdown 文件，可直接贴到文档或提交到仓库">⬇ Markdown</button>
         <button class="menu-item" id="btnCsv" hidden title="导出聚合维度的汇总表：模型 / 客户端 / 日期 / 时段 / 工具。要逐条明细请用「完整明细」卡片里的导出">⬇ CSV</button>
-        <button class="menu-item danger" id="btnWipe" hidden title="清除浏览器本地保存的全部数据：快照、筛选条件、自动保存的草稿">🗑 清空本地</button>
-        <button class="menu-item danger" id="btnReset" hidden title="清空当前数据集，回到上传界面重新开始（本地快照不会被删除）">🗑 清空重来</button>
       </div>
     </div>
     <a class="gh-link" href="https://github.com/CaoDonald/buddyToken" target="_blank" rel="noopener noreferrer"
@@ -917,6 +914,13 @@ function computeStats(d){
   const byHour   = agg(d, x => x.hour);
   const top      = [...d].sort((a,b) => b.points - a.points).slice(0, 10);
   const zeroCnt  = d.filter(x => x.points === 0).length;
+
+  // 单次积分的四分位区间：给「平均单次」卡片做说明用（这里不能写死——
+  // 早先硬编码成「0.01 ~ 1 积分」，数据换了它还照旧显示）。
+  // 只取有积分的记录：0 积分的是免费模型，混进来会把下四分位直接压到 0。
+  const ptsSorted = d.map(x => x.points).filter(v => v > 0).sort((a,b) => a - b);
+  const quantile  = p => ptsSorted.length
+    ? ptsSorted[Math.min(ptsSorted.length - 1, Math.floor(ptsSorted.length * p))] : 0;
   byDate.sort((a,b) => a.key.localeCompare(b.key));
   const dates = byDate.map(x => x.key);
   const hourArr = new Array(24).fill(0);
@@ -1097,6 +1101,8 @@ function computeStats(d){
     freeRows: freeRows.length, freeToken,
     byTool, topToken, toolSteps, hasDetail: toolSteps > 0,
     toolKinds: byTool.length,
+    perReqP25: quantile(0.25),
+    perReqP75: quantile(0.75),
     modelRank,
     bySession,
     tokenPerPoint:   tokenPts > 0 ? tokenTot / tokenPts : 0,        // 每 1 积分产出多少 token
@@ -1124,7 +1130,10 @@ function renderKPIs(d){
   const items = [
     {label:'总积分消耗', value: fmt2(s.total), sub:`${s.count} 次请求`},
     {label:'日均消耗',   value: fmt2(s.dailyAvg), sub:`覆盖 <b>${s.days}</b> 天`},
-    {label:'平均单次',   value: fmt2(s.avg), sub:`中位区间 0.01 ~ 1 积分`},
+    {label:'平均单次',   value: fmt2(s.avg),
+     sub: s.perReqP75 > 0
+       ? `半数记录落在 <b>${fmt2(s.perReqP25)}</b> ~ <b>${fmt2(s.perReqP75)}</b> 积分`
+       : `${s.count} 次请求`},
     {label:'单次最高',   value: s.max ? fmt2(s.max) : '0',
      sub: s.maxReq ? `${esc(s.maxReq.model)} · ${s.maxReq.time.getHours()}:${pad(s.maxReq.time.getMinutes())}` : '-'},
     {label:'主力模型', value: mainModel ? esc(mainModel.key) : '-', small:true,
@@ -1259,19 +1268,15 @@ function activeLimits(uid, now){
 }
 
 /**
- * 底部「设为当前」按钮：仅针对 WorkBuddy 桌面端（各应用切换已由右上角图标承担）。
- * 当前登录账号显示禁用的「当前使用」；无桌面端快照不显示。
+ * 底部「刷新」按钮：只拉这个账号的账单与积分余额，其余账号原样不动。
+ *
+ * 这里原先放的是「✓ 当前使用 / 🔀 设为当前」。前者是禁用态，点上去没有任何
+ * 反应；后者与卡片右上角的三个应用图标重复（切换能力没丢，只是由那里承担）。
+ * 换成一个真能干活的操作——账号一多，最常做的恰恰是「单独刷一下这个号」。
  */
-function switchBtnFor(a){
-  const sw = state.serverStatus && state.serverStatus.switchable;
-  if(!sw || !Array.isArray(sw.accounts)) return '';
-  const cur = sw.currentByApp || {};
-  if(cur['workbuddy-desktop'] === a.uid){
-    return '<button class="acct-btn" disabled title="该账号正在 WorkBuddy 桌面端登录">✓ 当前使用</button>';
-  }
-  if(!sw.accounts.some(x => x.uid === a.uid && x.snapshots && x.snapshots['workbuddy-desktop'])) return '';
-  return `<button class="acct-btn" data-act="switch" data-uid="${esc(a.uid)}"
-            title="把 WorkBuddy 桌面端切换到该账号（会关闭并重启 WorkBuddy）">🔀 设为当前</button>`;
+function refreshBtnFor(a){
+  return `<button class="acct-btn" data-act="refresh" data-uid="${esc(a.uid)}"
+            title="只刷新该账号的官方账单与积分余额，其他账号不受影响">🔄 刷新</button>`;
 }
 
 /**
@@ -1475,7 +1480,7 @@ function renderAccounts(){
       <div class="card c6">
         <h3>
           <span class="dot"></span>${esc(a.name)}
-          <span class="tag">${esc(String(a.uid).slice(0, 8))}…</span>
+          <span class="tag" title="账号 uid：${esc(a.uid)}">${esc(String(a.uid).slice(0, 8))}…</span>
           ${renderStatusChips(a, a.uid, a.uid === priorityUid)}
           ${renderAppBadges(a)}
         </h3>
@@ -1494,7 +1499,7 @@ function renderAccounts(){
                   title="每日签到领积分。已签到会自动识别，不会重复提交">✅ 签到</button>
           <button class="acct-btn" data-act="travel" data-uid="${esc(a.uid)}"
                   title="按状态自动判断：空闲就派出去，已到达就领奖励，旅行中会提示还要等多久">🐱 派猫猫</button>
-          ${switchBtnFor(a)}
+          ${refreshBtnFor(a)}
         </div>
       </div>`;
   }).join('');
@@ -1524,8 +1529,9 @@ function renderAccounts(){
  */
 async function loadCheckinStatus(){
   if(!await ServerSync.available()) return;
-  // 服务状态（含可切换账号列表）随本轮一并缓存，切换按钮据此渲染
-  state.serverStatus = await ServerSync.status();
+  // 每轮强制重拉服务状态：这是个 60s 轮询，读缓存的话，在客户端里手动切换的
+  // 账号看板永远看不到，卡片右上角的登录图标会一直停在旧值
+  state.serverStatus = await ServerSync.status(true);
   const [list, lim] = await Promise.all([ServerSync.checkinStatus(), ServerSync.limits()]);
   if(list && list.length){
     state.checkins = {};
@@ -1542,11 +1548,11 @@ async function loadCheckinStatus(){
 }
 
 /**
- * 账号卡片上的操作按钮（签到 / 派猫猫）。
+ * 账号卡片上的操作按钮（刷新 / 签到 / 派猫猫）。
  *
- * 这两个动作会真的调用官方接口改变服务端状态，所以：
- *   · 必须通过本地服务（浏览器直开 HTML 时没有凭证）；
- *   · 按钮处理期间禁用，避免连点。
+ * 签到与派猫猫会真的改动服务端状态，刷新只读；但三者都需要读取本地登录凭证，
+ * 所以都必须走本地服务（浏览器直开 HTML 时拿不到凭证）。处理期间禁用按钮，
+ * 避免连点——服务端同一时间也只允许一次同步，并发会返 409。
  */
 async function onAcctAction(btn){
   if(!await ServerSync.available()){
@@ -1558,15 +1564,15 @@ async function onAcctAction(btn){
   const uid = btn.dataset.uid;
   const label = btn.textContent;
 
-  // 切换账号是破坏性动作，按目标应用给出对应提示，先二次确认
-  if(act === 'switch' || act === 'appswitch'){
+  // 切换账号（卡片右上角的应用图标）是破坏性动作，按目标应用给出提示并二次确认
+  if(act === 'appswitch'){
     const sw = state.serverStatus && state.serverStatus.switchable;
     const target = sw && sw.accounts ? sw.accounts.find(x => x.uid === uid) : null;
     const name = (target && target.name) || uid.slice(0, 8);
-    const app = act === 'appswitch' ? (btn.dataset.app || 'workbuddy-desktop') : 'workbuddy-desktop';
+    const app = btn.dataset.app || 'workbuddy-desktop';
     const appName = app === 'codebuddy-cli' ? 'CodeBuddy CLI' : 'WorkBuddy 桌面端';
     const effect = app === 'codebuddy-cli'
-      ? '无感切换：不打断正在运行的 CLI 会话（仍用原账号），新开的 CLI 会话将使用新账号'
+      ? '立即生效：不打断任何进程，CLI 随即使用新账号（无需重启）'
       : '将关闭并重新启动 WorkBuddy';
     if(!confirm(`把${appName}切换到「${name}」？\n\n${effect}，切换前会自动备份当前登录态。`)) return;
 
@@ -1583,9 +1589,39 @@ async function onAcctAction(btn){
     }
     toast(`${r.name || '账号'}：${r.message || '已切换为当前登录账号'}` +
       (r.backup ? '（原登录态已备份）' : ''));
-    // 切换后各应用当前账号变了，重拉服务状态与账号卡片
-    state.serverStatus = await ServerSync.status();
+    // 切换后各应用当前账号变了：必须 force 重拉，否则拿到的是切换前的缓存，
+    // 卡片右上角的图标不会变（用户看到的"切了但没刷新"）
+    state.serverStatus = await ServerSync.status(true);
     renderAccounts();
+    return;
+  }
+
+  // 只刷新这一个账号的积分：后端只拉该 uid 的账单与余额，其余账号原样保留
+  if(act === 'refresh'){
+    const name = (OfficialBill.accounts().find(x => x.uid === uid) || {}).name || uid.slice(0, 8);
+    btn.disabled = true;
+    btn.textContent = '⏳ 刷新中…';
+    setSaveState('saving', `正在刷新「${name}」的积分…`);
+
+    let r;
+    try{
+      r = await ServerSync.run('credits', uid);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+    if(!r || !r.ok){
+      toast('刷新失败：' + (r && r.error || '未知错误'));
+      setSaveState('saved', '刷新失败，数据未更新');
+      return;
+    }
+
+    await syncTokens({});            // 重载数据文件，账号卡片随之刷新
+    const m = r.meta || {};
+    const secs = ((r.elapsedMs || 0) / 1000).toFixed(1);
+    toast(`「${name}」积分已刷新 · 本次新增 ${fmt0(m.addedRows || 0)} 条 · ` +
+      `累计 ${fmt0(m.billRows || 0)} 条 · 耗时 ${secs}s`);
+    setSaveState('saved', `「${name}」积分已刷新 · ${secs}s`);
     return;
   }
 
@@ -3126,9 +3162,15 @@ const ServerSync = (() => {
     return null;
   }
 
-  /** 取服务状态（含服务端会扫描的本地会话目录）。结果缓存。 */
-  async function status(){
-    if(_status) return _status;
+  /**
+   * 取服务状态（含服务端会扫描的本地会话目录、各应用当前登录账号）。结果缓存。
+   *
+   * force=true 时绕过缓存重拉——**切换账号后必须用它**。缓存里的 currentByApp
+   * 是切换前的快照，不绕过就会拿旧值渲染，卡片右上角的图标（谁打了 ✓、谁可点）
+   * 看起来像"没刷新"。
+   */
+  async function status(force){
+    if(_status && !force) return _status;
     const b = await base();
     if(!b) return null;
     try{
@@ -3155,13 +3197,20 @@ const ServerSync = (() => {
   /**
    * 触发一次同步，返回服务端的执行结果。
    * part：'credits' 只刷积分 / 'tokens' 只扫本地 / 省略＝全量。
+   * uid：只刷这一个账号（仅 'credits' 有效，账号卡片上的「🔄 刷新」走这条）。
    */
-  async function run(part){
+  async function run(part, uid){
     const b = await base();
     if(!b) return { ok:false, error:'本地服务未启动：请先用「打开看板.bat」启动' };
     const url = (part === 'credits' || part === 'tokens') ? `${b}/api/sync/${part}` : `${b}/api/sync`;
     try{
-      const r = await fetch(url, { method: 'POST' });
+       // 不带 uid 时不设 Content-Type / body，避免多余的一次跨域预检
+      const body = uid ? JSON.stringify({ uid }) : null;
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: body ? { 'Content-Type': 'application/json' } : undefined,
+        body: body || undefined,
+      });
       const j = await r.json();
       return j || { ok:false, error:'服务返回空响应' };
     }catch(e){
@@ -3190,11 +3239,16 @@ const ServerSync = (() => {
   const travel  = (uid) => postJson('/api/travel',  uid ? { uid } : {});
 
   /**
-   * 切换某应用的登录账号。app：'workbuddy-desktop'（默认，会重启 WorkBuddy）
-   * 或 'coding-copilot'（CodeBuddy，切完需重开窗口）。
+   * 切换某应用的登录账号。app：'workbuddy-desktop'（默认）或 'codebuddy-cli'。
+   *
+   * restart 只对桌面端有意义——桌面端要让客户端重读登录态才生效，所以默认重启；
+   * CLI 写完即生效（实测无需重启），传 restart 也不会触发任何进程操作。
    */
-  const switchAccount = (uid, app = 'workbuddy-desktop', restart = true) =>
-    postJson('/api/switch', { uid, app, restart });
+  const switchAccount = (uid, app = 'workbuddy-desktop', restart) =>
+    postJson('/api/switch', {
+      uid, app,
+      restart: restart !== undefined ? restart : app === 'workbuddy-desktop',
+    });
 
   /** 各账号签到状态（只读，页面加载时拉一次）。 */
   async function checkinStatus(){
@@ -3570,7 +3624,9 @@ async function runServerSync(part, btn){
   const m = r.meta || {};
   const secs = (r.elapsedMs / 1000).toFixed(1);
   if(part === 'credits'){
-    toast(`积分已同步 · 账单 ${fmt0(m.billRows)} 条 · ${m.accounts} 个账号 · 耗时 ${secs}s`
+    // billRows 是「合并后累计」条数（窗口外的历史也在里面），不是本次拉到的量
+    toast(`积分已同步 · 本次新增 ${fmt0(m.addedRows || 0)} 条 · ` +
+      `累计账单 ${fmt0(m.billRows || 0)} 条 · ${m.accountCount || m.accounts} 个账号 · 耗时 ${secs}s`
       + ((m.errors && m.errors.length) ? `（${m.errors.length} 个账号失败）` : ''));
     setSaveState('saved', `积分已同步 · ${secs}s`);
   }else{
@@ -3627,7 +3683,8 @@ async function runServerSyncAll(btn){
 
   const secs = (done.reduce((a, r) => a + (r.elapsedMs || 0), 0) / 1000).toFixed(1);
   const cm = done[0].meta || {}, tm = done[1].meta || {};
-  toast(`一键同步完成 · 账单 ${fmt0(cm.billRows)} 条 / ${cm.accounts} 个账号 · ` +
+  toast(`一键同步完成 · 累计账单 ${fmt0(cm.billRows || 0)} 条 / ` +
+    `${cm.accountCount || cm.accounts} 个账号 · ` +
     `本地回合 ${fmt0(tm.turns)} · 耗时 ${secs}s` +
     ((cm.errors && cm.errors.length) ? `（${cm.errors.length} 个账号拉取失败）` : ''));
   setSaveState('saved', `一键同步完成 · ${secs}s`);
@@ -3791,7 +3848,6 @@ const Persist = (() => {
 
   const put   = snap => tx('readwrite', s => s.put(snap));
   const del   = id   => tx('readwrite', s => s.delete(id));
-  const clear = ()   => tx('readwrite', s => s.clear());
   const all   = ()   => tx('readonly',  s => s.getAll()).then(l =>
                         (l || []).sort((a,b) => b.savedAt - a.savedAt));
   const get   = id   => tx('readonly',  s => s.get(id));
@@ -3841,11 +3897,9 @@ const Persist = (() => {
 
   const loadMeta  = () => { try{ return JSON.parse(localStorage.getItem(LS_META) || '{}'); }catch(e){ return {}; } };
   const saveMeta  = obj => { try{ localStorage.setItem(LS_META, JSON.stringify({...loadMeta(), ...obj})); }catch(e){} };
-  const clearMeta = () => { try{ localStorage.removeItem(LS_META); }catch(e){} };
-
   return { saveAuto, saveManual, loadAuto, listManual,
-           del, clear, all, serialize, deserialize,
-           saveMeta, loadMeta, clearMeta, MAX_MANUAL };
+           del, all, serialize, deserialize,
+           saveMeta, loadMeta, MAX_MANUAL };
 })();
 
 function setSaveState(kind, text){
@@ -3932,7 +3986,7 @@ function applyDataset(rows, sheet, fileName){
 
   $('uploader').hidden = true;
   $('dash').hidden = false;
-  ['btnPrint','btnMd','btnCsv','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
+  ['btnPrint','btnMd','btnCsv','btnAppend','btnSnap','btnHist','saveDot']
     .forEach(id => { const el = $(id); if(el) el.hidden = false; });
 
   // 无条件重算 token 关联：覆盖「首次导入 / 追加合并 / 快照恢复」全部路径
@@ -3979,16 +4033,17 @@ async function mergeOfficialBill(){
   const off = OfficialBill.rows();
   if(!off.length) return false;
 
-  const before = state.all.length;
   const res = mergeByRequestId(state.all, off);
   applyDataset(res.rows, state.sheetName, state.fileName || '官方账单（自动同步）');
 
   const m = OfficialBill.meta();
   if(m){
+    // 三个数必须分清：res.rows.length 是「合并后的数据集总行数」（含手工导入的
+    // Excel），m.billRows 才是官方账单累计条数，m.addedRows 是本次拉到的增量。
+    // 早先把 res.rows.length 写成「官方账单已同步 N 条」，会被读成「这次拉了 N 条」。
     setSaveState('saved',
-      `官方账单已同步 ${fmt0(res.rows.length)} 条` +
-      (before ? `（新增 ${fmt0(res.added)}）` : '') +
-      ` · 窗口 ${m.windowDays} 天 · ${m.accountCount} 个账号`);
+      `官方账单已同步 · 本次新增 ${fmt0(m.addedRows || 0)} 条 · ` +
+      `累计 ${fmt0(m.billRows || res.rows.length)} 条 · ${m.accountCount || 0} 个账号`);
     if(m.errors && m.errors.length){
       toast(`官方账单已同步，但有 ${m.errors.length} 个账号拉取失败，详见脚本输出`);
     }
@@ -4294,32 +4349,6 @@ async function loadFile(file){
     $('fileInput').click();
   });
 
-  /* ★ 修改：清空重来 */
-  $('btnReset').addEventListener('click', () => {
-    if(!confirm(
-      '确定要清空当前数据集吗？\n\n' +
-      '· 页面上的合并结果会被清空\n' +
-      '· 本地自动快照保留，可从「📂 历史」恢复\n' +
-      '· 如果你只是想追加新文件，请点「➕ 追加数据」'
-    )) return;
-
-    Object.values(state.charts).forEach(c => c.destroy());
-    state.charts = {};
-    state.all = [];
-    state.filters.models.clear();
-    state.filters.clients.clear();
-    state.filters.from = '';
-    state.filters.to   = '';
-    $('uploader').hidden = false;
-    $('dash').hidden = true;
-    $('banner').hidden = true;
-    $('mergeInfo').classList.remove('show');
-    ['btnPrint','btnMd','btnCsv','btnReset','btnAppend','btnSnap','btnHist','btnWipe','saveDot']
-      .forEach(id => { const el = $(id); if(el) el.hidden = true; });
-    $('srcName').textContent = '';
-    window.scrollTo({top:0, behavior:'smooth'});
-  });
-
   $('btnSnap').addEventListener('click', async () => {
     if(!state.all.length){ toast('当前无数据'); return; }
     const note = prompt('为这份手动快照写个备注（可留空）：', '') || '';
@@ -4331,13 +4360,6 @@ async function loadFile(file){
   });
 
   $('btnHist').addEventListener('click', openHistory);
-
-  $('btnWipe').addEventListener('click', async () => {
-    if(!confirm('将删除浏览器中保存的所有快照（自动 + 手动）与筛选记录。\n\n当前页面数据不受影响，确定继续？')) return;
-    await Persist.clear();
-    Persist.clearMeta();
-    toast('已清空本地缓存');
-  });
 
   /* 「⋯ 更多」下拉菜单：点按钮开合，点页面别处或 Esc 收起 */
   (() => {

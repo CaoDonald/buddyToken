@@ -1198,13 +1198,14 @@ function findWorkbuddyExe() {
 /**
  * 切换某应用的登录账号。
  *
- * app = 'workbuddy-desktop'（WorkBuddy 桌面端）或 'coding-copilot'（CodeBuddy 插件宿主）。
+ * app = 'workbuddy-desktop'（WorkBuddy 桌面端）或 'codebuddy-cli'（CodeBuddy CLI）。
  *
  * 流程对齐官方客户端自身行为：备份当前 <app>.info → 把目标账号在该 app 的
  * 最新快照**整份原样**写回（不重建字段——快照里的加密信封、sso、deployStatus
  * 等官方结构一律不动，重建反而会毁掉登录态）→ 写后校验 → 可选重启 WorkBuddy。
  *
- * 仅桌面端支持自动重启（关进程→写→拉起）；CodeBuddy 切换后提示重新打开窗口。
+ * 仅桌面端需要自动重启（关进程→写→拉起）；CLI 侧每次请求都重新读登录态，
+ * 写完即生效，不必重启（实测：连正在跑的会话也直接用新账号）。
  * 目标账号必须在目标应用登录过（有快照）才可切换——token 域不同
  * （workbuddy.cn 与 codebuddy.cn），跨 app 借用快照会被网关拒。
  *
@@ -1300,10 +1301,9 @@ function switchAppAccount(app, uid, { restart = false } = {}) {
 
     return {
       ok: true, uid, name: target.name, backup: backupPath, restarted: false,
-      // 无感切换：不动运行中的进程。CLI 启动时才读登录态，当前会话仍用旧账号，
-      // 新开的 CLI 会话自动用新账号（与 workbuddySwitch 的「关进程强制生效」不同，
-      // 这里选择不打断用户正在跑的会话，代价是生效要等下次启动）
-      message: '已切换。正在运行的 CLI 会话仍用原账号，新开的 CLI 会话将使用新账号',
+      // 无感切换：不动任何进程。CLI 每次请求都重新读登录态，写完即生效——
+      // 连正在跑的会话也直接用新账号，所以这里不重启也不打断
+      message: '已切换，CLI 立即生效（无需重启）',
     };
   } catch (e) {
     return { ok: false, error: '切换失败：' + e.message, backup: backupPath };

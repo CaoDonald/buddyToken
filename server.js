@@ -136,15 +136,20 @@ function readDataMeta() {
     const m = text.match(/window\.__TOKEN_DATA__=(\{[\s\S]*\});?\s*$/);
     if (!m) return null;
     const d = JSON.parse(m[1]);
+    const off = d.official || {};
     return {
       generatedAt: d.gen || null,
       turns: (d.meta && d.meta.turns) || 0,
       reqs: (d.meta && d.meta.reqs) || 0,
+      // accounts＝有余额快照的账号数；accountCount＝本机发现的账号总数（后者更全，
+      // 某个账号余额查询失败时它仍有余额以外的信息）。页面描述「几个账号」用后者。
       accounts: Array.isArray(d.acct) ? d.acct.length : 0,
-      billRows: d.official ? d.official.billRows : (Array.isArray(d.bill) ? d.bill.length : 0),
-      creditTotal: d.official ? d.official.creditTotal : null,
-      windowDays: d.official ? d.official.windowDays : null,
-      errors: (d.official && d.official.errors) || [],
+      accountCount: off.accountCount || (Array.isArray(d.acct) ? d.acct.length : 0),
+      billRows: off.billRows || (Array.isArray(d.bill) ? d.bill.length : 0),
+      addedRows: off.addedRows || 0,
+      creditTotal: off.creditTotal != null ? off.creditTotal : null,
+      windowDays: off.windowDays != null ? off.windowDays : null,
+      errors: off.errors || [],
     };
   } catch {
     return null;
@@ -161,12 +166,16 @@ function readDataMeta() {
  *
  * 用子进程而不是把主脚本 require 进来——脚本本身是 CLI 入口，
  * 子进程方式能保证行为与手动跑完全一致，也不怕它内部 process.exit()。
+ *
+ * uid 非空时只刷新该账号（仅对 'credits' 有意义）。值是「字母数字下划线连字符」，
+ * 由 handleSync 先行校验——execFile 本就不经 shell，这里再加一道是纵深防御。
  */
-function runSync(part) {
+function runSync(part, uid) {
   return new Promise((resolve) => {
     const started = Date.now();
     const args = [path.join(ROOT, 'token-usage-report.js'), '--emit-js'];
     if (part === 'credits' || part === 'tokens') args.push('--only=' + part);
+    if (uid) args.push('--uid=' + uid);
 
     execFile(
       process.execPath,
@@ -175,9 +184,12 @@ function runSync(part) {
       (err, stdout, stderr) => {
         const elapsedMs = Date.now() - started;
         if (err) {
+          // 脚本自己的报错（如「账号 xxx 刷新失败，数据文件保持不变。」）都在
+          // stderr 里，比 execFile 那句 "Command failed: …" 有用得多，优先透出
+          const lastErr = (stderr || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
           resolve({
             ok: false, elapsedMs, part: part || 'all',
-            error: err.killed ? '同步超时' : (err.message || String(err)),
+            error: err.killed ? '同步超时' : (lastErr || err.message || String(err)),
             output: (stdout || '').slice(-4000),
             stderr: (stderr || '').slice(-2000),
           });
@@ -204,9 +216,22 @@ async function handleSync(req, res) {
     json(res, 409, { ok: false, error: '已有同步进行中，请稍候' });
     return;
   }
+
+  // body 可选：{ uid } 表示只刷新该账号（看板账号卡片上的「刷新」按钮）
+  const body = await readBody(req);
+  const uid = String(body.uid || '').trim();
+  if (uid && !/^[0-9a-zA-Z_-]{1,64}$/.test(uid)) {
+    json(res, 400, { ok: false, error: 'uid 格式不合法' });
+    return;
+  }
+  if (uid && part !== 'credits') {
+    json(res, 400, { ok: false, error: '只支持「只刷积分」时指定 uid' });
+    return;
+  }
+
   syncing = true;
   try {
-    const result = await runSync(part === 'all' ? undefined : part);
+    const result = await runSync(part === 'all' ? undefined : part, uid);
     json(res, result.ok ? 200 : 500, result);
   } catch (e) {
     json(res, 500, { ok: false, error: e.message });
@@ -342,7 +367,9 @@ async function handleSwitch(req, res) {
     return;
   }
   const app = String(body.app || 'workbuddy-desktop').trim();
-  const restart = body.restart !== false;   // 默认重启（不重启登录态可能不被客户端重读）
+  // 默认重启：桌面端要重启才会重读登录态。CLI 不受此影响——switchAppAccount
+  // 内部按 app 判断，非桌面端不触碰任何进程（写完即生效）
+  const restart = body.restart !== false;
 
   switching = true;
   try {
