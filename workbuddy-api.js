@@ -57,6 +57,15 @@ const PAGE_SIZE = 3000;
 const MAX_WINDOW_DAYS = 30;
 /** 分页推进的安全上限，防御服务端异常导致的死循环。 */
 const MAX_ROUNDS = 100;
+/**
+ * 账单窗口的并发路数。
+ *
+ * 首次同步（或刚清过数据）要拉满一年，会切成十几个窗口；串行时每个窗口一次
+ * 往返，是这块耗时的主要来源，并发把它们压成 N/4 轮。取 4 是留余量：本机曾
+ * 出现过 429（见 rate-limits.js），而这里是同一账号连续打同一接口。
+ * 账号之间仍是串行，所以「同时在飞的请求数」始终不超过这个值。
+ */
+const BILLING_CONCURRENCY = 4;
 
 /** 官方客户端使用的套餐码清单（多带不存在的码无副作用）。 */
 const PAID_PACKAGE_CODES = [
@@ -467,6 +476,21 @@ async function refreshAccount(acct) {
 }
 
 /**
+ * 同一账号的刷新去重：并发拉账单时多个窗口可能同时撞上 401，
+ * 各自去刷新会让先刷出来的那份 refresh token 立刻作废（见 authedPost 注释）。
+ * 把同一账号的刷新收敛成一个 Promise，后到的调用直接复用结果。
+ */
+const _refreshInflight = new Map();
+function refreshAccountOnce(acct) {
+  const key = acct.uid || acct.accessToken || '';
+  const hit = _refreshInflight.get(key);
+  if (hit) return hit;
+  const p = refreshAccount(acct).finally(() => _refreshInflight.delete(key));
+  _refreshInflight.set(key, p);
+  return p;
+}
+
+/**
  * 带认证的 POST：遇到未授权自动刷新一次并重试。
  *
  * 返回 `{ json, account }`——`account` 可能是刷新后的新凭证，
@@ -477,7 +501,7 @@ async function authedPost(acct, p, body) {
   let json = await postOnce(working, p, body);
 
   if (isUnauthorized(json) && working.refreshToken) {
-    const refreshed = await refreshAccount(working);
+    const refreshed = await refreshAccountOnce(working);
     if (refreshed) {
       working = refreshed;
       json = await postOnce(working, p, body);
@@ -564,6 +588,15 @@ async function fetchBilling(acct, startDate, endDate, onProgress) {
 /**
  * 拉取多个账号的账单，按窗口上限自动切分时间段。
  *
+ * 窗口之间互不依赖（每个窗口都是一次独立的区间查询），所以同一账号的窗口
+ * 按 BILLING_CONCURRENCY 路并发拉取——不改变结果，只把 N 次串行往返压成
+ * N/4 轮。账号之间保持串行，`all` 里的行序仍是「账号 → 窗口（由旧到新）」。
+ *
+ * 某个窗口失败时只记进 errors 并跳过它，不再像串行版那样中断该账号的后续
+ * 窗口：并发下其余窗口早已发出，中断没有意义，尽力而为反而能多拿回数据。
+ *
+ * onProgress 是单个窗口内部的局部进度（并发下会交错回调），仅用于观察。
+ *
  * 返回 `{ byAccount, all, errors }`，`all` 是合并后的明细（带 accountKey 标注）。
  */
 async function fetchBillingForAccounts(accounts, sinceMs, onProgress) {
@@ -573,19 +606,35 @@ async function fetchBillingForAccounts(accounts, sinceMs, onProgress) {
 
   const end = Date.now();
   for (const acct of accounts) {
-    const collected = [];
     // 窗口切分：服务端对超过约 31 天的窗口直接返回空
-    let cursor = sinceMs;
-    while (cursor < end) {
+    const windows = [];
+    for (let cursor = sinceMs; cursor < end;) {
       const windowEnd = Math.min(cursor + MAX_WINDOW_DAYS * 86400000, end);
-      const r = await fetchBilling(acct, cursor, windowEnd, onProgress);
-      if (!r.ok) {
-        errors.push({ account: acct.name, uid: acct.uid, error: r.error });
-        break;
-      }
-      collected.push(...r.rows);
+      windows.push([cursor, windowEnd]);
       cursor = windowEnd + 1000;
     }
+
+    // results 按下标回填，避免并发完成的先后打乱顺序
+    const results = new Array(windows.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < windows.length) {
+        const i = next++;
+        const [ws, we] = windows[i];
+        const r = await fetchBilling(acct, ws, we, onProgress);
+        if (!r.ok) {
+          errors.push({ account: acct.name, uid: acct.uid, error: r.error });
+          continue;
+        }
+        results[i] = r.rows;
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(BILLING_CONCURRENCY, windows.length) }, worker)
+    );
+
+    const collected = [];
+    for (const rows of results) if (rows && rows.length) collected.push(...rows);
     byAccount.set(acct.uid, collected);
     for (const row of collected) {
       all.push({ ...row, uid: acct.uid, account: acct.name });

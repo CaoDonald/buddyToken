@@ -240,6 +240,45 @@ async function handleSync(req, res) {
   }
 }
 
+/**
+ * 清空所有数据：跑一次 token-usage-report.js --reset。
+ *
+ * 与同步共用同一把锁——清空删的正是同步在写的那些文件，并发跑会出现
+ * 「刚写完又被删掉」的竞态。删除清单由脚本侧维护（固定文件名白名单），
+ * 这里只负责触发与回报，不自己拼路径，免得两边清单跑偏。
+ *
+ * 不动 switch-backups/ 账号凭证备份，也不碰 ~/.workbuddy 下的原始会话记录。
+ * 看板侧的快照存在浏览器里，需要页面自己清（见页面里的清空流程）。
+ */
+function handleReset(req, res) {
+  if (syncing) {
+    json(res, 409, { ok: false, error: '已有同步进行中，请稍候再清空' });
+    return;
+  }
+  syncing = true;
+  execFile(
+    process.execPath,
+    [path.join(ROOT, 'token-usage-report.js'), '--reset'],
+    { cwd: ROOT, timeout: 30 * 1000, maxBuffer: 1024 * 1024 },
+    (err, stdout, stderr) => {
+      syncing = false;
+      const out = stdout || '';
+      // 脚本每删掉一个文件就打印一行「  ✓ 文件名」，据此回报给页面
+      const removed = [...out.matchAll(/✓\s*(.+)/g)].map((m) => m[1].trim());
+      if (err) {
+        const lastErr = (stderr || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
+        json(res, 500, {
+          ok: false,
+          error: err.killed ? '清空超时' : (lastErr || err.message || String(err)),
+          output: out.slice(-2000),
+        });
+        return;
+      }
+      json(res, 200, { ok: true, removed, output: out.slice(-2000) });
+    }
+  );
+}
+
 /** 读取 POST 的 JSON body（体积很小，够用即可）。 */
 function readBody(req) {
   return new Promise((resolve) => {
@@ -429,6 +468,7 @@ const server = http.createServer((req, res) => {
 
   const pathname = req.url.split('?')[0];
   if (pathname.startsWith('/api/sync') && req.method === 'POST') return handleSync(req, res);
+  if (pathname === '/api/reset' && req.method === 'POST') return handleReset(req, res);
   if (pathname === '/api/checkin' && req.method === 'POST') return handleCheckin(req, res);
   if (pathname === '/api/checkin-status') return handleCheckinStatus(req, res);
   if (pathname === '/api/travel' && req.method === 'POST') return handleTravel(req, res);

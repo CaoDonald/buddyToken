@@ -36,6 +36,7 @@
  *   node token-usage-report.js --emit-js --no-merge # 关闭增量合并，纯全量覆盖
  *   node token-usage-report.js --emit-js --only=credits            # 只刷官方账单与积分余额
  *   node token-usage-report.js --emit-js --only=credits --uid <uid> # 只刷某个账号（看板卡片上的刷新）
+ *   node token-usage-report.js --reset             # 清空所有数据（删除本脚本产出的数据文件）
  *
  * 看板数据是「增量合并」写入的（默认）
  *   生成前会读取已有的 token-usage-data.js，把历次同步过、但本次本地已扫不到的
@@ -43,9 +44,19 @@
  *   同名回合以本次扫描为准（正在进行的会话会在后续同步里被补齐）。
  *   想丢弃历史、只保留本次扫描结果，加 --no-merge。
  *
+ * 清空数据（--reset）
+ *   删除本脚本产出的全部数据文件，回到「从未同步过」的状态：
+ *     token-usage-data.js / token-usage-detail.csv / token-usage-summary.md
+ *     credit-history.json（余额趋势）/ checkin-history.json（签到纪录）
+ *   只按这份固定清单删除，不使用通配符。以下内容不受影响：
+ *     · switch-backups/ —— 账号切换的凭证备份，删了就没法回滚
+ *     · 手工导入的 *.xlsx 账单、项目里其它任何文件
+ *     · ~/.workbuddy、~/.codebuddy 下的原始 jsonl 会话记录（不属于本项目）
+ *   清除后重新同步即可再生成；看板侧的浏览器快照需在看板里单独清空。
+ *
  * 官方账单拉取窗口
  *   默认跟随 --days（兜底 7 天）。已有数据里账单一条都没有时视为「初始化」，
- *   自动改为一次性拉全部历史（近 3 年，30 天窗口由 API 层自动切分），之后的
+ *   自动改为一次性拉全部历史（近 1 年，30 天窗口由 API 层自动切分），之后的
  *   同步回到常规窗口只做增量。--official-days 显式指定时优先于以上规则。
  *
  * 回合（turn）口径
@@ -457,6 +468,11 @@ function buildTokenDataJs(reqs, light, titles) {
 /**
  * 读取已有的 token-usage-data.js，用于增量合并。
  * 文件不存在、被截断、或格式不对都返回 null（当作首次生成）。
+ *
+ * 注意这里不校验 t 是否存在：`--only=credits` 允许在数据文件缺失时从空骨架
+ * 起步（见 syncCreditsOnly），那一步的产物可能只有官方字段。若因缺 t 就判为
+ * 无效，紧随其后的 `--only=tokens` 会读不到这些账单，把刚拉回来的官方数据
+ * 整块丢掉。需要 t 的调用方自行判空（如 main 里的增量合并用 `old.t || {}`）。
  */
 function loadExistingTokenData(file) {
   try {
@@ -465,7 +481,7 @@ function loadExistingTokenData(file) {
     const j = raw.lastIndexOf('}');
     if (i < 0 || j <= i) return null;
     const d = JSON.parse(raw.slice(i, j + 1));
-    return d && d.t && typeof d.t === 'object' ? d : null;
+    return d && typeof d === 'object' ? d : null;
   } catch {
     return null;
   }
@@ -705,10 +721,14 @@ function mergeOfficialData(prev, fresh, canMerge, partialUid) {
  * 「初始化」＝已有数据文件里账单一条都没有（首次生成、--no-official 离线首跑、
  * 或官方同步一直失败）。此时若仍按默认 7 天拉，窗口外的历史账单永远不会被补回
  * ——增量合并只保留已经拉到的行，没拉到的等于永久丢失。所以初始化时一次拉全量：
- * 窗口取 3 年，足以覆盖产品上线以来的全部历史；服务端「窗口 >31 天返回空」的
- * 限制由 workbuddy-api.js 按 30 天自动切分兜住。之后每次同步只需拉最近几天做增量。
+ * 窗口取 1 年，足以覆盖本机有记录以来的账单；服务端「窗口 >31 天返回空」的
+ * 限制由 workbuddy-api.js 按 30 天自动切分兜住（1 年 ≈ 13 段，乘以账号数就是
+ * 首次同步要发的请求数，直接决定耗时；3 年要 37 段，正是 28 秒的来源）。
+ * 之后每次同步只需拉最近几天做增量。
+ * 要补更早的账单，用 --official-days 显式指定更大的窗口（只此一次，拉回来的
+ * 行会被增量合并保留下来）。
  */
-const FULL_HISTORY_DAYS = 365 * 3;
+const FULL_HISTORY_DAYS = 365;
 
 /**
  * 官方数据拉取窗口：优先显式参数；账单还是空的（初始化）时取全量窗口；
@@ -747,8 +767,10 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid }) {
   // 继续往下走，让 resolveOfficialDays 自动改拉全部历史（见其注释里的 null 分支）。
   // 本地 Token 部分由紧随其后的「🔄 同步 Token」补上——看板的「⚡ 一键同步」正是
   // 「先积分后 Token」两步串行，所以首次点它一次就能拿到完整数据。
+  // 骨架里的 t / ti 不能省：第二步「🔄 同步 Token」要靠读这个文件把官方字段带
+  // 回去，而它按「有没有 t 判断是不是有效数据文件」，缺了就会把账单整块丢掉。
   const existing = loadExistingTokenData(jsPath);
-  const data = existing || { meta: { turns: 0 } };
+  const data = existing || { meta: { turns: 0 }, ti: {}, t: {} };
 
   // 已有账单一条都没有＝初始化：自动改拉全部历史，之后的同步再回到常规窗口
   const officialDays = resolveOfficialDays(args, days, data);
@@ -798,6 +820,59 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid }) {
 
 // ---------------------------------------------------------------- 主流程
 
+/**
+ * 清空数据：删除本脚本产出的数据文件（清单见文件头「清空数据」一节）。
+ *
+ * 只删下面这份固定清单，不做通配符匹配、不递归删目录——清空是破坏性操作，
+ * 宁可漏删也不误删。清单外的文件一律不碰。
+ *
+ * 路径基准是 outdir（默认脚本所在目录，与 --emit-js 的产出一致）。
+ */
+function resetDataFiles(outdir, jsOut) {
+  const jsName = jsOut || 'token-usage-data.js';
+  const targets = [
+    path.isAbsolute(jsName) ? jsName : path.join(outdir, jsName),
+    path.join(outdir, 'token-usage-detail.csv'),
+    path.join(outdir, 'token-usage-summary.md'),
+    path.join(outdir, 'credit-history.json'),
+    path.join(outdir, 'checkin-history.json'),
+  ];
+
+  const removed = [], missing = [];
+  let bytes = 0;
+  for (const f of targets) {
+    let size = 0;
+    try {
+      size = fs.statSync(f).size;
+    } catch {
+      missing.push(f);              // 本来就不存在：跳过，不算失败
+      continue;
+    }
+    try {
+      fs.rmSync(f, { force: true });
+      removed.push(path.basename(f));
+      bytes += size;
+    } catch (e) {
+      console.error(`  删除失败：${path.basename(f)} —— ${e.message}`);
+      process.exitCode = 1;
+    }
+  }
+
+  if (removed.length) {
+    console.log(`已清空 ${removed.length} 个数据文件（释放 ${(bytes / 1048576).toFixed(1)} MB）：`);
+    for (const n of removed) console.log('  ✓ ' + n);
+  } else {
+    console.log('没有可清空的数据文件（本来就没同步过）。');
+  }
+  if (missing.length) {
+    console.log(`  跳过 ${missing.length} 个不存在的文件：` +
+      missing.map((f) => path.basename(f)).join('、'));
+  }
+  console.log('  保留：switch-backups/ 账号备份、手工导入的 Excel、' +
+    '原始会话记录（~/.workbuddy、~/.codebuddy 未改动）。');
+  console.log('  重新同步即可再生成这些数据文件。');
+}
+
 async function main() {
   let args;
   try {
@@ -814,6 +889,7 @@ async function main() {
         'official-days': { type: 'string' },
         only: { type: 'string' },
         uid: { type: 'string' },
+        reset: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
       },
     }).values;
@@ -848,6 +924,14 @@ async function main() {
   if (uid && only !== 'credits') {
     console.error('--uid 只能与 --only=credits 一起使用（只刷新单个账号的积分）');
     process.exit(1);
+  }
+
+  // 清空：只删数据文件，不扫描也不生成。放在 mkdirSync 之前短路，
+  // 这样清空不会顺手把目录建出来，也不受 --only / --days 等参数影响。
+  if (args.reset) {
+    console.log('== 清空数据 ==');
+    resetDataFiles(outdir, args['js-out']);
+    return;
   }
 
   fs.mkdirSync(outdir, { recursive: true });
@@ -965,7 +1049,8 @@ async function main() {
     if (!args['no-merge']) {
       const old = prev;
       if (old) {
-        for (const [k, v] of Object.entries(old.t)) {
+        // old.t 可能不存在（旧文件由 --only=credits 从空骨架写出），按空表处理
+        for (const [k, v] of Object.entries(old.t || {})) {
           if (data.t[k]) continue;
           data.t[k] = v;
           kept++;

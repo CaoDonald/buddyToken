@@ -65,6 +65,10 @@ body{
 }
 .menu-item:hover:not(:disabled){background:#f2f5fc}
 .menu-item:disabled{opacity:.55;cursor:default}
+/* 清空数据：破坏性操作，用分隔线与上方功能隔开并标红，避免误点 */
+.menu-sep{height:1px;background:var(--line);margin:6px 4px}
+.menu-item.danger{color:var(--danger)}
+.menu-item.danger:hover:not(:disabled){background:#fdf1f2}
 
 /* GitHub 仓库入口：右上角纯图标，与主流开源项目的位置一致 */
 .gh-link{
@@ -432,6 +436,8 @@ table.cal td.cal-cell.has:hover{
         <button class="menu-item" id="btnPrint" hidden title="打印当前看板，或另存为 PDF（浏览器打印时会自动隐藏按钮和输入框）">🖨 打印 / PDF</button>
         <button class="menu-item" id="btnMd" hidden title="导出分析报告为 Markdown 文件，可直接贴到文档或提交到仓库">⬇ Markdown</button>
         <button class="menu-item" id="btnCsv" hidden title="导出聚合维度的汇总表：模型 / 客户端 / 日期 / 时段 / 工具。要逐条明细请用「完整明细」卡片里的导出">⬇ CSV</button>
+        <div class="menu-sep"></div>
+        <button class="menu-item danger" id="btnReset" title="清空全部数据：项目目录里的数据文件（Token 数据、账单明细、报告、余额与签到历史）以及浏览器里的本地快照与目录授权。清空后重新同步即可再生成。不可撤销，会连续确认两次">🗑 一键清空数据</button>
       </div>
     </div>
     <a class="gh-link" href="https://github.com/CaoDonald/buddyToken" target="_blank" rel="noopener noreferrer"
@@ -3239,6 +3245,13 @@ const ServerSync = (() => {
   const travel  = (uid) => postJson('/api/travel',  uid ? { uid } : {});
 
   /**
+   * 清空项目目录里的数据文件（服务端跑 token-usage-report.js --reset）。
+   * 返回 { ok, removed:[文件名] }。浏览器侧的快照由调用方一并清掉——
+   * 两处数据必须一起清，只清一边会出现「文件没了页面还显示旧数据」。
+   */
+  const reset = () => postJson('/api/reset', {});
+
+  /**
    * 切换某应用的登录账号。app：'workbuddy-desktop'（默认）或 'codebuddy-cli'。
    *
    * restart 只对桌面端有意义——桌面端要让客户端重读登录态才生效，所以默认重启；
@@ -3279,7 +3292,7 @@ const ServerSync = (() => {
     }
   }
 
-  return { available, status, scanDirs, run, checkin, travel, checkinStatus, limits, switchAccount };
+  return { available, status, scanDirs, run, checkin, travel, checkinStatus, limits, switchAccount, reset };
 })();
 
 /* =========================================================
@@ -3897,9 +3910,21 @@ const Persist = (() => {
 
   const loadMeta  = () => { try{ return JSON.parse(localStorage.getItem(LS_META) || '{}'); }catch(e){ return {}; } };
   const saveMeta  = obj => { try{ localStorage.setItem(LS_META, JSON.stringify({...loadMeta(), ...obj})); }catch(e){} };
+
+  /**
+   * 清空本模块的全部持久化：自动槽、手动槽、元信息（含筛选条件）。
+   *
+   * 只清 store 里的数据、不删库本身——已打开的连接会让 deleteDatabase 处于
+   * blocked 状态而静默失败，留着空库反而更可控（库名不是数据）。
+   */
+  const clear = async () => {
+    await tx('readwrite', s => s.clear());
+    try{ localStorage.removeItem(LS_META); }catch(e){ /* 隐私模式下可能不可用 */ }
+  };
+
   return { saveAuto, saveManual, loadAuto, listManual,
            del, all, serialize, deserialize,
-           saveMeta, loadMeta, MAX_MANUAL };
+           saveMeta, loadMeta, clear, MAX_MANUAL };
 })();
 
 function setSaveState(kind, text){
@@ -4138,6 +4163,70 @@ async function openHistory(){
 }
 
 /* =========================================================
+ * 13.5 一键清空
+ *
+ * 数据分两处存放，清空必须两边一起清：
+ *   · 项目目录里的数据文件（Token 数据 / 明细 CSV / 报告 / 余额与签到历史）
+ *     —— 由本地服务跑 token-usage-report.js --reset 删除；
+ *   · 浏览器里的本地快照（IndexedDB）、筛选元信息（localStorage）、
+ *     已授权的会话目录句柄 —— 只能在页面里清。
+ * 只清一边会出问题：文件没了页面还显示旧数据，或页面空了下次同步数据又回来。
+ *
+ * 清完直接 reload：把内存里的 state、图表、已打开的 IndexedDB 连接全部推倒
+ * 重来，比逐个复位可靠得多（reload 后自动槽已空，看板自然回到初始上传界面）。
+ *
+ * 不可撤销，所以两道确认：先 confirm 列清楚范围，再要求手动输入「清空」。
+ * =======================================================*/
+async function resetAllData(){
+  const hasServer = await ServerSync.available();
+
+  const scope = hasServer
+    ? '· 项目目录里的数据文件：Token 数据、明细 CSV、Markdown 报告、余额与签到历史\n'
+      + '· 浏览器里的本地快照、筛选条件和已授权的会话目录'
+    : '· 浏览器里的本地快照、筛选条件和已授权的会话目录\n'
+      + '  （项目目录里的数据文件需要本地服务才能删除，本次无法清空）';
+
+  if(!confirm('确定要清空所有数据吗？\n\n' + scope + '\n\n'
+    + '⚠ 此操作不可撤销。\n'
+    + '不受影响：switch-backups/ 账号备份、手工导入的 Excel、'
+    + '原始会话记录（~/.workbuddy、~/.codebuddy）。')) return;
+
+  if(prompt('最后确认：请输入「清空」两个字，再点确定。') !== '清空'){
+    toast('已取消清空');
+    return;
+  }
+
+  const btn = $('btnReset');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ 清空中…';
+
+  let removed = [];
+  if(hasServer){
+    const r = await ServerSync.reset();
+    if(!r.ok){
+      btn.disabled = false;
+      btn.textContent = label;
+      toast('清空数据文件失败：' + (r.error || '未知错误'));
+      return;
+    }
+    removed = r.removed || [];
+  }
+
+  try{ await Persist.clear(); }catch(e){ console.warn('[Persist] 清空失败', e); }
+  try{ await LocalScan.clear(); }catch(e){ console.warn('[LocalScan] 清空失败', e); }
+
+  // 用 alert 而不是 toast：reload 会把 toast 一起冲掉，这里需要用户先看到结果
+  alert(hasServer
+    ? `已清空：${removed.length} 个数据文件 + 浏览器本地快照。\n\n`
+      + '重新同步即可再生成。点「确定」后看板重新加载，回到初始状态。'
+    : '已清空浏览器本地快照。\n\n'
+      + '项目目录里的数据文件没能清空——需先用「打开看板.bat」启动本地服务，再执行一次。\n'
+      + '点「确定」后看板重新加载。');
+  location.reload();
+}
+
+/* =========================================================
  * 14. 文件导入（合并）
  * =======================================================*/
 async function loadFile(file){
@@ -4258,6 +4347,9 @@ async function loadFile(file){
     download(`积分汇总_${state.filters.from}_${state.filters.to}.csv`,
       buildCSV(d), 'text/csv');
   });
+
+  /* 🗑 一键清空：数据为空时也能点——清的是文件与快照，与当前是否载入数据无关 */
+  $('btnReset').addEventListener('click', resetAllData);
 
   /* ---- 每日汇总：点表头排序 ---- */
   $('tblDay').addEventListener('click', e => {
