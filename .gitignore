@@ -14,6 +14,9 @@ switch-backups/
 *.xlsx
 *.xls
 
+# 打包产物（发给别人用的压缩包，不入库）
+*.zip
+
 # 临时调研脚本
 _probe*.js
 _check*.js
