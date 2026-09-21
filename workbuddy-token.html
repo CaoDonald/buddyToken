@@ -836,7 +836,7 @@ const state = {
   serverStatus: null,     // /api/status 缓存（switchable 账号列表等）
   rank: { sort:'perPoint', dir:'desc' },  // 模型性价比卡的表头排序
   sess: { sort:'pts', dir:'desc' },       // Session 消耗卡的表头排序
-  day:  { sort:'date', dir:'asc' }        // 每日汇总卡的表头排序（默认时间正序）
+  day:  { sort:'date', dir:'desc' }       // 每日汇总卡的表头排序（默认时间倒序，最新在上）
 };
 
 /* =========================================================
@@ -2796,7 +2796,8 @@ function buildMarkdown(d){
   L.push(`| 日期 | 星期 | 积分 | 请求数 | 均值 |`);
   L.push(`|:--|:--|--:|--:|--:|`);
   const wd = ['一','二','三','四','五','六','日'];
-  s.byDate.forEach(x => {
+  // byDate 在源头是正序（图表要用），这里只对副本倒序，最新日期排在最上面
+  [...s.byDate].reverse().forEach(x => {
     const dow = wd[(parseDs(x.key).getDay() + 6) % 7];
     L.push(`| ${x.key} | ${dow} | ${fmt2(x.sum)} | ${x.count} | ${fmt2(x.sum/x.count)} |`);
   });
@@ -2885,7 +2886,8 @@ function buildCSV(d){
     (x.sum/s.total*100).toFixed(2)+'%', x.count, (x.sum/x.count).toFixed(3), ...tkCols(x)]));
   s.byClient.forEach(x => rows.push(['客户端', x.key, x.sum.toFixed(2),
     (x.sum/s.total*100).toFixed(2)+'%', x.count, (x.sum/x.count).toFixed(3), ...tkCols(x)]));
-  s.byDate.forEach(x => rows.push(['日期', x.key, x.sum.toFixed(2),
+  // 与看板一致：每日明细按日期倒序输出（byDate 源为正序，只倒副本）
+  [...s.byDate].reverse().forEach(x => rows.push(['日期', x.key, x.sum.toFixed(2),
     (x.sum/s.total*100).toFixed(2)+'%', x.count, (x.sum/x.count).toFixed(3), ...tkCols(x)]));
   // 工具维度没有积分归属（一个回合内多个工具共享一次计费），积分列留空
   s.byTool.slice(0, 20).forEach(x => rows.push(['工具', x.key, '', '', x.steps, '',
@@ -4360,8 +4362,8 @@ async function loadFile(file){
       state.day.dir = state.day.dir === 'desc' ? 'asc' : 'desc';
     }else{
       state.day.sort = k;
-      // 换一列时给个符合直觉的默认方向：数值列先看最大的，文本列按字面正序
-      state.day.dir = (k === 'date' || k === 'model') ? 'asc' : 'desc';
+      // 换一列时给个符合直觉的默认方向：数值列与日期列先看最大的/最新的，模型列按字面正序
+      state.day.dir = (k === 'model') ? 'asc' : 'desc';
     }
     renderTables(getFiltered());
   });
