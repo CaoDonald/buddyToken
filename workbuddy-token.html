@@ -154,6 +154,11 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .ck-cell.on{background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent}
 .ck-meta{font-size:11px;color:var(--muted);white-space:nowrap}
 .ck-meta b{color:var(--text);font-weight:600}
+/* 今日 / 昨日消耗：跟在签到行右侧 */
+.ck-spend{display:flex;gap:14px;margin-left:auto;font-size:11px;color:var(--muted);
+  white-space:nowrap;cursor:help}
+.ck-spend b{color:var(--text);font-weight:600;margin-left:3px;font-variant-numeric:tabular-nums}
+.ck-spend span:first-child b{color:var(--accent)}
 
 /* ---------- 网格 ---------- */
 .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;margin-bottom:16px}
@@ -387,6 +392,7 @@ table.cal td.cal-cell.has:hover{
     <div class="spacer"></div>
     <div class="save-dot" id="saveDot" hidden><i></i><span id="saveTxt">已自动保存</span></div>
     <button class="btn" id="btnScan" title="授权本地会话目录（~/.workbuddy 或 ~/.codebuddy），让页面自己扫描会话记录。只需授权一次，之后导入账单会自动匹配">📁 连接本地会话</button>
+    <button class="btn" id="btnSyncAll" title="一次性同步积分与 Token：先拉官方账单与各账号积分余额，再重扫本地会话记录（~/.workbuddy、~/.codebuddy）。等于依次点「💰 同步积分」和「🔄 同步 Token」，完成后自动重载看板数据。需要本地服务——请用「打开看板.bat」打开看板">⚡ 一键同步</button>
     <button class="btn" id="btnSyncCredits" title="只同步积分：拉取官方账单与各账号积分余额。账单还是空的（初始化）时自动拉全部历史，之后每次只拉最近 7 天增量。需要本地服务——请用「打开看板.bat」打开看板">💰 同步积分</button>
     <button class="btn" id="btnSyncTokens" title="只同步 Token：重扫本地会话记录（~/.workbuddy、~/.codebuddy）。不开服务也能用；通过本地服务打开时会连带刷新页面数据">🔄 同步 Token</button>
     <button class="btn" id="btnAppend" hidden title="再选一份积分账单 Excel 合并进来。按 RequestID 去重，已存在的记录会自动跳过">➕ 追加数据</button>
@@ -1144,9 +1150,13 @@ function renderKPIs(d){
  * 若干天），有更早记录时窗口自动加长，最多 31 天。数据来自服务端只读查询，
  * 还没拿到时整体不渲染。
  */
-function renderCheckinStrip(uid){
+/**
+ * 签到条：`tail` 是要挂在同一行右侧的补充内容（今日/昨日消耗）。
+ * 签到状态拿不到时，tail 仍要单独渲染——消耗数据来自账单，与服务无关。
+ */
+function renderCheckinStrip(uid, tail){
   const c = state.checkins[uid];
-  if(!c || !c.ok) return '';
+  if(!c || !c.ok) return tail ? `<div class="ck-row">${tail}</div>` : '';
 
   // 服务端累积后的完整日期；拿不到时退回本次查询结果
   const done = new Set(c.checkinDatesAll || c.checkinDates || []);
@@ -1171,6 +1181,7 @@ function renderCheckinStrip(uid){
     <div class="ck-row">
       <div class="ck-strip" title="最近 ${span} 天签到（右端为今天）">${cells.join('')}</div>
       <div class="ck-meta">连续 <b>${c.streakDays}</b> 天 · 累计 <b>${done.size}</b> 天 · <b>${fmt0(c.totalCredits)}</b> 积分</div>
+      ${tail || ''}
     </div>`;
 }
 
@@ -1418,6 +1429,10 @@ function renderAccounts(){
       ? `<span class="acct-upd" title="余额数据更新于 ${new Date(a.updatedAt).toLocaleString('zh-CN')}">🕒 ${pad(new Date(a.updatedAt).getHours())}:${pad(new Date(a.updatedAt).getMinutes())} 更新</span>`
       : '';
 
+    // 今日/昨日消耗：官方账单按自然日聚合（纯聚合，不涉及余额反推）
+    const spend = DailySpend.recent(a.uid);
+    const spendHtml = `<div class="ck-spend" title="今日 / 昨日消耗（积分）&#10;官方账单明细按自然日汇总。&#10;今日（${spend.todayKey}）当天可能略偏小——官方对跨日记录有尾部结算，后续同步会自动补正；昨日（${spend.yesterdayKey}）已结算完毕，是稳定值。"><span>今日<b>${fmt2(spend.today)}</b></span><span>昨日<b>${fmt2(spend.yesterday)}</b></span></div>`;
+
     return `
       <div class="card c6">
         <h3>
@@ -1435,7 +1450,7 @@ function renderAccounts(){
         <div class="kpi-sub">${expiry}${
           a.expired ? ` · <span class="acct-warn">已过期 ${fmt0(a.expiredRemaining)}</span>` : ''}</div>
         <div style="margin-top:10px">${pkgs}${more}</div>
-        ${renderCheckinStrip(a.uid)}
+        ${renderCheckinStrip(a.uid, spendHtml)}
         <div class="acct-ops">
           <button class="acct-btn" data-act="checkin" data-uid="${esc(a.uid)}"
                   title="每日签到领积分。已签到会自动识别，不会重复提交">✅ 签到</button>
@@ -2977,6 +2992,60 @@ const OfficialBill = (() => {
 })();
 
 /* =========================================================
+ * 10.66 账号每日消耗（今日 / 昨日）
+ *
+ * 数据就是官方账单明细（bill），按账号 + 自然日求和——纯聚合，不做任何反推，
+ * 所以历史完整、口径与「每日汇总」卡一致。
+ *
+ * 与已放弃的「每日获取」的区别：那个必须靠余额反推，会被套餐额度重置污染
+ * （套餐 used 周期回退会让 remaining 账面回升）；这里只读账单，不碰余额。
+ *
+ * 一个已知特性：账单是增量合并的（按 RequestID 去重、本次覆盖旧值），而官方对
+ * 跨日记录会做「尾部结算」——同一条记录在当天窗口里取值偏小，窗口延伸到次日才是
+ * 饱和值。所以「今日消耗」在当天可能略偏小，之后同步会自动修正；「昨日消耗」已经
+ * 结算完毕，是稳定值。
+ * =======================================================*/
+const DailySpend = (() => {
+  let _cache = { data:null, map:null };
+
+  /** uid →（YYYY-MM-DD → 消耗积分）。按数据引用缓存，避免每次重渲染都重算。 */
+  function byAccount(){
+    const d = TokenData.get();
+    if(_cache.data === d) return _cache.map;
+
+    const map = new Map();
+    for(const r of OfficialBill.rows()){
+      if(!r.acct) continue;
+      let m = map.get(r.acct);
+      if(!m){ m = new Map(); map.set(r.acct, m); }
+      m.set(r.date, (m.get(r.date) || 0) + r.points);
+    }
+    _cache = { data:d, map };
+    return map;
+  }
+
+  /** 某账号在指定自然日的消耗；该日没有账单记录时返回 0。 */
+  function on(uid, date){
+    const m = byAccount().get(uid);
+    return (m && m.get(date)) || 0;
+  }
+
+  /** 今日与昨日两天的消耗（按本地自然日；跨月由 Date 自动处理），附带日期供提示文案用。 */
+  function recent(uid){
+    const t = new Date();
+    const y = new Date(t.getFullYear(), t.getMonth(), t.getDate() - 1);
+    return {
+      today: on(uid, fmtDate(t)),
+      yesterday: on(uid, fmtDate(y)),
+      todayKey: fmtDate(t),
+      yesterdayKey: fmtDate(y),
+    };
+  }
+
+  return { on, recent };
+})();
+
+/* =========================================================
  * 10.66 本地服务同步通道（file:// 下同样可用）
  *
  * 看板统一用 file:// 打开——浏览器存储按地址（origin）隔离，只要有人用
@@ -3473,7 +3542,60 @@ async function runServerSync(part, btn){
 }
 
 /**
- * 积分自动刷新：定时静默跑一次「同步积分」（与手动点击走同一条服务端命令），
+ * ⚡ 一键同步：积分与 Token 一次跑完。
+ *
+ * 两步必须串行——服务端同一时间只允许一次同步，并发会返 409。顺序是先积分后
+ * Token：积分要联网、失败概率高，早点失败就不用白扫一遍本地会话。两步都成功
+ * 才重载数据文件，避免中途刷新出半份数据。
+ *
+ * 没有本地服务时退化成只重扫 Token（与「🔄 同步 Token」的离线分支一致），
+ * 积分部分必须走服务，只能提示用户。
+ */
+async function runServerSyncAll(btn){
+  const label = btn.textContent;
+
+  if(!await ServerSync.available()){
+    toast('积分同步需要本地服务，本次只重扫 Token。请用「打开看板.bat」打开看板以同步积分');
+    if(LocalScan.count()) await scanLocal({ toast: true });
+    else                   await syncTokens({ toast: true });
+    return;
+  }
+
+  btn.disabled = true;
+  const steps = [
+    { part:'credits', name:'积分',  txt:'⏳ 积分…' },
+    { part:'tokens',  name:'Token', txt:'⏳ Token…' },
+  ];
+  const done = [];
+
+  for(const s of steps){
+    btn.textContent = s.txt;
+    setSaveState('saving', `正在同步${s.name}…`);
+    const r = await ServerSync.run(s.part);
+    if(!r.ok){
+      btn.disabled = false;
+      btn.textContent = label;
+      toast(`${s.name}同步失败：` + (r.error || '未知错误'));
+      setSaveState('saved', `${s.name}同步失败，数据未更新`);
+      return;                    // 前一步失败就不跑下一步，避免半套数据
+    }
+    done.push(r);
+  }
+
+  btn.disabled = false;
+  btn.textContent = label;
+
+  await syncTokens({});          // 重新加载刚生成的数据文件
+
+  const secs = (done.reduce((a, r) => a + (r.elapsedMs || 0), 0) / 1000).toFixed(1);
+  const cm = done[0].meta || {}, tm = done[1].meta || {};
+  toast(`一键同步完成 · 账单 ${fmt0(cm.billRows)} 条 / ${cm.accounts} 个账号 · ` +
+    `本地回合 ${fmt0(tm.turns)} · 耗时 ${secs}s` +
+    ((cm.errors && cm.errors.length) ? `（${cm.errors.length} 个账号拉取失败）` : ''));
+  setSaveState('saved', `一键同步完成 · ${secs}s`);
+}
+
+/**
  * 让卡片余额/到期信息保持新鲜。成功后静默重载数据；
  * 失败（409 撞上手动同步、服务未启动等）一律静默跳过，不打扰用户。
  */
@@ -4151,6 +4273,9 @@ async function loadFile(file){
     Persist.clearMeta();
     toast('已清空本地缓存');
   });
+
+  /* ⚡ 一键同步 = 积分 + Token 串行跑一遍（离线时退化为只重扫 Token） */
+  $('btnSyncAll').addEventListener('click', () => runServerSyncAll($('btnSyncAll')));
 
   /* 「💰 同步积分」= 只拉官方账单与账号余额，必须走本地服务
      「🔄 同步 Token」= 只扫本地会话；没有服务时退回重扫/重载 */
