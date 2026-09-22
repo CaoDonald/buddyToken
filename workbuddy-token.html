@@ -280,7 +280,7 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .stat-hit{background:#e7f8f1;color:#0b8a63}
 .stat-miss{background:#f2f5fc;color:#8b98b3}
 
-/* ---------- 模型性价比 ---------- */
+/* ---------- 模型数据 ---------- */
 .rank-note{
   margin:12px 0 0;font-size:12px;line-height:1.75;color:var(--muted);
   background:#f7f9fd;border-radius:8px;padding:10px 13px;
@@ -538,7 +538,7 @@ table.cal td.cal-cell.has:hover{
         <div class="auto-row" data-auto="refresh">
           <div class="auto-line1">
             <i class="auto-dot"></i><span class="auto-name">自动刷新积分</span>
-            <span class="auto-cycle" title="执行周期">每 1 小时</span>
+            <span class="auto-cycle" title="执行周期">每 30 分钟</span>
             <button class="chip auto-chip" type="button">已关闭</button>
           </div>
           <div class="auto-desc">定时拉取官方账单与<b>各账号余额</b>（含 429 后的恢复情况），数据文件增量合并、历史不丢。开启后看板余额自动保持新鲜，无需手动点「💰 同步积分」。</div>
@@ -633,7 +633,7 @@ table.cal td.cal-cell.has:hover{
       </div>
 
       <div class="card c12" id="rankCard" hidden>
-        <h3><span class="dot"></span>模型性价比 <span class="tag">每积分 Token 越高越划算</span></h3>
+        <h3><span class="dot"></span>模型数据 <span class="tag">默认按请求数 · 点表头排序</span></h3>
         <div class="tbl-scroll" style="max-height:420px"><table class="tbl" id="tblRank"></table></div>
         <p class="rank-note">
           口径：<b>每积分 Token = 该模型 Token 合计 ÷ 积分合计</b>，即「花 1 积分能换到多少 Token」。
@@ -898,7 +898,7 @@ const state = {
   checkins: {},           // uid → 签到状态（服务模式下异步拉取；含 travel 旅行状态）
   limits: { scannedAt: 0, byUid: {} },   // uid → 429 受限模型列表（服务模式异步拉取）
   serverStatus: null,     // /api/status 缓存（switchable 账号列表等）
-  rank: { sort:'perPoint', dir:'desc' },  // 模型性价比卡的表头排序
+  rank: { sort:'count', dir:'desc' },     // 模型数据卡的表头排序（默认请求数倒序）
   sess: { sort:'pts', dir:'desc' },       // Session 消耗卡的表头排序
   day:  { sort:'date', dir:'desc' }       // 每日汇总卡的表头排序（默认时间倒序，最新在上）
 };
@@ -1130,7 +1130,7 @@ function computeStats(d){
   turnRatios.sort((a, b) => a - b);
   const medOf = a => a.length ? a[Math.floor(a.length / 2)] : null;
 
-  // ---- 模型性价比 ----
+  // ---- 模型数据 ----
   // 每积分 Token 是唯一能把 token 与积分拉到同一尺度的指标，越高越划算。
   // 注意：低不代表模型差——复杂任务才会用强模型，它天然 token 多、积分高。
   const modelRank = byModel
@@ -2359,9 +2359,9 @@ function renderTables(d){
 }
 
 /* =========================================================
- *  8.4 模型性价比
+ *  8.4 模型数据
  * =======================================================*/
-/* 模型性价比表的列定义（num=右对齐；k 对应 modelRank 里的字段名） */
+/* 模型数据表的列定义（num=右对齐；k 对应 modelRank 里的字段名） */
 const RANK_COLS = [
   { k:'key',       t:'模型' },
   { k:'count',     t:'请求数',       num:1 },
@@ -4604,7 +4604,7 @@ async function loadFile(file){
     }, 200);
   });
 
-  /* ---- 模型性价比：点表头排序（同列再点切换升降序） ---- */
+  /* ---- 模型数据：点表头排序（同列再点切换升降序） ---- */
   $('tblRank').addEventListener('click', e => {
     const th = e.target.closest('th.sortable');
     if(!th) return;

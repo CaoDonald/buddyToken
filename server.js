@@ -469,7 +469,7 @@ function handleStatus(req, res) {
  *   · 猫猫：状态机 idle→traveling→arrived 跨度可能几小时，30min 一查才能在
  *     到达后及时领奖；查得太稀会漏掉领取窗口。
  *   · 切换账号：每小时评估一次「有没有更该用的账号」。
- *   · 刷新积分：每 1h 拉一次官方余额，保持看板数据新鲜。
+ *   · 刷新积分：每 30min 拉一次官方余额，保持看板数据新鲜。
  */
 const AUTO_CONFIG_FILE = path.join(ROOT, 'auto-config.json');
 const AUTO_KEYS = ['checkin', 'travel', 'switch', 'refresh'];
@@ -477,7 +477,7 @@ const AUTO_INTERVALS = {
   checkin: 6 * 60 * 60 * 1000,
   travel: 30 * 60 * 1000,
   switch: 60 * 60 * 1000,
-  refresh: 60 * 60 * 1000,
+  refresh: 30 * 60 * 1000,
 };
 /** 自动切换只在「有账号积分即将到期（默认 14 天内）」时才切，避免无谓切换。 */
 const SWITCH_HORIZON_DAYS = 14;
