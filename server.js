@@ -161,7 +161,7 @@ function readDataMeta() {
  *
  * `part` 决定同步范围：
  *   undefined / 'all' → 本地会话 + 官方账单（全量，行为同 bat）
- *   'credits'         → 只刷官方账单与积分余额，本地 Token 数据原样保留
+ *   'credits'         → 刷官方账单与积分余额（可 --uid 限单账号），并顺带重扫本地会话
  *   'tokens'          → 只扫本地会话，官方数据原样保留
  *
  * 用子进程而不是把主脚本 require 进来——脚本本身是 CLI 入口，

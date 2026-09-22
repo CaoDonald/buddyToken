@@ -34,8 +34,8 @@
  *   node token-usage-report.js --emit-js           # 额外生成看板数据 token-usage-data.js
  *   node token-usage-report.js --emit-js --light   # 同上，省略每步明细（文件约小一半）
  *   node token-usage-report.js --emit-js --no-merge # 关闭增量合并，纯全量覆盖
- *   node token-usage-report.js --emit-js --only=credits            # 只刷官方账单与积分余额
- *   node token-usage-report.js --emit-js --only=credits --uid <uid> # 只刷某个账号（看板卡片上的刷新）
+ *   node token-usage-report.js --emit-js --only=credits            # 刷官方账单/余额 + 顺带重扫本地会话
+ *   node token-usage-report.js --emit-js --only=credits --uid <uid> # 只刷某个账号的积分（看板卡片上的刷新），同样带重扫
  *   node token-usage-report.js --reset             # 清空所有数据（删除本脚本产出的数据文件）
  *
  * 看板数据是「增量合并」写入的（默认）
@@ -470,9 +470,9 @@ function buildTokenDataJs(reqs, light, titles) {
  * 文件不存在、被截断、或格式不对都返回 null（当作首次生成）。
  *
  * 注意这里不校验 t 是否存在：`--only=credits` 允许在数据文件缺失时从空骨架
- * 起步（见 syncCreditsOnly），那一步的产物可能只有官方字段。若因缺 t 就判为
- * 无效，紧随其后的 `--only=tokens` 会读不到这些账单，把刚拉回来的官方数据
- * 整块丢掉。需要 t 的调用方自行判空（如 main 里的增量合并用 `old.t || {}`）。
+ * 起步（见 syncCreditsOnly），且本地重扫失败时其产物可能只有官方字段。若因
+ * 缺 t 就判为无效，紧随其后的 `--only=tokens` 会读不到这些账单，把刚拉回来
+ * 的官方数据整块丢掉。需要 t 的调用方自行判空（如 main 里的增量合并用 `old.t || {}`）。
  */
 function loadExistingTokenData(file) {
   try {
@@ -747,14 +747,15 @@ function resolveOfficialDays(args, days, prevData) {
 /**
  * 只刷新官方账单与积分余额（`--only=credits`）。
  *
- * 完全不扫本地会话、不重写 CSV 与汇总报告——只把已有数据文件里的官方字段
- * 换成最新的。这样「同步积分」和「同步 Token」就是两个互不干扰的操作，
- * 各跑各的，谁也不会把对方的结果覆盖掉。
+ * 不重写 CSV 与汇总报告，但会顺带重扫本地会话——「按账号刷积分」和「Token
+ * 扫描」虽是两个维度，可 Token 数字一旦停在旧时点，看板上模型分布就会像丢
+ * 了数据（2026-09-22 实际踩过：卡片刷新后 glm-5.3 显示 1.85M，实际已 5.1M）。
+ * 全量扫描只要几秒，跟着积分一起刷掉，保证两种刷新看到的数字一致。
  *
  * uid 非空时只刷新该账号（看板账号卡片上的「刷新」按钮）：账单按 RequestID
  * 合并、余额按 uid 覆盖，其余账号的账单与余额原样保留。
  */
-async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid }) {
+async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid, light }) {
   if (!wbApi) {
     console.error('缺少 workbuddy-api.js，无法同步官方数据');
     process.exit(1);
@@ -765,9 +766,8 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid }) {
 
   // 数据文件不存在＝首次使用（刚 clone、或刚清过产物）：按初始化处理，用空骨架
   // 继续往下走，让 resolveOfficialDays 自动改拉全部历史（见其注释里的 null 分支）。
-  // 本地 Token 部分由紧随其后的「🔄 同步 Token」补上——看板的「⚡ 一键同步」正是
-  // 「先积分后 Token」两步串行，所以首次点它一次就能拿到完整数据。
-  // 骨架里的 t / ti 不能省：第二步「🔄 同步 Token」要靠读这个文件把官方字段带
+  // 本地 Token 部分由下面的重扫补上；若重扫失败，产物会暂时只有官方字段。
+  // 骨架里的 t / ti 不能省：后续「🔄 同步 Token」要靠读这个文件把官方字段带
   // 回去，而它按「有没有 t 判断是不是有效数据文件」，缺了就会把账单整块丢掉。
   const existing = loadExistingTokenData(jsPath);
   const data = existing || { meta: { turns: 0 }, ti: {}, t: {} };
@@ -782,7 +782,7 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid }) {
     process.exit(1);
   }
 
-  // 增量合并：窗口外的历史账单原样保留，本地回合一个字节都不动
+  // 增量合并：窗口外的历史账单原样保留（本地回合由下面的重扫更新）
   const merged = mergeOfficialData(data, official, !noMerge, uid);
   data.acct = merged.accounts;
   data.uids = merged.uids;
@@ -794,28 +794,68 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid }) {
     if (h && h.byUid) data.hist = h.byUid;
   } catch { /* 无历史时省略 */ }
 
+  // 顺带重扫本地会话，把 Token 部分也带到最新。合并规则与主流程一致：
+  // 同名回合以本次扫描为准，本地已清理但历史同步过的回合原样保留。
+  // 扫描失败不影响官方数据落盘（降级为只更新积分，回到旧行为）。
+  let keptTurns = 0;
+  try {
+    const since = days > 0 ? new Date(Date.now() - days * 86400000) : null;
+    const { allReqs, titles } = await collect(since);
+    const local = buildTokenDataJs(allReqs, light, titles);
+    if (noMerge) {
+      data.t = local.t;
+      data.ti = local.ti || {};
+    } else {
+      for (const [k, v] of Object.entries(local.t)) data.t[k] = v;
+      for (const [k, v] of Object.entries(local.ti || {})) data.ti[k] = v;
+      for (const [k, v] of Object.entries(existing ? (existing.t || {}) : {})) {
+        if (!data.t[k]) { data.t[k] = v; keptTurns++; }
+      }
+      for (const [k, v] of Object.entries(existing ? (existing.ti || {}) : {})) {
+        if (!data.ti[k]) data.ti[k] = v;
+      }
+    }
+    // 重算 meta：沿用旧文件的累计值会跟合并后的回合表对不上
+    let reqs = 0, from = null, to = null;
+    for (const v of Object.values(data.t)) {
+      reqs += v.n || 0;
+      if (v.t0 && (from === null || v.t0 < from)) from = v.t0;
+      if (v.t1 && (to === null || v.t1 > to)) to = v.t1;
+    }
+    data.meta.reqs = reqs;
+    data.meta.turns = Object.keys(data.t).length;
+    if (from) data.meta.from = from;
+    if (to) data.meta.to = to;
+    // 会话 → 账号映射：与官方接口无关，但顺手一起刷新
+    try {
+      const su = wbApi.readSessionsFromDb();
+      if (su && Object.keys(su).length) data.su = su;
+    } catch { /* 读库失败不影响主流程 */ }
+    console.log(`  [本地] 重扫 ${fmt(Object.keys(local.t).length)} 个回合` +
+      (keptTurns ? ` + 历史保留 ${fmt(keptTurns)} 个` : '') +
+      ` = ${fmt(data.meta.turns)} 个`);
+  } catch (e) {
+    console.warn(`  [本地] 重扫失败，Token 数据保持原样：${e.message}`);
+  }
+
   const scope = `账号 ${(official.accounts[0] && official.accounts[0].name) || uid}（其余账号保留）`;
   const head = '/* 由 token-usage-report.js 自动生成，请勿手工编辑 */\n' +
-    `/* ${fmtTime(new Date())} · 仅刷新官方账单（` +
-    (uid ? `只刷 ${scope} · ` : '') +
-    (officialDays >= FULL_HISTORY_DAYS ? `初始化全量，近 ${officialDays} 天` : `近 ${officialDays} 天`) +
-    `）· ` +
+    `/* ${fmtTime(new Date())} · 刷新官方账单` +
+    (uid ? `（只刷 ${scope}）` : '') +
+    ` + 重扫本地 · ` +
+    (officialDays >= FULL_HISTORY_DAYS ? `账单初始化全量，近 ${officialDays} 天 · ` : `账单近 ${officialDays} 天 · `) +
     `本次新增 ${fmt(merged.meta.addedRows)} 条 + 历史保留 ${fmt(merged.meta.keptRows)} 条 ` +
     `= 账单 ${fmt(merged.bill.length)} 条 · 账号 ${merged.accounts.length} 个 · ` +
-    (existing
-      ? `本地回合沿用 ${fmt(data.meta.turns)} 个 */\n`
-      : '本地回合待「🔄 同步 Token」补齐 */\n');
+    `回合 ${fmt(data.meta.turns)} 个 */\n`;
   fs.writeFileSync(jsPath, head + 'window.__TOKEN_DATA__=' + JSON.stringify(data) + ';\n', 'utf8');
 
   console.log('');
   console.log(uid
-    ? `  已刷新官方数据：只更新 ${scope}（本地 Token 数据未改动）`
-    : (existing
-        ? '  已刷新官方数据（本地 Token 数据未改动）'
-        : '  已初始化官方数据（首次，尚无本地 Token，请再点一次「🔄 同步 Token」）'));
+    ? `  已刷新 ${scope} 的积分，并重扫了本地会话`
+    : '  已刷新官方数据，并重扫了本地会话');
   console.log(`  账单增量合并：本次新增 ${fmt(merged.meta.addedRows)} 条 + ` +
     `历史保留 ${fmt(merged.meta.keptRows)} 条 = ${fmt(merged.bill.length)} 条，窗口外的历史未丢弃`);
-  console.log('  看板数据 : ' + jsPath);
+  console.log(`  看板数据 : ${jsPath}`);
 }
 
 // ---------------------------------------------------------------- 主流程
@@ -945,6 +985,7 @@ async function main() {
       days,
       noMerge: !!args['no-merge'],
       uid,
+      light,
     });
     return;
   }

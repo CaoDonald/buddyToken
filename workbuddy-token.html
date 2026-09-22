@@ -135,11 +135,43 @@ body{
   color:#1f5b46;font-weight:600;border:1px solid #c8eedd}
 
 /* ---------- 筛选 ---------- */
+/* 默认（📌 定住）：筛选区是普通文档流元素，固定在页面原位、随页面滚走。
+   浮动模式（🎈 .float-mode）：钉在顶栏下方（top 由 JS 按 topbar 实际高度同步），
+   滚过原位后切紧凑形态——未选中的 chip 收起，只留已选与「+N」 */
+body{overflow-anchor:none}  /* .floating 切换会改变文档流高度，滚动锚定补偿会把 scrollTop
+   拉回导致哨兵反复出入判定区、展开/折叠无限振荡，必须禁用 */
 .filters{
   background:var(--card);border:1px solid var(--line);border-radius:14px;
   padding:12px 16px;margin:16px 0;box-shadow:var(--shadow);
   display:flex;gap:10px 18px;flex-wrap:wrap;align-items:center;
 }
+.filters.float-mode{
+  position:sticky;top:var(--filters-top,60px);z-index:49;
+}
+.filters.floating{
+  padding:8px 14px;box-shadow:0 10px 26px rgba(20,30,60,.16);
+}
+/* 隐藏规则必须带 :not(.no-collapse)——:not() 参数计入特异性，(0,5,1) 的隐藏规则
+   否则永远压过 (0,4,1) 的展开规则，展开就失效了 */
+.filters.floating:not(.no-collapse) .chip:not(.on):not(.chip-more){display:none}
+.filters.floating.no-collapse .chip{display:inline-block}   /* 点「+N」/「▾ 展开」时全部可见 */
+/* 浮动紧凑态的「▾ 展开」入口：未选中 chip 都被藏起来了，靠它临时放开出选；
+   展开后文案切「▴ 收起」，再点收回紧凑 */
+.float-expand{display:none}
+.filters.floating .float-expand{display:inline-block}
+/* ---- 浮动紧凑态单行化 ----
+   统计句（已筛选 N 条…）不占地方；快捷按钮组整个隐藏（随「▾ 展开」一起出）；
+   没有已选内容的组整组隐藏，保证紧凑条只有一行 */
+.filters.floating:not(.no-collapse) .statline{display:none}
+/* 模型组的「+N」与「▾ 展开」入口重复，紧凑态不显示（float-expand 无 data-chips，不受影响） */
+.filters.floating:not(.no-collapse) .chip-more[data-chips]{display:none}
+/* 统计句藏了以后由展开按钮接管推右（statline 的 margin-left:auto 随隐藏失效），
+   「▾ 展开」+ 🎈 靠到紧凑条最右 */
+.filters.floating:not(.no-collapse) .float-expand{margin-left:auto}
+.filters.floating:not(.no-collapse) .fgroup.grp-empty{display:none}
+.filters.floating:not(.no-collapse) .quick-btns{display:none}
+.quick-btns{display:inline-flex;gap:6px;flex-wrap:wrap;align-items:center}
+.q-sep{width:1px;height:14px;background:var(--line);flex:none}
 .fgroup{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .fgroup>label{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.3px}
 input[type=date]{
@@ -159,6 +191,15 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .chip-more{color:var(--accent);border-style:dashed;font-weight:600}
 .chip-more:hover{border-color:var(--accent);color:var(--accent)}
 .statline{font-size:12px;color:var(--muted);margin-left:auto}
+/* 定住/浮动开关：📌 定住（默认，完整形态钉顶）/ 🎈 浮动（滚过原位收起为紧凑条）。
+   放文档流行尾（statline 右侧），absolute 贴角会压住统计文字 */
+.pin-toggle{
+  flex:none;width:30px;height:30px;border-radius:999px;line-height:1;
+  border:1px solid var(--line);background:#fbfcfe;cursor:pointer;
+  font-size:15px;display:flex;align-items:center;justify-content:center;
+  transition:.15s;font-family:inherit;padding:0;
+}
+.pin-toggle:hover{border-color:#b9c5e6}
 
 /* ---------- KPI ---------- */
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px}
@@ -491,15 +532,27 @@ table.cal td.cal-cell.has:hover{
         <input type="date" id="dateFrom">
         <span style="color:var(--muted)">~</span>
         <input type="date" id="dateTo">
-        <button class="btn" id="qToday" style="padding:5px 10px;font-size:12px" title="把日期范围设为今天">今日</button>
-        <button class="btn" id="q7" style="padding:5px 10px;font-size:12px" title="把日期范围设为最近 7 天">近7日</button>
-        <button class="btn" id="q30" style="padding:5px 10px;font-size:12px" title="把日期范围设为最近 30 天">近30日</button>
-        <button class="btn" id="qAll" style="padding:5px 10px;font-size:12px" title="清除日期限制，显示全部数据">全部</button>
+        <!-- 快捷范围：完整形态常驻；浮动紧凑态随「▾ 展开」一起出（未选中 chip 本来就被藏）。
+             日期级以数据最后一天为基准，时间级（近30分/近1时/近3时）以最新一条为基准 -->
+        <span class="quick-btns" id="quickBtns">
+          <button class="chip" data-q="today" title="把日期范围设为数据里最后一天">今日</button>
+          <button class="chip" data-q="7"    title="最近 7 天（按数据最后一天回溯）">近7日</button>
+          <button class="chip" data-q="30"   title="最近 30 天（按数据最后一天回溯）">近30日</button>
+          <button class="chip" data-q="1y"   title="最近一年">近1年</button>
+          <i class="q-sep"></i>
+          <button class="chip" data-q="30m"  title="数据里最新一条往前 30 分钟">近30分</button>
+          <button class="chip" data-q="1h"   title="数据里最新一条往前 1 小时">近1时</button>
+          <button class="chip" data-q="3h"   title="数据里最新一条往前 3 小时">近3时</button>
+          <i class="q-sep"></i>
+          <button class="chip" data-q="all"  title="清除日期限制，显示全部数据">全部</button>
+        </span>
       </div>
       <div class="fgroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
       <div class="fgroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
+      <button class="chip chip-more float-expand" id="floatExpand" type="button">▾ 展开</button>
       <div class="statline" id="statLine"></div>
+      <button class="pin-toggle" id="pinToggle" type="button" aria-pressed="false"></button>
     </section>
 
     <!-- 自动任务：chip 开关 + 周期说明 + 上次成功/失败时间（连上本地服务才显示） -->
@@ -890,7 +943,7 @@ function mergeByRequestId(oldRows, newRows){
  * =======================================================*/
 const state = {
   all: [], fileName: '', sheetName: '',
-  filters: { from:'', to:'', models:new Set(), clients:new Set(), accounts:new Set() },
+  filters: { from:'', to:'', fromTs:0, toTs:0, models:new Set(), clients:new Set(), accounts:new Set() },
   charts: {},
   tokenLoaded: false,   // token-usage-data.js 是否成功加载
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
@@ -930,6 +983,10 @@ function getFiltered(){
   return state.all.filter(x => {
     if(f.from && x.date < f.from) return false;
     if(f.to   && x.date > f.to)   return false;
+    // 时间粒度快捷（近30分/近1时/近3时）：在日期过滤之上再按精确时间戳裁剪。
+    // from/to 日期串仍会同步设为对应当天，所以两层过滤不冲突
+    if(f.fromTs && x.time.getTime() < f.fromTs) return false;
+    if(f.toTs   && x.time.getTime() > f.toTs)   return false;
     if(f.models.size   && !f.models.has(x.model))       return false;
     if(f.clients.size  && !f.clients.has(x.client))     return false;
     // 账号：空串代表「未知」（手工导入的 Excel 行没有账号归属）
@@ -1346,7 +1403,7 @@ function activeLimits(uid, now){
  */
 function refreshBtnFor(a){
   return `<button class="acct-btn" data-act="refresh" data-uid="${esc(a.uid)}"
-            title="只刷新该账号的官方账单与积分余额，其他账号不受影响">🔄 刷新</button>`;
+            title="刷新该账号的官方账单与积分余额（其他账号不受影响），并重扫本地会话的 Token 数据">🔄 刷新</button>`;
 }
 
 /**
@@ -1664,12 +1721,13 @@ async function onAcctAction(btn){
     return;
   }
 
-  // 只刷新这一个账号的积分：后端只拉该 uid 的账单与余额，其余账号原样保留
+  // 刷新这一个账号的积分并重扫本地 Token：后端拉该 uid 的账单与余额（其余账号
+  // 原样保留），同时全量重扫本地会话，保证模型 Token 分布跟积分一样新鲜
   if(act === 'refresh'){
     const name = (OfficialBill.accounts().find(x => x.uid === uid) || {}).name || uid.slice(0, 8);
     btn.disabled = true;
     btn.textContent = '⏳ 刷新中…';
-    setSaveState('saving', `正在刷新「${name}」的积分…`);
+    setSaveState('saving', `正在刷新「${name}」的积分与本地 Token…`);
 
     let r;
     try{
@@ -1687,9 +1745,9 @@ async function onAcctAction(btn){
     await syncTokens({});            // 重载数据文件，账号卡片随之刷新
     const m = r.meta || {};
     const secs = ((r.elapsedMs || 0) / 1000).toFixed(1);
-    toast(`「${name}」积分已刷新 · 本次新增 ${fmt0(m.addedRows || 0)} 条 · ` +
-      `累计 ${fmt0(m.billRows || 0)} 条 · 耗时 ${secs}s`);
-    setSaveState('saved', `「${name}」积分已刷新 · ${secs}s`);
+    toast(`「${name}」已刷新 · 账单新增 ${fmt0(m.addedRows || 0)} 条 · ` +
+      `本地回合 ${fmt0(m.turns || 0)} 个 · 耗时 ${secs}s`);
+    setSaveState('saved', `「${name}」已刷新 · ${secs}s`);
     return;
   }
 
@@ -3955,6 +4013,23 @@ function renderChips(){
   $('acctChips').innerHTML = accts.map(u =>
     chip('acct', u, acctLabel(u), state.filters.accounts.has(u))
   ).join('') || empty;
+
+  // 空组标记：紧凑态下组内没有任何可见内容（未选中的 chip 都被藏了，模型组
+  // 的 +N 也不显示，所以「有已选」才算非空）时整组隐藏。grp-empty 只在紧凑态
+  // CSS 里生效，完整形态不受影响
+  const markEmpty = (id, has) => {
+    const g = $(id).closest('.fgroup');
+    if(g) g.classList.toggle('grp-empty', !has);
+  };
+  markEmpty('modelChips',  state.filters.models.size  > 0);
+  markEmpty('clientChips', state.filters.clients.size > 0);
+  markEmpty('acctChips',   state.filters.accounts.size > 0);
+}
+
+/* 「▾ 展开 / ▴ 收起」与「+N」共用 no-collapse，两处切换都要同步文案 */
+function syncFloatExpand(open){
+  const fx = document.getElementById('floatExpand');
+  if(fx) fx.textContent = open ? '▴ 收起' : '▾ 展开';
 }
 
 function bindChips(){
@@ -3965,6 +4040,10 @@ function bindChips(){
     // 「+N / 收起」只负责折叠，不参与筛选
     if(b.dataset.chips){
       modelsOpen = b.dataset.chips === 'more';
+      // 钉顶紧凑态下展开时临时放开「隐藏未选中 chip」，收起时恢复
+      const f = document.querySelector('.filters');
+      if(f) f.classList.toggle('no-collapse', modelsOpen);
+      syncFloatExpand(modelsOpen);
       renderChips();
       return;
     }
@@ -4498,11 +4577,19 @@ async function loadFile(file){
     }
   });
 
-  $('dateFrom').addEventListener('change', e => { state.filters.from = e.target.value; render(); });
-  $('dateTo').addEventListener('change',   e => { state.filters.to   = e.target.value; render(); });
+  $('dateFrom').addEventListener('change', e => {
+    state.filters.from = e.target.value; state.filters.fromTs = 0; render();
+  });
+  $('dateTo').addEventListener('change',   e => {
+    state.filters.to = e.target.value; state.filters.toTs = 0; render();
+  });
 
-  /* 快捷范围：都以「数据里最后一天」为基准，而不是今天——数据不是当天时
-     按今天算会得到一个空区间。区间两端还会被夹在数据的实际首尾之内。 */
+  /* 快捷范围：日期级都以「数据里最后一天」为基准，而不是今天——数据不是当天时
+     按今天算会得到一个空区间。区间两端还会被夹在数据的实际首尾之内。
+     时间级（近30分/近1时/近3时）以「数据里最新一条」为基准——数据不实时，
+     按现在算多半一条都筛不出来。 */
+  const clearTs = () => { state.filters.fromTs = 0; state.filters.toTs = 0; };
+
   const setRecentDays = n => {
     const dates = [...new Set(state.all.map(x => x.date))].sort();
     if(!dates.length) return;
@@ -4512,18 +4599,43 @@ async function loadFile(file){
     const from = fmtDate(d) < dates[0] ? dates[0] : fmtDate(d);
     $('dateFrom').value = from; $('dateTo').value = last;
     state.filters.from = from;  state.filters.to = last;
+    clearTs();
     render();
   };
-  $('qToday').addEventListener('click', () => setRecentDays(1));
-  $('q7').addEventListener('click',    () => setRecentDays(7));
-  $('q30').addEventListener('click',   () => setRecentDays(30));
 
-  $('qAll').addEventListener('click', () => {
-    const dates = [...new Set(state.all.map(x => x.date))].sort();
-    if(!dates.length) return;
-    $('dateFrom').value = dates[0]; $('dateTo').value = dates[dates.length-1];
-    state.filters.from = dates[0];  state.filters.to = dates[dates.length-1];
+  const setRecentMs = ms => {
+    if(!state.all.length) return;
+    let last = 0;
+    for(const x of state.all){ const t = x.time.getTime(); if(t > last) last = t; }
+    const fromTs = last - ms;
+    state.filters.fromTs = fromTs; state.filters.toTs = 0;
+    // date input 同步显示对应当天：日期层不截 ts 区间，显示上也有反馈
+    const from = fmtDate(new Date(fromTs)), to = fmtDate(new Date(last));
+    $('dateFrom').value = from; $('dateTo').value = to;
+    state.filters.from = from;  state.filters.to = to;
     render();
+  };
+
+  const applyQuick = q => {
+    if(q === 'all'){
+      const dates = [...new Set(state.all.map(x => x.date))].sort();
+      if(!dates.length) return;
+      $('dateFrom').value = dates[0]; $('dateTo').value = dates[dates.length-1];
+      state.filters.from = dates[0];  state.filters.to = dates[dates.length-1];
+      clearTs();
+      render();
+      return;
+    }
+    if(q === '30m') return setRecentMs(30 * 60e3);
+    if(q === '1h')  return setRecentMs(3600e3);
+    if(q === '3h')  return setRecentMs(3 * 3600e3);
+    setRecentDays(q === 'today' ? 1 : +q);   // today/7/30/1y 走日期级
+  };
+
+  $('quickBtns').addEventListener('click', e => {
+    const b = e.target.closest('[data-q]');
+    if(!b) return;
+    applyQuick(b.dataset.q);
   });
 
   $('btnPrint').addEventListener('click', () => window.print());
@@ -4716,6 +4828,57 @@ async function loadFile(file){
   })();
 
   bindChips();
+
+  /* 筛选区钉顶：顶栏 sticky 且窄屏会换行，top 值按其实际高度动态同步。
+     右上角开关手动控制：📌 定住（默认，筛选区固定在页面原位、随页面滚走）/
+     🎈 浮动（.float-mode 钉顶悬浮，滚过原位后收起为紧凑条）。
+     不持久化——每次打开页面一律回到定住，点击只在当前页面生效 */
+  (function(){
+    const f = document.querySelector('.filters');
+    const tb = document.querySelector('.topbar');
+    if(!f) return;
+    const sync = () => document.documentElement.style
+      .setProperty('--filters-top', ((tb ? tb.offsetHeight : 0) + 6) + 'px');
+    sync();
+    window.addEventListener('resize', sync);
+    const sentinel = document.createElement('div');
+    f.parentNode.insertBefore(sentinel, f);
+    const H = (tb ? tb.offsetHeight : 0) + 6;
+    const btn = document.getElementById('pinToggle');
+    let floatOn = false;
+    const apply = () => {
+      if(btn){
+        btn.textContent = floatOn ? '🎈' : '📌';
+        btn.setAttribute('aria-pressed', String(floatOn));
+        btn.title = floatOn
+          ? '浮动中：筛选区悬浮钉在顶部，滚过原位后收起为紧凑条（点击改回定住）'
+          : '定住中：筛选区固定在页面原位，随页面滚动（点击开启悬浮钉顶）';
+      }
+      f.classList.toggle('float-mode', floatOn);
+      if(!floatOn) f.classList.remove('floating');
+    };
+    if(btn) btn.addEventListener('click', () => {
+      floatOn = !floatOn;
+      apply();
+      /* 开启浮动时若已滚过原位（哨兵在吸附线上方），立即收起，不等滚动触发 */
+      if(floatOn && sentinel.getBoundingClientRect().bottom < H) f.classList.add('floating');
+    });
+    /* 紧凑条上的「▾ 展开」：临时放开被藏起来的未选中 chip，改完筛选再收起 */
+    const fx = document.getElementById('floatExpand');
+    if(fx) fx.addEventListener('click', () => {
+      syncFloatExpand(f.classList.toggle('no-collapse'));
+    });
+    apply();
+    if(!('IntersectionObserver' in window)) return;
+    /* 迟滞：过吸附线立即进入悬浮，但回滚要退回到线下方 50px 才还原——
+       临界点附近微小的滚动/补偿不至于在两种形态间反复横跳 */
+    new IntersectionObserver(([e]) => {
+      if(floatOn && !e.isIntersecting) f.classList.add('floating');
+    }, { rootMargin: `${H}px 0px 0px 0px` }).observe(sentinel);
+    new IntersectionObserver(([e]) => {
+      if(floatOn && e.isIntersecting) f.classList.remove('floating');
+    }, { rootMargin: `${H - 50}px 0px 0px 0px` }).observe(sentinel);
+  })();
 
   // 先静默加载 token 数据（失败不能阻塞快照恢复），再恢复历史数据集
   (async () => {
