@@ -538,7 +538,7 @@ table.cal td.cal-cell.has:hover{
         <div class="auto-row" data-auto="refresh">
           <div class="auto-line1">
             <i class="auto-dot"></i><span class="auto-name">自动刷新积分</span>
-            <span class="auto-cycle" title="执行周期">每 3 小时</span>
+            <span class="auto-cycle" title="执行周期">每 1 小时</span>
             <button class="chip auto-chip" type="button">已关闭</button>
           </div>
           <div class="auto-desc">定时拉取官方账单与<b>各账号余额</b>（含 429 后的恢复情况），数据文件增量合并、历史不丢。开启后看板余额自动保持新鲜，无需手动点「💰 同步积分」。</div>
@@ -1378,8 +1378,6 @@ function renderStatusChips(a, uid, isPriority){
     chips.push('<span class="st-chip ok" title="猫猫已到达，点「派猫猫」领取奖励">🐱</span>');
   }else if(tv && !tv.state){
     chips.push('<span class="st-chip dim" title="无 Buddy">无 Buddy</span>');
-  }else if(tv && tv.state === 'idle' && tv.dailyLimitReached){
-    chips.push('<span class="st-chip dim" title="今日已派出过，明天再来">🐱</span>');
   }
 
   // 模型限流（429）：受限模型数 >1 时图标带数量角标，tooltip 按恢复时间升序逐行列出

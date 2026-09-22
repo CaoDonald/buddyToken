@@ -1043,19 +1043,22 @@ async function runTravel(acct) {
   }
 
   if (st.state === 'idle') {
-    if (st.dailyLimitReached) {
-      return {
-        ok: true, action: 'skip', uid: acct.uid, name: acct.name,
-        state: 'idle', dailyLimit: true,
-        message: '今日已派出过，明天再来',
-      };
-    }
+    // 不看 daily_limit_reached——它不代表每日只能派一次，体力够就能继续旅行。
+    // 直接尝试派出；若官方拒绝「daily limit reached」= 今日可用次数确实用完，
+    // 转成正常状态而非失败（做任务攒次数后，下轮轮询自动继续派）。
     const cfg = await fetchTravelConfig(acct);
     const loc = cfg.locations[0];
     if (!loc) {
       return { ok: false, uid: acct.uid, name: acct.name, error: '没有可用地点', account: cfg.account };
     }
-    return departTravel(acct, loc.id);
+    const r = await departTravel(acct, loc.id);
+    if (!r.ok && /daily.?limit/i.test(r.error || '')) {
+      return {
+        ok: true, action: 'limit', uid: acct.uid, name: acct.name, state: 'idle',
+        message: '今日旅行次数已用完，做任务攒次数后自动继续',
+      };
+    }
+    return r;
   }
 
   return {

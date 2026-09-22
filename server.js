@@ -469,7 +469,7 @@ function handleStatus(req, res) {
  *   · 猫猫：状态机 idle→traveling→arrived 跨度可能几小时，30min 一查才能在
  *     到达后及时领奖；查得太稀会漏掉领取窗口。
  *   · 切换账号：每小时评估一次「有没有更该用的账号」。
- *   · 刷新积分：每 3h 拉一次官方余额，保持看板数据新鲜。
+ *   · 刷新积分：每 1h 拉一次官方余额，保持看板数据新鲜。
  */
 const AUTO_CONFIG_FILE = path.join(ROOT, 'auto-config.json');
 const AUTO_KEYS = ['checkin', 'travel', 'switch', 'refresh'];
@@ -477,10 +477,19 @@ const AUTO_INTERVALS = {
   checkin: 6 * 60 * 60 * 1000,
   travel: 30 * 60 * 1000,
   switch: 60 * 60 * 1000,
-  refresh: 3 * 60 * 60 * 1000,
+  refresh: 60 * 60 * 1000,
 };
 /** 自动切换只在「有账号积分即将到期（默认 14 天内）」时才切，避免无谓切换。 */
 const SWITCH_HORIZON_DAYS = 14;
+
+/**
+ * 下次触发的随机抖动：±10% 周期（30min 任务即 ±3min，6h 任务即 ±36min）。
+ * 固定间隔的规律性请求容易被识别为脚本，每次执行时重摇一次，
+ * 让各任务的实际间隔在标称周期附近随机浮动。
+ */
+function nextJitter(period) {
+  return Math.round((Math.random() * 2 - 1) * period * 0.1);
+}
 
 let autoConfig = loadAutoConfig();
 /** key → { tryAt, okAt, failAt, error, info }：上次尝试/成功/失败时间与结果摘要。 */
@@ -518,8 +527,15 @@ function isWorkbuddyRunning() {
  * 对两个应用都切：CLI 写完即生效（不重启），桌面端仅在「正在运行」时重启生效。
  * 目标账号必须在目标应用有登录快照才可切（token 域不同，跨域借用会被网关拒）。
  *
+ * 防震荡：切换的排序键（到期时刻）不因切换而改变，切到手的账号只要临期批次
+ * 没花完就不会再动；冷却兜底——自动切换成功后 24h 内不再切（手动 /api/switch
+ * 不受限），即使官方数据抖动也不会反复改登录文件、重启桌面端。
+ *
  * 返回结果摘要（供前端展示）；没有可切换的对象时原样返回说明，不报错。
  */
+const AUTO_SWITCH_COOLDOWN = 24 * 60 * 60 * 1000;
+let lastAutoSwitchAt = 0;   // 上次自动切换成功时刻（内存态，重启归零；手动切换不记）
+
 async function autoSwitchAccount() {
   const all = wbApi.discoverAccounts();
   if (!all.length) throw new Error('本机未找到登录态');
@@ -537,6 +553,12 @@ async function autoSwitchAccount() {
   }
 
   const sw = wbApi.listSwitchableAccounts();
+  // 两个应用都已在该账号上时无需冷却判断（本来就不动）；否则看 24h 冷却。
+  const cur = sw.currentByApp || {};
+  const allCurrent = ['workbuddy-desktop', 'codebuddy-cli'].every((app) => (cur[app] || null) === target.uid);
+  if (!allCurrent && Date.now() - lastAutoSwitchAt < AUTO_SWITCH_COOLDOWN) {
+    return '24 小时内已自动切换过，冷却中，暂不切换';
+  }
   const done = [];
   for (const app of ['workbuddy-desktop', 'codebuddy-cli']) {
     const appName = app === 'codebuddy-cli' ? 'CLI' : '桌面端';
@@ -550,6 +572,7 @@ async function autoSwitchAccount() {
     const r = wbApi.switchAppAccount(app, target.uid, { restart });
     if (!r.ok) throw new Error(`切换${appName}失败：${r.error || '未知错误'}`);
     done.push(`${appName}已切换${restart ? '（已重启客户端）' : ''}`);
+    lastAutoSwitchAt = Date.now();
   }
   const d = new Date(best).toLocaleDateString('zh-CN');
   return `已切到「${target.name || target.uid}」（${days} 天后 ${d} 到期）：${done.join('，')}`;
@@ -574,19 +597,23 @@ async function runAutoTaskBody(name) {
   if (name === 'travel') {
     const accounts = pickAccounts();
     if (!accounts.length) throw new Error('本机未找到登录态');
-    let departN = 0, claimN = 0, credit = 0, okN = 0, lastErr = '';
+    let departN = 0, claimN = 0, credit = 0, okN = 0, lastErr = '', waitN = 0, limitN = 0;
     for (const a of accounts) {
       const r = await wbApi.runTravel(a);
       if (!r.ok) { lastErr = r.error || '未知错误'; continue; }
       okN++;
       if (r.action === 'depart') departN++;
       else if (r.action === 'claim') { claimN++; credit += (r.rewardCredit || 0); }
+      else if (r.action === 'wait') waitN++;      // 旅行中，等到达
+      else if (r.action === 'limit') limitN++;    // 今日次数已用完（官方拒绝派出，非故障）
     }
     if (!okN) throw new Error(`共 ${accounts.length} 个账号，全部失败：${lastErr}`);
     const parts = [];
     if (departN) parts.push(`派出 ${departN} 只`);
     if (claimN) parts.push(`领取 ${claimN} 份奖励${credit ? `（+${credit} 积分）` : ''}`);
-    return `共 ${accounts.length} 个账号：${parts.join('，') || '旅行进行中，到点自动领奖'}` +
+    if (waitN) parts.push(`${waitN} 只旅行中`);
+    if (limitN) parts.push(`${limitN} 只今日次数已用完`);
+    return `共 ${accounts.length} 个账号：${parts.join('，') || '无可用动作'}` +
       (lastErr && okN < accounts.length ? `（${accounts.length - okN} 个失败：${lastErr}）` : '');
   }
   if (name === 'switch') {
@@ -614,9 +641,10 @@ async function runAutoTaskBody(name) {
 async function runAutoTask(name) {
   if (autoRunning.has(name)) return;
   autoRunning.add(name);
-  if (!autoState[name]) autoState[name] = { tryAt: 0, okAt: 0, failAt: 0, error: '', info: '' };
+  if (!autoState[name]) autoState[name] = { tryAt: 0, okAt: 0, failAt: 0, error: '', info: '', jitter: 0 };
   const st = autoState[name];
   st.tryAt = Date.now();
+  st.jitter = nextJitter(AUTO_INTERVALS[name]);   // 本次执行时决定下次的触发偏移
   try {
     if (!wbApi) throw new Error('缺少 workbuddy-api.js');
     st.info = await runAutoTaskBody(name);
@@ -632,13 +660,13 @@ async function runAutoTask(name) {
   }
 }
 
-/** 每分钟评估一次：开关开着且距上次「尝试」已超周期，就触发（失败也等完整周期再重试）。 */
+/** 每分钟评估一次：开关开着且距上次「尝试」已超「周期+随机抖动」，就触发（失败也等完整周期再重试）。 */
 function autoTick() {
   const now = Date.now();
   for (const name of AUTO_KEYS) {
     if (!autoConfig[name]) continue;
     const st = autoState[name];
-    if (now - ((st && st.tryAt) || 0) >= AUTO_INTERVALS[name]) runAutoTask(name);
+    if (now - ((st && st.tryAt) || 0) >= AUTO_INTERVALS[name] + ((st && st.jitter) || 0)) runAutoTask(name);
   }
 }
 
