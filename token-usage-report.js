@@ -838,6 +838,10 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid, light 
     console.warn(`  [本地] 重扫失败，Token 数据保持原样：${e.message}`);
   }
 
+  // 刷新数据生成时间：existing 沿用旧文件的 gen，不重置的话看板的
+  // 「数据 X 小时前生成」会停在很久以前，让人误以为同步没生效
+  data.gen = Date.now();
+
   const scope = `账号 ${(official.accounts[0] && official.accounts[0].name) || uid}（其余账号保留）`;
   const head = '/* 由 token-usage-report.js 自动生成，请勿手工编辑 */\n' +
     `/* ${fmtTime(new Date())} · 刷新官方账单` +

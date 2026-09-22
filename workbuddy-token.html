@@ -190,6 +190,13 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 /* 折叠开关：虚线圈，和筛选用的实心 chip 区分开 */
 .chip-more{color:var(--accent);border-style:dashed;font-weight:600}
 .chip-more:hover{border-color:var(--accent);color:var(--accent)}
+/* 展开态（+N）：chips 占据「模型」标签右侧的全部行宽、内部折行——先填满当前行，
+   装不下的下一行。flex-basis 0 是关键：chips 整体不再作为一个超宽的 flex 项参与
+   fgroup 的换行（否则它会被整体推到标签下一行，「模型」二字就孤零零占一行了）。
+   fgroup 切顶对齐 + label 行高对齐 chip 高度，避免两行 chips 把「模型」挤到垂直居中 */
+.fgroup.expanded{align-items:flex-start}
+.fgroup.expanded>label{line-height:24px}
+.fgroup.expanded .chips{flex:1 1 0;min-width:0}
 .statline{font-size:12px;color:var(--muted);margin-left:auto}
 /* 定住/浮动开关：📌 定住（默认，完整形态钉顶）/ 🎈 浮动（滚过原位收起为紧凑条）。
    放文档流行尾（statline 右侧），absolute 贴角会压住统计文字 */
@@ -539,22 +546,24 @@ table.cal td.cal-cell.has:hover{
         <input type="date" id="dateFrom">
         <span style="color:var(--muted)">~</span>
         <input type="date" id="dateTo">
-        <!-- 快捷范围：完整形态常驻；浮动紧凑态随「▾ 展开」一起出（未选中 chip 本来就被藏）。
+        <!-- 快捷范围：按时间跨度从小到大排（分钟级 | 天级 | 全部），点亮的即当前生效范围；
+             完整形态常驻；浮动紧凑态随「▾ 展开」一起出（未选中 chip 本来就被藏）。
              日期级以数据最后一天为基准，时间级（近30分/近1时/近3时）以最新一条为基准 -->
         <span class="quick-btns" id="quickBtns">
-          <button class="chip" data-q="today" title="把日期范围设为数据里最后一天">今日</button>
-          <button class="chip" data-q="7"    title="最近 7 天（按数据最后一天回溯）">近7日</button>
-          <button class="chip" data-q="30"   title="最近 30 天（按数据最后一天回溯）">近30日</button>
-          <button class="chip" data-q="1y"   title="最近一年">近1年</button>
-          <i class="q-sep"></i>
           <button class="chip" data-q="30m"  title="数据里最新一条往前 30 分钟">近30分</button>
           <button class="chip" data-q="1h"   title="数据里最新一条往前 1 小时">近1时</button>
           <button class="chip" data-q="3h"   title="数据里最新一条往前 3 小时">近3时</button>
           <i class="q-sep"></i>
+          <button class="chip" data-q="today" title="把日期范围设为数据里最后一天">今日</button>
+          <button class="chip" data-q="7"    title="最近 7 天（按数据最后一天回溯）">近7日</button>
+          <button class="chip" data-q="14"   title="最近 14 天（按数据最后一天回溯）">近14日</button>
+          <button class="chip" data-q="30"   title="最近 30 天（按数据最后一天回溯）">近30日</button>
+          <button class="chip" data-q="1y"   title="最近一年">近1年</button>
+          <i class="q-sep"></i>
           <button class="chip" data-q="all"  title="清除日期限制，显示全部数据">全部</button>
         </span>
       </div>
-      <div class="fgroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
+      <div class="fgroup" id="modelGroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
       <div class="fgroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
       <button class="chip chip-more float-expand" id="floatExpand" type="button">▾ 展开</button>
@@ -4132,17 +4141,20 @@ function acctLabel(uid){
 /** 模型 chip 是否展开。render() 每次都会重建 chips，靠它记住展开状态。 */
 let modelsOpen = false;
 
+/* 行内 chip 模板 */
+const chipHtml = (type, val, label, on) =>
+  `<button class="chip${on ? ' on' : ''}" data-type="${type}" data-val="${esc(val)}">${esc(label)}</button>`;
+
 function renderChips(){
   const models  = [...new Set(state.all.map(x => x.model))].sort();
   const clients = [...new Set(state.all.map(x => x.client))].sort();
   const accts   = [...new Set(state.all.map(x => x.acct || ''))].sort();
 
   const empty = '<span style="color:#a8b3c8;font-size:12px">—</span>';
-  const chip = (type, val, label, on) =>
-    `<button class="chip${on ? ' on' : ''}" data-type="${type}" data-val="${esc(val)}">${esc(label)}</button>`;
 
-  // 模型动辄十几个，全铺开能把筛选区撑到三四行。默认只留一行的量，但「已选中」的
-  // 必须始终露在外面——否则用户看不到自己选了什么，再点一下就莫名取消了。
+  // 模型动辄十几个，全铺开会折行——点「+N」铺开：先填满当前行、装不下的下一行。
+  // 默认只留一行的量，但「已选中」的必须始终露在外面——否则用户看不到自己选了
+  // 什么，再点一下就莫名取消了。
   const LIMIT = 8;
   let shown = models;
   if(!modelsOpen && models.length > LIMIT){
@@ -4157,15 +4169,15 @@ function renderChips(){
         ? '<button class="chip chip-more" data-chips="less" title="收起模型列表">收起</button>' : '');
 
   $('modelChips').innerHTML =
-    (shown.map(m => chip('model', m, m, state.filters.models.has(m))).join('') + more) || empty;
+    (shown.map(m => chipHtml('model', m, m, state.filters.models.has(m))).join('') + more) || empty;
 
   $('clientChips').innerHTML = clients.map(c =>
-    chip('client', c, c, state.filters.clients.has(c))
+    chipHtml('client', c, c, state.filters.clients.has(c))
   ).join('') || empty;
 
   // 账号 chip 的值是 uid（空串＝未知），显示名另取，避免同名账号混淆
   $('acctChips').innerHTML = accts.map(u =>
-    chip('acct', u, acctLabel(u), state.filters.accounts.has(u))
+    chipHtml('acct', u, acctLabel(u), state.filters.accounts.has(u))
   ).join('') || empty;
 
   // 空组标记：紧凑态下组内没有任何可见内容（未选中的 chip 都被藏了，模型组
@@ -4191,9 +4203,12 @@ function bindChips(){
     const b = e.target.closest('.chip');
     if(!b) return;
 
-    // 「+N / 收起」只负责折叠，不参与筛选
+    // 「+N / 收起」只负责折叠，不参与筛选。展开态 chips 占满标签右侧行宽、
+    // 内部折行（.fgroup.expanded），先填满当前行、装不下的下一行
     if(b.dataset.chips){
       modelsOpen = b.dataset.chips === 'more';
+      const g = $('modelChips').closest('.fgroup');
+      if(g) g.classList.toggle('expanded', modelsOpen);
       // 钉顶紧凑态下展开时临时放开「隐藏未选中 chip」，收起时恢复
       const f = document.querySelector('.filters');
       if(f) f.classList.toggle('no-collapse', modelsOpen);
@@ -4732,21 +4747,35 @@ async function loadFile(file){
   });
 
   $('dateFrom').addEventListener('change', e => {
-    state.filters.from = e.target.value; state.filters.fromTs = 0; render();
+    state.filters.from = e.target.value; state.filters.fromTs = 0;
+    markQuick('');   // 手动改日期，快捷按钮全部熄灭
+    render();
   });
   $('dateTo').addEventListener('change',   e => {
-    state.filters.to = e.target.value; state.filters.toTs = 0; render();
+    state.filters.to = e.target.value; state.filters.toTs = 0;
+    markQuick('');
+    render();
   });
 
   /* 快捷范围：日期级都以「数据里最后一天」为基准，而不是今天——数据不是当天时
      按今天算会得到一个空区间。区间两端还会被夹在数据的实际首尾之内。
      时间级（近30分/近1时/近3时）以「数据里最新一条」为基准——数据不实时，
      按现在算多半一条都筛不出来。 */
+  /* 快捷范围：日期级都以「数据里最后一天」为基准，而不是今天——数据不是当天时
+     按今天算会得到一个空区间。区间两端还会被夹在数据的实际首尾之内。
+     时间级（近30分/近1时/近3时）以「数据里最新一条」为基准——数据不实时，
+     按现在算多半一条都筛不出来。设置成功返回 true，调用方据此点亮按钮。 */
   const clearTs = () => { state.filters.fromTs = 0; state.filters.toTs = 0; };
+
+  /* 快捷按钮选中态：点亮的即当前生效的范围；手动改日期输入框后全部熄灭 */
+  const markQuick = q => {
+    $('quickBtns').querySelectorAll('[data-q]').forEach(b =>
+      b.classList.toggle('on', b.dataset.q === q));
+  };
 
   const setRecentDays = n => {
     const dates = [...new Set(state.all.map(x => x.date))].sort();
-    if(!dates.length) return;
+    if(!dates.length) return false;
     const last = dates[dates.length - 1];
     const d = parseDs(last);
     d.setDate(d.getDate() - (n - 1));
@@ -4755,10 +4784,11 @@ async function loadFile(file){
     state.filters.from = from;  state.filters.to = last;
     clearTs();
     render();
+    return true;
   };
 
   const setRecentMs = ms => {
-    if(!state.all.length) return;
+    if(!state.all.length) return false;
     let last = 0;
     for(const x of state.all){ const t = x.time.getTime(); if(t > last) last = t; }
     const fromTs = last - ms;
@@ -4768,6 +4798,7 @@ async function loadFile(file){
     $('dateFrom').value = from; $('dateTo').value = to;
     state.filters.from = from;  state.filters.to = to;
     render();
+    return true;
   };
 
   const applyQuick = q => {
@@ -4778,12 +4809,14 @@ async function loadFile(file){
       state.filters.from = dates[0];  state.filters.to = dates[dates.length-1];
       clearTs();
       render();
+      markQuick(q);
       return;
     }
-    if(q === '30m') return setRecentMs(30 * 60e3);
-    if(q === '1h')  return setRecentMs(3600e3);
-    if(q === '3h')  return setRecentMs(3 * 3600e3);
-    setRecentDays(q === 'today' ? 1 : +q);   // today/7/30/1y 走日期级
+    if(q === '30m'){ if(setRecentMs(30 * 60e3)) markQuick(q); return; }
+    if(q === '1h'){  if(setRecentMs(3600e3))     markQuick(q); return; }
+    if(q === '3h'){  if(setRecentMs(3 * 3600e3)) markQuick(q); return; }
+    // +'1y' 是 NaN，必须单独翻译；其余数字（7/14/30）直接用
+    if(setRecentDays(q === 'today' ? 1 : (q === '1y' ? 365 : +q))) markQuick(q);
   };
 
   $('quickBtns').addEventListener('click', e => {
@@ -5017,10 +5050,14 @@ async function loadFile(file){
       /* 开启浮动时若已滚过原位（哨兵在吸附线上方），立即收起，不等滚动触发 */
       if(floatOn && sentinel.getBoundingClientRect().bottom < H) f.classList.add('floating');
     });
-    /* 紧凑条上的「▾ 展开」：临时放开被藏起来的未选中 chip，改完筛选再收起 */
+    /* 紧凑条上的「▾ 展开」：临时放开被藏起来的未选中 chip，改完筛选再收起。
+       expanded 与 no-collapse 同步切换，模型 chips 同样「填满当前行、多的折行」 */
     const fx = document.getElementById('floatExpand');
     if(fx) fx.addEventListener('click', () => {
-      syncFloatExpand(f.classList.toggle('no-collapse'));
+      const open = f.classList.toggle('no-collapse');
+      syncFloatExpand(open);
+      const g = document.getElementById('modelGroup');
+      if(g) g.classList.toggle('expanded', open);
     });
     apply();
     if(!('IntersectionObserver' in window)) return;
