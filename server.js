@@ -456,6 +456,211 @@ function handleStatus(req, res) {
   });
 }
 
+// ---------------------------------------------------------------- 自动化调度
+
+/**
+ * 四个自动任务：自动签到 / 自动猫猫 / 自动切换账号 / 自动刷新积分。
+ *
+ * 开关存 auto-config.json（只存四个布尔，不含任何 token），默认全关——
+ * 页面上点开哪个，哪个就按自己的周期开始跑。调度本身常驻，只是被开关门控。
+ *
+ * 周期（毫秒）按任务性质定：
+ *   · 签到：每天至少一次即可，6h 一查（doCheckin 幂等，已签不再提交）。
+ *   · 猫猫：状态机 idle→traveling→arrived 跨度可能几小时，30min 一查才能在
+ *     到达后及时领奖；查得太稀会漏掉领取窗口。
+ *   · 切换账号：每小时评估一次「有没有更该用的账号」。
+ *   · 刷新积分：每 3h 拉一次官方余额，保持看板数据新鲜。
+ */
+const AUTO_CONFIG_FILE = path.join(ROOT, 'auto-config.json');
+const AUTO_KEYS = ['checkin', 'travel', 'switch', 'refresh'];
+const AUTO_INTERVALS = {
+  checkin: 6 * 60 * 60 * 1000,
+  travel: 30 * 60 * 1000,
+  switch: 60 * 60 * 1000,
+  refresh: 3 * 60 * 60 * 1000,
+};
+/** 自动切换只在「有账号积分即将到期（默认 14 天内）」时才切，避免无谓切换。 */
+const SWITCH_HORIZON_DAYS = 14;
+
+let autoConfig = loadAutoConfig();
+/** key → { tryAt, okAt, failAt, error, info }：上次尝试/成功/失败时间与结果摘要。 */
+const autoState = {};
+const autoRunning = new Set();
+
+function loadAutoConfig() {
+  try {
+    const c = JSON.parse(fs.readFileSync(AUTO_CONFIG_FILE, 'utf8'));
+    const o = {};
+    for (const k of AUTO_KEYS) o[k] = !!c[k];
+    return o;
+  } catch {
+    return { checkin: false, travel: false, switch: false, refresh: false };
+  }
+}
+function saveAutoConfig() {
+  try { fs.writeFileSync(AUTO_CONFIG_FILE, JSON.stringify(autoConfig, null, 2), 'utf8'); } catch { /* 忽略 */ }
+}
+
+/** WorkBuddy 桌面端是否正在运行（决定是否在切换后重启它）。 */
+function isWorkbuddyRunning() {
+  try {
+    const { execFileSync } = require('child_process');
+    const out = execFileSync('tasklist', ['/FI', 'IMAGENAME eq WorkBuddy.exe', '/FO', 'CSV', '/NH'],
+      { encoding: 'utf8', timeout: 8000, windowsHide: true });
+    return /WorkBuddy\.exe/i.test(out);
+  } catch { return false; }
+}
+
+/**
+ * 自动切换账号：在「有剩余积分且即将到期」的账号里挑到期最早的，
+ * 若它还不是某应用的当前登录账号，就切过去——让即将过期的积分先被用掉。
+ *
+ * 对两个应用都切：CLI 写完即生效（不重启），桌面端仅在「正在运行」时重启生效。
+ * 目标账号必须在目标应用有登录快照才可切（token 域不同，跨域借用会被网关拒）。
+ *
+ * 返回结果摘要（供前端展示）；没有可切换的对象时原样返回说明，不报错。
+ */
+async function autoSwitchAccount() {
+  const all = wbApi.discoverAccounts();
+  if (!all.length) throw new Error('本机未找到登录态');
+
+  const credits = await wbApi.fetchCreditForAccounts(all);
+  let target = null, best = Infinity;
+  for (const c of credits) {
+    if (!c.ok || !c.totalRemaining || !c.soonestExpireAt) continue;
+    if (c.soonestExpireAt < best) { best = c.soonestExpireAt; target = c; }
+  }
+  if (!target) return '各账号均无带到期时间的剩余积分，无需切换';
+  const days = Math.ceil((best - Date.now()) / 86400000);
+  if (best > Date.now() + SWITCH_HORIZON_DAYS * 86400000) {
+    return `最近到期的积分还有 ${days} 天（超过 ${SWITCH_HORIZON_DAYS} 天），暂不切换`;
+  }
+
+  const sw = wbApi.listSwitchableAccounts();
+  const done = [];
+  for (const app of ['workbuddy-desktop', 'codebuddy-cli']) {
+    const appName = app === 'codebuddy-cli' ? 'CLI' : '桌面端';
+    const current = (sw.currentByApp && sw.currentByApp[app]) || null;
+    if (current === target.uid) { done.push(`${appName}已是该账号`); continue; }
+    const acc = (sw.accounts || []).find((a) => a.uid === target.uid);
+    if (!acc || !acc.snapshots || !acc.snapshots[app]) { done.push(`${appName}无该账号快照`); continue; }
+    // 桌面端只在「正在运行」时重启（避免把一个没在用的应用凭空拉起来）；
+    // CLI 不重启，写完即生效。
+    const restart = app !== 'codebuddy-cli' && isWorkbuddyRunning();
+    const r = wbApi.switchAppAccount(app, target.uid, { restart });
+    if (!r.ok) throw new Error(`切换${appName}失败：${r.error || '未知错误'}`);
+    done.push(`${appName}已切换${restart ? '（已重启客户端）' : ''}`);
+  }
+  const d = new Date(best).toLocaleDateString('zh-CN');
+  return `已切到「${target.name || target.uid}」（${days} 天后 ${d} 到期）：${done.join('，')}`;
+}
+
+/** 各任务的实际动作，返回结果摘要；失败时抛错（由 runAutoTask 记录）。 */
+async function runAutoTaskBody(name) {
+  if (name === 'checkin') {
+    const accounts = pickAccounts();
+    if (!accounts.length) throw new Error('本机未找到登录态');
+    let okN = 0, newN = 0, credit = 0;
+    for (const a of accounts) {
+      const r = await wbApi.doCheckin(a);   // 幂等：已签到的回 already，不重复提交
+      if (!r.ok) continue;
+      okN++;
+      if (!r.already) { newN++; credit += (r.todayCredit || 0); }
+    }
+    if (!okN) throw new Error(`共 ${accounts.length} 个账号，签到全部失败`);
+    return `共 ${accounts.length} 个账号：成功 ${okN} 个` +
+      (newN ? `，新签 ${newN} 个得 ${credit} 积分` : '（均为已签到的补查）');
+  }
+  if (name === 'travel') {
+    const accounts = pickAccounts();
+    if (!accounts.length) throw new Error('本机未找到登录态');
+    let departN = 0, claimN = 0, credit = 0, okN = 0, lastErr = '';
+    for (const a of accounts) {
+      const r = await wbApi.runTravel(a);
+      if (!r.ok) { lastErr = r.error || '未知错误'; continue; }
+      okN++;
+      if (r.action === 'depart') departN++;
+      else if (r.action === 'claim') { claimN++; credit += (r.rewardCredit || 0); }
+    }
+    if (!okN) throw new Error(`共 ${accounts.length} 个账号，全部失败：${lastErr}`);
+    const parts = [];
+    if (departN) parts.push(`派出 ${departN} 只`);
+    if (claimN) parts.push(`领取 ${claimN} 份奖励${credit ? `（+${credit} 积分）` : ''}`);
+    return `共 ${accounts.length} 个账号：${parts.join('，') || '旅行进行中，到点自动领奖'}` +
+      (lastErr && okN < accounts.length ? `（${accounts.length - okN} 个失败：${lastErr}）` : '');
+  }
+  if (name === 'switch') {
+    if (switching) return '已有手动切换进行中，本次跳过';
+    switching = true;
+    try { return await autoSwitchAccount(); } finally { switching = false; }
+  }
+  if (name === 'refresh') {
+    if (syncing) return '已有同步进行中，本次跳过';
+    syncing = true;
+    let r;
+    try { r = await runSync('credits'); } finally { syncing = false; }
+    if (!r.ok) throw new Error(r.error || '同步失败');
+    const m = r.meta || {};
+    const parts = [];
+    if (m.billRows != null) parts.push(`账单 ${m.billRows} 条`);
+    if (m.addedRows) parts.push(`新增 ${m.addedRows} 条`);
+    if (m.accounts != null) parts.push(`${m.accounts} 个账号余额已更新`);
+    return parts.length ? parts.join('，') : '同步完成';
+  }
+  throw new Error('未知任务：' + name);
+}
+
+/** 执行单个自动任务：记录尝试/成功/失败时间与结果摘要（带防重入）。 */
+async function runAutoTask(name) {
+  if (autoRunning.has(name)) return;
+  autoRunning.add(name);
+  if (!autoState[name]) autoState[name] = { tryAt: 0, okAt: 0, failAt: 0, error: '', info: '' };
+  const st = autoState[name];
+  st.tryAt = Date.now();
+  try {
+    if (!wbApi) throw new Error('缺少 workbuddy-api.js');
+    st.info = await runAutoTaskBody(name);
+    st.okAt = Date.now();
+    st.error = '';
+    console.log('[auto] ' + name + ' ✓ ' + st.info);
+  } catch (e) {
+    st.failAt = Date.now();
+    st.error = e.message || String(e);
+    console.error('[auto] ' + name + ' ✗ ' + st.error);
+  } finally {
+    autoRunning.delete(name);
+  }
+}
+
+/** 每分钟评估一次：开关开着且距上次「尝试」已超周期，就触发（失败也等完整周期再重试）。 */
+function autoTick() {
+  const now = Date.now();
+  for (const name of AUTO_KEYS) {
+    if (!autoConfig[name]) continue;
+    const st = autoState[name];
+    if (now - ((st && st.tryAt) || 0) >= AUTO_INTERVALS[name]) runAutoTask(name);
+  }
+}
+
+/** 自动任务配置读写：GET 返回当前配置与上次执行时间；POST 合并开关（打开即跑一次）。 */
+async function handleAuto(req, res) {
+  if (req.method !== 'POST') {
+    json(res, 200, { ok: true, config: { ...autoConfig }, lastRun: { ...autoState }, intervals: AUTO_INTERVALS });
+    return;
+  }
+  const body = await readBody(req);
+  let changed = false;
+  for (const k of AUTO_KEYS) {
+    if (typeof body[k] === 'boolean') {
+      if (!autoConfig[k] && body[k]) runAutoTask(k);   // 刚打开，立刻跑一次给反馈
+      autoConfig[k] = body[k];
+      changed = true;
+    }
+  }
+  if (changed) saveAutoConfig();
+  json(res, 200, { ok: true, config: { ...autoConfig }, lastRun: { ...autoState } });
+}
+
 // ---------------------------------------------------------------- 启动
 
 const server = http.createServer((req, res) => {
@@ -475,6 +680,7 @@ const server = http.createServer((req, res) => {
   if (pathname === '/api/travel-status') return handleCheckinStatus(req, res);
   if (pathname === '/api/switch' && req.method === 'POST') return handleSwitch(req, res);
   if (pathname === '/api/limits') return handleLimits(req, res);
+  if (pathname === '/api/auto') return handleAuto(req, res);
   if (pathname === '/api/status') return handleStatus(req, res);
   serveStatic(req, res);
 });
@@ -521,3 +727,6 @@ function listen(port, remaining) {
 }
 
 listen(DEFAULT_PORT, PORT_SCAN_LIMIT);
+
+/** 自动化调度：每分钟评估一次四个开关，谁开着且到点就跑。 */
+setInterval(autoTick, 60 * 1000);
