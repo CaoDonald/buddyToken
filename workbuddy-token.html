@@ -345,6 +345,10 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .spark{display:block;width:100%;height:15px;opacity:.85}
 .spark:hover{opacity:1}
 #tblRank td.num{white-space:nowrap}
+/* 走势可点击开大图 */
+.spark-link{cursor:pointer}
+.spark-link:hover .spark{opacity:1;filter:drop-shadow(0 0 3px rgba(76,111,255,.35))}
+#sparkBig svg{display:block}
 
 /* ---------- 可排序表头 ---------- */
 .tbl th.sortable{cursor:pointer;user-select:none;white-space:nowrap}
@@ -718,8 +722,8 @@ table.cal td.cal-cell.has:hover{
           <br>
           <b>数字下方的小走势</b>：当前筛选范围内该指标的逐桶走势——范围 ≤2 天按小时、
           ≤45 天按天、更长按周；请求数/积分/Token 的空桶画平线（0），
-          比率与耗时类空桶断线（样本不足不硬凑），有效点不足 2 个直接画平线；
-          悬停可看桶数与峰值。
+          比率与耗时类的无样本桶不硬凑 0，用虚线补齐；悬停看峰值，<b>点击查看大图</b>
+          （带坐标轴与悬停数值）。
         </p>
       </div>
 
@@ -2510,7 +2514,7 @@ function buildModelSeries(d, f){
   // 导出：模型 → 各指标的桶序列（与模型数据表的列一一对应）
   const series = new Map();
   for(const [model, buckets] of acc){
-    const s = { count:[], pts:[], tk:[], perPoint:[], perReq:[], cacheRate:[], latP50:[], ttft:[], speed:[], n, label };
+    const s = { model, count:[], pts:[], tk:[], perPoint:[], perReq:[], cacheRate:[], latP50:[], ttft:[], speed:[], n, label };
     for(const b of buckets){
       s.count.push(b.count);
       s.pts.push(b.pts);
@@ -2531,12 +2535,12 @@ function buildModelSeries(d, f){
     }
     series.set(model, s);
   }
-  return { series, n, label };
+  // s0/unitMs 供走势大图画 X 轴时间刻度
+  return { series, n, label, s0, unitMs };
 }
 
-/* 极简走势线：细灰线 + 末端主题色小圆点，贴近统计卡上的样式。
+/* 极简走势线：实线为实测段，虚线为跨无样本桶的补线（不硬凑 0）。
    viewBox 固定 100×18，由 CSS 横向拉伸到列宽，线宽用 non-scaling-stroke 锁定。
-   null 值断段（路径分段 M/L），全部等值画中平线；
    有效点不足 2 个时不画孤点，直接画一条贯穿的平线。 */
 function sparklineSVG(vals){
   const valid = vals.filter(v => v != null);
@@ -2545,32 +2549,63 @@ function sparklineSVG(vals){
   const min = Math.min(...valid), max = Math.max(...valid);
   const px = i => vals.length > 1 ? i / (vals.length - 1) * W : W / 2;
   const py = v => max === min ? H / 2 : padY + (1 - (v - min) / (max - min)) * (H - padY * 2);
-  const stroke = 'fill="none" stroke="#9aa7c7" stroke-width="1.4" stroke-linecap="round" ' +
-                 'stroke-linejoin="round" vector-effect="non-scaling-stroke"';
+  const solid = 'fill="none" stroke="#9aa7c7" stroke-width="1.4" stroke-linecap="round" ' +
+                'stroke-linejoin="round" vector-effect="non-scaling-stroke"';
+  const dash  = 'fill="none" stroke="#b9c5e6" stroke-width="1.2" stroke-dasharray="3 3" ' +
+                'stroke-linecap="round" vector-effect="non-scaling-stroke"';
   const svgOpen = inner => `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">${inner}</svg>`;
   // 点不够 → 一条贯穿的平线（唯一值取等值分支即中线）
   if(valid.length === 1){
     const y = py(valid[0]).toFixed(1);
-    return svgOpen(`<path d="M0 ${y} L${W} ${y}" ${stroke}/>`);
+    return svgOpen(`<path d="M0 ${y} L${W} ${y}" ${solid}/>`);
   }
-  let path = '', run = 0, lastX = 0, lastY = 0;
-  vals.forEach((v, i) => {
-    if(v == null){ run = 0; return; }
-    path += (run ? ' L' : 'M') + px(i).toFixed(1) + ' ' + py(v).toFixed(1);
-    run++; lastX = px(i).toFixed(1); lastY = py(v).toFixed(1);
-  });
-  return svgOpen(`<path d="${path}" ${stroke}/><circle cx="${lastX}" cy="${lastY}" r="2" fill="#4c6fff"/>`);
+  // 逐相邻有效点对：间隔 1 桶连实线，跨无样本桶连虚线
+  let solidD = '', dashD = '', prev = -1, firstIdx = -1;
+  for(let i = 0; i < vals.length; i++){
+    if(vals[i] == null) continue;
+    if(firstIdx === -1) firstIdx = i;
+    if(prev !== -1){
+      const seg = `M${px(prev).toFixed(1)} ${py(vals[prev]).toFixed(1)} L${px(i).toFixed(1)} ${py(vals[i]).toFixed(1)}`;
+      if(i - prev === 1) solidD += seg; else dashD += seg;
+    }
+    prev = i;
+  }
+  // 首尾的无样本桶也补虚线：延续最近的有效值到图边缘，整条线不留空
+  if(firstIdx > 0)
+    dashD += `M0 ${py(vals[firstIdx]).toFixed(1)} L${px(firstIdx).toFixed(1)} ${py(vals[firstIdx]).toFixed(1)}`;
+  if(prev < vals.length - 1)
+    dashD += `M${px(prev).toFixed(1)} ${py(vals[prev]).toFixed(1)} L${W} ${py(vals[prev]).toFixed(1)}`;
+  const dot = `<circle cx="${px(prev).toFixed(1)}" cy="${py(vals[prev]).toFixed(1)}" r="2" fill="#4c6fff"/>`;
+  return svgOpen(
+    (dashD ? `<path d="${dashD}" ${dash}/>` : '') +
+    (solidD ? `<path d="${solidD}" ${solid}/>` : '') + dot);
 }
 
-/* 数值单元格包装：数字在上、走势线在下；没有走势数据时保持原样 */
-function sparkTd(numHtml, vals, meta, fmtV){
+/* 数值单元格包装：数字在上、走势线在下；没有走势数据时保持原样。
+   带 data-model / data-metric，点击由 openSparkModal 弹大图 */
+function sparkTd(numHtml, sr, metric){
+  const vals = sr && sr[metric];
   if(!vals || !vals.some(v => v != null)) return `<td class="num">${numHtml}</td>`;
+  const fmtV = RANK_FMT[metric].fmt;
   let peak = -Infinity;
   for(const v of vals) if(v != null && v > peak) peak = v;
-  return `<td class="num"><span class="cellwrap" ` +
-         `title="按${meta.label}走势（${meta.n} 桶）· 峰值 ${fmtV(peak)}">` +
+  return `<td class="num"><span class="cellwrap spark-link" data-model="${esc(sr.model)}" data-metric="${metric}" ` +
+         `title="按${sr.label}走势（${sr.n} 桶）· 峰值 ${fmtV(peak)} · 点击查看大图">` +
          `<span class="cellnum">${numHtml}</span>${sparklineSVG(vals)}</span></td>`;
 }
+
+/* 模型数据各指标的展示名与数值格式化（单元格 tooltip、大图坐标轴共用） */
+const RANK_FMT = {
+  count:     { t:'请求数',       fmt: v => fmt0(Math.round(v)) },
+  pts:       { t:'积分',         fmt: v => fmt2(v) },
+  tk:        { t:'Token',        fmt: v => fmtTok(v) },
+  perPoint:  { t:'每积分 Token', fmt: v => fmtTok(v) },
+  latP50:    { t:'响应 P50',     fmt: v => (v/1000).toFixed(1) + 's' },
+  ttft:      { t:'首字延迟',     fmt: v => v.toFixed(1) + 's' },
+  speed:     { t:'输出速度',     fmt: v => v.toFixed(0) + ' tok/s' },
+  perReq:    { t:'单次积分',     fmt: v => fmt2(v) },
+  cacheRate: { t:'缓存率',       fmt: v => (v*100).toFixed(1) + '%' },
+};
 
 /* 模型数据表的列定义（num=右对齐；k 对应 modelRank 里的字段名） */
 const RANK_COLS = [
@@ -2626,25 +2661,22 @@ function renderModelRank(d){
     const sr = ms.series.get(m.key);
     return `<tr>
       <td><span class="pill">${esc(m.key)}</span></td>
-      ${sparkTd(`<span style="color:#6b7891">${fmt0(m.count)}</span>`, sr && sr.count, sr, fmt0)}
-      ${sparkTd(fmt2(m.pts), sr && sr.pts, sr, fmt2)}
-      ${sparkTd(fmtTok(m.tk), sr && sr.tk, sr, fmtTok)}
+      ${sparkTd(`<span style="color:#6b7891">${fmt0(m.count)}</span>`, sr, 'count')}
+      ${sparkTd(fmt2(m.pts), sr, 'pts')}
+      ${sparkTd(fmtTok(m.tk), sr, 'tk')}
       ${m.free
         ? `<td class="num"><span class="free-tag">免费</span></td>`
-        : sparkTd(`<span style="font-weight:600">${fmtTok(m.perPoint)}</span>`, sr && sr.perPoint, sr, fmtTok)}
+        : sparkTd(`<span style="font-weight:600">${fmtTok(m.perPoint)}</span>`, sr, 'perPoint')}
       ${sparkTd(`<span style="color:#6b7891"${
         m.latP50 != null && m.latN < 30 ? ` title="样本仅 ${m.latN} 条，参考价值有限"` : ''}>${
         m.latP50 != null
           ? (m.latP50 / 1000).toFixed(1) + 's' +
             (m.latN < 30 ? '<span style="color:#c8a24a" title="样本不足">*</span>' : '')
-          : '—'}</span>`, sr && sr.latP50, sr, v => (v / 1000).toFixed(1) + 's')}
-      ${sparkTd(`<span style="color:#6b7891">${m.ttft != null ? m.ttft.toFixed(1) + 's' : '—'}</span>`,
-        sr && sr.ttft, sr, v => v.toFixed(1) + 's')}
-      ${sparkTd(`<span style="color:#6b7891">${m.speed != null ? m.speed.toFixed(0) + ' tok/s' : '—'}</span>`,
-        sr && sr.speed, sr, v => v.toFixed(0) + ' tok/s')}
-      ${sparkTd(`<span style="color:#6b7891">${fmt2(m.perReq)}</span>`, sr && sr.perReq, sr, fmt2)}
-      ${sparkTd(`<span style="color:#6b7891">${(m.cacheRate*100).toFixed(1)}%</span>`,
-        sr && sr.cacheRate, sr, v => (v * 100).toFixed(1) + '%')}
+          : '—'}</span>`, sr, 'latP50')}
+      ${sparkTd(`<span style="color:#6b7891">${m.ttft != null ? m.ttft.toFixed(1) + 's' : '—'}</span>`, sr, 'ttft')}
+      ${sparkTd(`<span style="color:#6b7891">${m.speed != null ? m.speed.toFixed(0) + ' tok/s' : '—'}</span>`, sr, 'speed')}
+      ${sparkTd(`<span style="color:#6b7891">${fmt2(m.perReq)}</span>`, sr, 'perReq')}
+      ${sparkTd(`<span style="color:#6b7891">${(m.cacheRate*100).toFixed(1)}%</span>`, sr, 'cacheRate')}
     </tr>`;
   }).join('');
 
@@ -4198,6 +4230,129 @@ function syncFloatExpand(open){
   if(fx) fx.textContent = open ? '▴ 收起' : '▾ 展开';
 }
 
+/* ---------- 走势大图：点击模型数据表的 sparkline 弹出 ---------- */
+function openSparkModal(model, metric){
+  const meta = RANK_FMT[metric];
+  if(!meta) return;
+  // 点击时现算：保证与当前筛选完全一致（renderModelRank 里那份是渲染期的）
+  const ms = buildModelSeries(getFiltered(), state.filters);
+  const sr = ms.series.get(model);
+  const vals = sr && sr[metric];
+  if(!vals || !vals.some(v => v != null)){ toast('该指标没有可显示的数据'); return; }
+
+  const colT = (RANK_COLS.find(c => c.k === metric) || {}).t || metric;
+  const valid = vals.filter(v => v != null);
+  const W = 920, H = 380, L = 70, R = 16, T = 34, B = 42;
+  const iw = W - L - R, ih = H - T - B;
+  let min = Math.min(...valid), max = Math.max(...valid);
+  if(min === max){ min -= Math.abs(min) * 0.1 + 1; max += Math.abs(max) * 0.1 + 1; }
+  const pad = (max - min) * 0.08; min -= pad; max += pad;
+  const px = i => L + (vals.length > 1 ? i / (vals.length - 1) * iw : iw / 2);
+  const py = v => T + (1 - (v - min) / (max - min)) * ih;
+
+  // 折线：实线 = 相邻桶直连（实测）；虚线 = 跨无样本桶的补线；
+  // 首尾的无样本桶同样延续最近的有效值补到图边缘
+  let solid = '', dashed = '', prev = -1, firstIdx = -1;
+  const dots = [];
+  for(let i = 0; i < vals.length; i++){
+    if(vals[i] == null) continue;
+    if(firstIdx === -1) firstIdx = i;
+    if(prev !== -1){
+      const seg = `M${px(prev).toFixed(1)} ${py(vals[prev]).toFixed(1)} L${px(i).toFixed(1)} ${py(vals[i]).toFixed(1)}`;
+      if(i - prev === 1) solid += seg; else dashed += seg;
+    }
+    dots.push(`<circle cx="${px(i).toFixed(1)}" cy="${py(vals[i]).toFixed(1)}" r="2.5" fill="#4c6fff"/>`);
+    prev = i;
+  }
+  if(firstIdx > 0)
+    dashed += `M0 ${py(vals[firstIdx]).toFixed(1)} L${px(firstIdx).toFixed(1)} ${py(vals[firstIdx]).toFixed(1)}`;
+  if(prev < vals.length - 1)
+    dashed += `M${px(prev).toFixed(1)} ${py(vals[prev]).toFixed(1)} L${W - R} ${py(vals[prev]).toFixed(1)}`;
+  // Y 轴：4 档网格线 + 刻度
+  const grid = [0,1,2,3,4].map(k => {
+    const v = min + (max - min) * k / 4, y = py(v).toFixed(1);
+    return `<line x1="${L}" y1="${y}" x2="${W-R}" y2="${y}" stroke="#eef1f8"/>` +
+           `<text x="${L-8}" y="${(+y + 4).toFixed(1)}" text-anchor="end" font-size="11" fill="#8b98b3">${meta.fmt(v)}</text>`;
+  }).join('');
+  // X 轴：约 10 个时间刻度（按桶粒度格式化）
+  const step = Math.max(1, Math.ceil(vals.length / 10));
+  const fmtT = ms.unitMs === 3600000
+    ? t => { const d = new Date(t); return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
+    : t => { const d = new Date(t); return `${d.getMonth() + 1}/${d.getDate()}`; };
+  let xticks = '';
+  for(let i = 0; i < vals.length; i += step)
+    xticks += `<text x="${px(i).toFixed(1)}" y="${H - B + 20}" text-anchor="middle" font-size="11" fill="#8b98b3">${fmtT(ms.s0 + i * ms.unitMs)}</text>`;
+
+  const root = $('modalRoot');
+  root.innerHTML = `
+    <div class="modal" id="modalMask">
+      <div class="modal-box" style="width:min(980px,100%)">
+        <div class="modal-head">
+          📈 ${esc(model)} · ${colT}
+          <span style="font-weight:500;font-size:12px;color:var(--muted)">
+            按${ms.label}（${ms.n} 桶）· 范围 ${state.filters.from || '全部'} ~ ${state.filters.to || '最新'}</span>
+          <span class="x" id="sparkModalClose">×</span>
+        </div>
+        <div class="modal-body" style="padding:14px 18px">
+          <div id="sparkBig">
+            <svg id="sparkSvg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;max-width:100%">
+              ${grid}
+              <line x1="${L}" y1="${H - B}" x2="${W - R}" y2="${H - B}" stroke="#c9d2e6"/>
+              ${xticks}
+              ${dashed ? `<path d="${dashed}" fill="none" stroke="#b9c5e6" stroke-width="1.6" stroke-dasharray="5 4" stroke-linecap="round"/>` : ''}
+              ${solid ? `<path d="${solid}" fill="none" stroke="#7d8db4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>` : ''}
+              ${dots.join('')}
+              <line id="hovLine" y1="${T}" y2="${H - B}" stroke="#4c6fff" stroke-dasharray="3 3" visibility="hidden"/>
+              <circle id="hovDot" r="4" fill="#fff" stroke="#4c6fff" stroke-width="2" visibility="hidden"/>
+              <text id="hovTxt" x="${L + 4}" y="18" font-size="12.5" font-weight="600" fill="#1f2d4d" visibility="hidden"></text>
+              <rect x="${L}" y="${T}" width="${iw}" height="${ih}" fill="transparent"/>
+            </svg>
+          </div>
+          <div style="font-size:11.5px;color:#8b98b3;margin-top:8px">
+            实线为实测段；虚线为无样本区间的补线（不硬凑 0）。悬停查看各桶的具体值，Esc 或点 × 关闭。
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  const close = () => { root.innerHTML = ''; document.removeEventListener('keydown', onKey); };
+  const onKey = e => { if(e.key === 'Escape') close(); };
+  $('sparkModalClose').onclick = close;
+  $('modalMask').onclick = e => { if(e.target.id === 'modalMask') close(); };
+  document.addEventListener('keydown', onKey);
+
+  // 悬停：取最近桶，显示参考线 + 数值（null 桶标「无样本」）
+  const svgEl = root.querySelector('#sparkSvg');
+  const hLine = root.querySelector('#hovLine'), hDot = root.querySelector('#hovDot'),
+        hTxt = root.querySelector('#hovTxt');
+  const show = i => {
+    const X = px(i).toFixed(1);
+    hLine.setAttribute('x1', X); hLine.setAttribute('x2', X);
+    hLine.setAttribute('visibility', 'visible');
+    if(vals[i] != null){
+      hDot.setAttribute('cx', X); hDot.setAttribute('cy', py(vals[i]).toFixed(1));
+      hDot.setAttribute('visibility', 'visible');
+      hTxt.textContent = `${fmtT(ms.s0 + i * ms.unitMs)} · ${meta.fmt(vals[i])}`;
+    }else{
+      hDot.setAttribute('visibility', 'hidden');
+      hTxt.textContent = `${fmtT(ms.s0 + i * ms.unitMs)} · 无样本`;
+    }
+    hTxt.setAttribute('visibility', 'visible');
+    // 靠右的桶右对齐文本，防止溢出画面
+    const atRight = i > vals.length * 0.7;
+    hTxt.setAttribute('text-anchor', atRight ? 'end' : 'start');
+    hTxt.setAttribute('x', atRight ? (W - R - 2).toFixed(1) : (L + 4).toFixed(1));
+  };
+  const hide = () => { [hLine, hDot, hTxt].forEach(el => el.setAttribute('visibility', 'hidden')); };
+  svgEl.addEventListener('mousemove', e => {
+    const rect = svgEl.getBoundingClientRect();
+    const scale = rect.width / W || 1;               // svg 被 CSS 压缩时按比例还原坐标
+    let i = Math.round(((e.clientX - rect.left) / scale - L) / (iw / Math.max(1, vals.length - 1)));
+    show(Math.max(0, Math.min(vals.length - 1, i)));
+  });
+  svgEl.addEventListener('mouseleave', hide);
+}
+
 function bindChips(){
   const handler = e => {
     const b = e.target.closest('.chip');
@@ -4228,6 +4383,12 @@ function bindChips(){
   $('modelChips').addEventListener('click', handler);
   $('clientChips').addEventListener('click', handler);
   $('acctChips').addEventListener('click', handler);
+
+  // 模型数据表的 sparkline：点击弹出走势大图
+  $('tblRank').addEventListener('click', e => {
+    const s = e.target.closest('.spark-link');
+    if(s) openSparkModal(s.dataset.model, s.dataset.metric);
+  });
 }
 
 /* =========================================================
