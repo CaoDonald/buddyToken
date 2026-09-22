@@ -331,6 +331,13 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
   display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;
   background:#e7f8f1;color:#0b8a63;
 }
+/* 单元格内嵌走势：数字在上、走势线在下撑满格子，hover 出分桶说明。
+   线用 viewBox 100×18 横向拉伸到列宽，vector-effect 保证线宽不随拉伸变形 */
+.cellwrap{display:flex;flex-direction:column;align-items:flex-end;gap:2px;width:100%}
+.cellwrap .cellnum{white-space:nowrap}
+.spark{display:block;width:100%;height:15px;opacity:.85}
+.spark:hover{opacity:1}
+#tblRank td.num{white-space:nowrap}
 
 /* ---------- 可排序表头 ---------- */
 .tbl th.sortable{cursor:pointer;user-select:none;white-space:nowrap}
@@ -699,6 +706,11 @@ table.cal td.cal-cell.has:hover{
           已排除工具执行时间但含网络与排队。后两者由「耗时 ≈ 首字延迟 + 输出 token ÷ 速度」
           分箱回归拟合得出（样本不足 60 条时留空）。带 <span style="color:#c8a24a">*</span> 表示样本不足 30 条。
           <b>单次请求耗时不等于用户等待时间</b>——用户等的是整个回合，见上方 KPI 的「模型耗时占比」。
+          <br>
+          <b>数字下方的小走势</b>：当前筛选范围内该指标的逐桶走势——范围 ≤2 天按小时、
+          ≤45 天按天、更长按周；请求数/积分/Token 的空桶画平线（0），
+          比率与耗时类空桶断线（样本不足不硬凑），有效点不足 2 个直接画平线；
+          悬停可看桶数与峰值。
         </p>
       </div>
 
@@ -2419,6 +2431,138 @@ function renderTables(d){
 /* =========================================================
  *  8.4 模型数据
  * =======================================================*/
+/* ---------- 单元格内嵌走势（sparkline） ----------
+   每个数值单元格的数字右侧画一条该指标随时间的迷你走势线，
+   范围 = 当前筛选范围（日期/时间粒度筛选都算）。 */
+
+/* 按当前筛选范围自适应分桶：≤2 天按小时、≤45 天按天、更长按周。
+   一次遍历 d 按 (模型, 桶) 累加各指标的分子分母，P50/拟合在导出时按桶计算。
+   求和类指标（请求数/积分/Token）空桶记 0（画平线）；比率与耗时类空桶记
+   null（画断线）——0 会把均值和比率瞬间砸穿，语义完全不同。 */
+function buildModelSeries(d, f){
+  let lo = Infinity, hi = -Infinity;
+  for(const x of d){
+    const t = x.time.getTime();
+    if(t < lo) lo = t;
+    if(t > hi) hi = t;
+  }
+  let start, end;
+  if(f.fromTs || f.toTs){                       // 分钟级快捷（近30分/近1时/近3时）
+    start = f.fromTs || lo;
+    end   = f.toTs   || hi;
+  }else if(f.from || f.to){                     // 日期选择（某天～某天）
+    start = f.from ? new Date(f.from + 'T00:00:00').getTime() : lo;
+    end   = f.to   ? new Date(f.to   + 'T23:59:59.999').getTime() : hi;
+  }else{
+    start = lo; end = hi;
+  }
+  const span = Math.max(end - start, 0);
+  const unitMs = span <= 2 * 86400000 ? 3600000
+               : span <= 45 * 86400000 ? 86400000
+               : 7 * 86400000;
+  const label = unitMs === 3600000 ? '小时' : unitMs === 86400000 ? '天' : '周';
+  // 天/周桶对齐到本地 0 点、小时桶对齐整点，避免从数据中间硬切出半截桶
+  let s0;
+  if(unitMs === 3600000){
+    s0 = Math.floor(start / 3600000) * 3600000;
+  }else{
+    const dd = new Date(start);
+    s0 = new Date(dd.getFullYear(), dd.getMonth(), dd.getDate()).getTime();
+  }
+  const n = Math.max(1, Math.ceil((end - s0) / unitMs));
+
+  // acc：模型 → n 个桶，每桶累加各指标的基础量
+  const acc = new Map();
+  for(const x of d){
+    const ts = x.time.getTime();
+    if(ts < s0 || ts > end) continue;
+    let arr = acc.get(x.model);
+    if(!arr){
+      arr = Array.from({length:n}, () => ({count:0, pts:0, tk:0, tkIn:0, tkCr:0, lats:[], pairs:[]}));
+      acc.set(x.model, arr);
+    }
+    const b = arr[Math.min(n - 1, Math.max(0, Math.floor((ts - s0) / unitMs)))];
+    b.count++;
+    b.pts += x.points;
+    const t = x.token;
+    if(t){
+      b.tk   += t.tot;
+      b.tkIn += t.in;
+      b.tkCr += t.cr;
+      if(t.d){
+        for(const st of t.d){
+          const lat = st[5] || 0, out = st[3] || 0;
+          if(lat > 0){ b.lats.push(lat); b.pairs.push([out, lat]); }
+        }
+      }
+    }
+  }
+
+  // 导出：模型 → 各指标的桶序列（与模型数据表的列一一对应）
+  const series = new Map();
+  for(const [model, buckets] of acc){
+    const s = { count:[], pts:[], tk:[], perPoint:[], perReq:[], cacheRate:[], latP50:[], ttft:[], speed:[], n, label };
+    for(const b of buckets){
+      s.count.push(b.count);
+      s.pts.push(b.pts);
+      s.tk.push(b.tk);
+      s.perPoint.push(b.pts > 0 ? b.tk / b.pts : null);
+      s.perReq.push(b.count > 0 ? b.pts / b.count : null);
+      s.cacheRate.push(b.tkIn > 0 ? b.tkCr / b.tkIn : null);
+      if(b.lats.length){
+        const sorted = [...b.lats].sort((a, z) => a - z);
+        s.latP50.push(sorted[Math.floor(sorted.length / 2)]);
+      }else{
+        s.latP50.push(null);
+      }
+      // 与单元格同口径：桶内分箱回归，样本不足 60 的桶断线
+      const fit = b.pairs.length >= 60 ? fitLatency(b.pairs) : null;
+      s.ttft.push(fit ? fit.ttft : null);
+      s.speed.push(fit ? fit.speed : null);
+    }
+    series.set(model, s);
+  }
+  return { series, n, label };
+}
+
+/* 极简走势线：细灰线 + 末端主题色小圆点，贴近统计卡上的样式。
+   viewBox 固定 100×18，由 CSS 横向拉伸到列宽，线宽用 non-scaling-stroke 锁定。
+   null 值断段（路径分段 M/L），全部等值画中平线；
+   有效点不足 2 个时不画孤点，直接画一条贯穿的平线。 */
+function sparklineSVG(vals){
+  const valid = vals.filter(v => v != null);
+  if(!valid.length) return '';
+  const W = 100, H = 18, padY = 3;
+  const min = Math.min(...valid), max = Math.max(...valid);
+  const px = i => vals.length > 1 ? i / (vals.length - 1) * W : W / 2;
+  const py = v => max === min ? H / 2 : padY + (1 - (v - min) / (max - min)) * (H - padY * 2);
+  const stroke = 'fill="none" stroke="#9aa7c7" stroke-width="1.4" stroke-linecap="round" ' +
+                 'stroke-linejoin="round" vector-effect="non-scaling-stroke"';
+  const svgOpen = inner => `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">${inner}</svg>`;
+  // 点不够 → 一条贯穿的平线（唯一值取等值分支即中线）
+  if(valid.length === 1){
+    const y = py(valid[0]).toFixed(1);
+    return svgOpen(`<path d="M0 ${y} L${W} ${y}" ${stroke}/>`);
+  }
+  let path = '', run = 0, lastX = 0, lastY = 0;
+  vals.forEach((v, i) => {
+    if(v == null){ run = 0; return; }
+    path += (run ? ' L' : 'M') + px(i).toFixed(1) + ' ' + py(v).toFixed(1);
+    run++; lastX = px(i).toFixed(1); lastY = py(v).toFixed(1);
+  });
+  return svgOpen(`<path d="${path}" ${stroke}/><circle cx="${lastX}" cy="${lastY}" r="2" fill="#4c6fff"/>`);
+}
+
+/* 数值单元格包装：数字在上、走势线在下；没有走势数据时保持原样 */
+function sparkTd(numHtml, vals, meta, fmtV){
+  if(!vals || !vals.some(v => v != null)) return `<td class="num">${numHtml}</td>`;
+  let peak = -Infinity;
+  for(const v of vals) if(v != null && v > peak) peak = v;
+  return `<td class="num"><span class="cellwrap" ` +
+         `title="按${meta.label}走势（${meta.n} 桶）· 峰值 ${fmtV(peak)}">` +
+         `<span class="cellnum">${numHtml}</span>${sparklineSVG(vals)}</span></td>`;
+}
+
 /* 模型数据表的列定义（num=右对齐；k 对应 modelRank 里的字段名） */
 const RANK_COLS = [
   { k:'key',       t:'模型' },
@@ -2438,6 +2582,9 @@ function renderModelRank(d){
   const card = $('rankCard');
   if(card) card.hidden = !state.all.length || !s.modelRank.length;
   if(!s.modelRank.length) return;
+
+  // 走势序列：按当前筛选范围分桶，每模型 × 每指标一条时间序列
+  const ms = buildModelSeries(d, state.filters);
 
   // 按 state.rank 排序。免费的「每积分 Token」视为无穷大，
   // 这样降序排在最前、升序排在最后，符合数值直觉。
@@ -2466,24 +2613,31 @@ function renderModelRank(d){
            `${c.t}${on ? (dir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`;
   }).join('');
 
-  const rows = list.map(m => `<tr>
+  const rows = list.map(m => {
+    const sr = ms.series.get(m.key);
+    return `<tr>
       <td><span class="pill">${esc(m.key)}</span></td>
-      <td class="num" style="color:#6b7891">${fmt0(m.count)}</td>
-      <td class="num">${fmt2(m.pts)}</td>
-      <td class="num">${fmtTok(m.tk)}</td>
-      <td class="num" style="font-weight:600">${
-        m.free ? '<span class="free-tag">免费</span>' : fmtTok(m.perPoint)}</td>
-      <td class="num" style="color:#6b7891"${
+      ${sparkTd(`<span style="color:#6b7891">${fmt0(m.count)}</span>`, sr && sr.count, sr, fmt0)}
+      ${sparkTd(fmt2(m.pts), sr && sr.pts, sr, fmt2)}
+      ${sparkTd(fmtTok(m.tk), sr && sr.tk, sr, fmtTok)}
+      ${m.free
+        ? `<td class="num"><span class="free-tag">免费</span></td>`
+        : sparkTd(`<span style="font-weight:600">${fmtTok(m.perPoint)}</span>`, sr && sr.perPoint, sr, fmtTok)}
+      ${sparkTd(`<span style="color:#6b7891"${
         m.latP50 != null && m.latN < 30 ? ` title="样本仅 ${m.latN} 条，参考价值有限"` : ''}>${
         m.latP50 != null
           ? (m.latP50 / 1000).toFixed(1) + 's' +
             (m.latN < 30 ? '<span style="color:#c8a24a" title="样本不足">*</span>' : '')
-          : '—'}</td>
-      <td class="num" style="color:#6b7891">${m.ttft != null ? m.ttft.toFixed(1) + 's' : '—'}</td>
-      <td class="num" style="color:#6b7891">${m.speed != null ? m.speed.toFixed(0) + ' tok/s' : '—'}</td>
-      <td class="num" style="color:#6b7891">${fmt2(m.perReq)}</td>
-      <td class="num" style="color:#6b7891">${(m.cacheRate*100).toFixed(1)}%</td>
-    </tr>`).join('');
+          : '—'}</span>`, sr && sr.latP50, sr, v => (v / 1000).toFixed(1) + 's')}
+      ${sparkTd(`<span style="color:#6b7891">${m.ttft != null ? m.ttft.toFixed(1) + 's' : '—'}</span>`,
+        sr && sr.ttft, sr, v => v.toFixed(1) + 's')}
+      ${sparkTd(`<span style="color:#6b7891">${m.speed != null ? m.speed.toFixed(0) + ' tok/s' : '—'}</span>`,
+        sr && sr.speed, sr, v => v.toFixed(0) + ' tok/s')}
+      ${sparkTd(`<span style="color:#6b7891">${fmt2(m.perReq)}</span>`, sr && sr.perReq, sr, fmt2)}
+      ${sparkTd(`<span style="color:#6b7891">${(m.cacheRate*100).toFixed(1)}%</span>`,
+        sr && sr.cacheRate, sr, v => (v * 100).toFixed(1) + '%')}
+    </tr>`;
+  }).join('');
 
   $('tblRank').innerHTML = `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody>`;
 }
