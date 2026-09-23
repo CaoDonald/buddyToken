@@ -8,6 +8,10 @@ checkin-history.json
 # 自动化开关配置（四个自动任务的开关状态，纯布尔偏好，不入库）
 auto-config.json
 
+# 云同步：连接配置（含 Supabase anonKey）与同步游标，切勿提交
+sync-config.json
+sync-state.json
+
 # 账号凭证与官方账单：含明文 accessToken/refreshToken、真实 requestId，切勿提交
 wb-accounts.json
 billing-data.js

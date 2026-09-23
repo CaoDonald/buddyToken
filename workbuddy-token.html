@@ -574,6 +574,7 @@ table.cal td.cal-cell.has:hover{
       <div class="fgroup" id="modelGroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
       <div class="fgroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
+      <div class="fgroup"><label>机器</label><div class="chips" id="machineChips"></div></div>
       <button class="chip chip-more float-expand" id="floatExpand" type="button">▾ 展开</button>
       <div class="statline" id="statLine"></div>
       <button class="pin-toggle" id="pinToggle" type="button" aria-pressed="false"></button>
@@ -972,7 +973,7 @@ function mergeByRequestId(oldRows, newRows){
  * =======================================================*/
 const state = {
   all: [], fileName: '', sheetName: '',
-  filters: { from:'', to:'', fromTs:0, toTs:0, models:new Set(), clients:new Set(), accounts:new Set() },
+  filters: { from:'', to:'', fromTs:0, toTs:0, models:new Set(), clients:new Set(), accounts:new Set(), machines:new Set() },
   charts: {},
   tokenLoaded: false,   // token-usage-data.js 是否成功加载
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
@@ -1033,6 +1034,8 @@ function getFiltered(range){
     if(f.clients.size  && !f.clients.has(x.client))     return false;
     // 账号：空串代表「未知」（手工导入的 Excel 行没有账号归属）
     if(f.accounts.size && !f.accounts.has(x.acct || '')) return false;
+    // 机器：空串代表「未标注」（云同步没启用，或该账单反查不到是哪个回合产生的）
+    if(f.machines.size && !f.machines.has(x.mch || '')) return false;
     return true;
   });
 }
@@ -1173,7 +1176,7 @@ function computeStats(d){
     if(!t || !t.s) continue;
     let o = sessMap.get(t.s);
     if(!o){
-      o = { key:t.s, title:tiMap[t.s] || '', cwd:t.p || '', count:0, reqs:0, pts:0,
+      o = { key:t.s, title:tiMap[t.s] || '', cwd:t.p || '', machine:t.mch || '', count:0, reqs:0, pts:0,
             tk:0, tkIn:0, tkOut:0, tkCr:0, t0:0, t1:0, models:new Set() };
       sessMap.set(t.s, o);
     }
@@ -2873,6 +2876,7 @@ const SESS_COLS = [
   { k:'key',       t:'Session' },
   { k:'title',     t:'标题' },
   { k:'cwd',       t:'工作目录' },
+  { k:'machine',   t:'机器' },
   { k:'t0',        t:'时间范围' },
   { k:'count',     t:'回合',        num:1 },
   { k:'reqs',      t:'请求数',      num:1 },
@@ -2899,7 +2903,10 @@ function renderSessionRank(d){
     return sign * (na - nb);
   });
 
-  const head = SESS_COLS.map(c => {
+  // 机器列只在数据里真有机器标识时出现——没启用云同步时整列都是空的，没必要占宽度
+  const showMachine = list.some(o => o.machine);
+
+  const head = SESS_COLS.filter(c => c.k !== 'machine' || showMachine).map(c => {
     const on = sort === c.k;
     return `<th class="sortable${on ? ' on' : ''}${c.num ? ' num' : ''}" data-k="${c.k}" title="点击排序">` +
            `${c.t}${on ? (dir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`;
@@ -2923,6 +2930,7 @@ function renderSessionRank(d){
       <td class="mono" title="${esc(o.key)}">${esc(o.key.slice(0, 8))}…</td>
       <td title="${esc(title)}">${title ? esc(titleShort) : '<span style="color:#6b7891">—</span>'}</td>
       <td class="mono" style="color:#6b7891" title="${esc(cwd)}">${esc(cwdShort) || '—'}</td>
+      ${showMachine ? `<td style="color:#6b7891" title="${esc(o.machine)}">${esc(machineLabel(o.machine))}</td>` : ''}
       <td class="mono" style="color:#6b7891;font-size:12px">${dur}</td>
       <td class="num" style="color:#6b7891">${fmt0(o.count)}</td>
       <td class="num" style="color:#6b7891">${fmt0(o.reqs)}</td>
@@ -3492,7 +3500,11 @@ const TokenData = (() => {
       if(!_data.ti) _data.ti = {};    // 旧版数据文件没有标题表，补一个空表
       let added = 0, updated = 0;
       for(const [k, v] of Object.entries(turns)){
-        if(_data.t[k]) updated++; else added++;
+        const old = _data.t[k];
+        if(old) updated++; else added++;
+        // 机器归属是云同步的产物，浏览器直读本地目录拿不到——同键覆盖时把旧值上的
+        // mch 留下来，否则点一次「📁 连接本地会话」就把机器标注全抹掉了
+        if(old && old.mch && !v.mch) v.mch = old.mch;
         _data.t[k] = v;
       }
       // 会话标题（会话级，与回合不是一一对应）：已有键不覆盖
@@ -3550,7 +3562,9 @@ const OfficialBill = (() => {
         hour: time.getHours(),
         min: time.getMinutes(),
         // 账号归属只可能来自账单侧：本地 jsonl 里没有账号标识
-        acct: uids[r[5]] || ''
+        acct: uids[r[5]] || '',
+        // 机器归属（云同步）：第 7 位。旧数据没有这一位，读成 undefined 归为空串
+        mch: r[6] || ''
       });
     }
     return out;
@@ -4253,7 +4267,12 @@ function attachTokens(rows){
   for(const r of rows){
     if(!r.id || r.id === '-'){ r.token = null; noId++; continue; }
     const t = TokenData.lookup(r.id);
-    if(t){ r.token = t; hit++; }
+    if(t){
+      r.token = t; hit++;
+      // 机器归属的双保险：账单行没有第 7 位时（旧产物 / 手工导入的 Excel），
+      // 用关联到的回合补上，免得按机器筛选时这一行被当成「未标注」
+      if(!r.mch && t.mch) r.mch = t.mch;
+    }
     else { r.token = null; miss++; }
   }
   const total = hit + miss;   // 分母排除没有 RequestID 的行
@@ -4449,6 +4468,20 @@ function acctLabel(uid){
   return hit ? hit.name : String(uid).slice(0, 8) + '…';
 }
 
+/**
+ * 机器 → 展示名。名册在数据顶层 machines（由云端拉回，本机那条由报告脚本写入），
+ * 拿不到就退回 ID 前 8 位，保证任何情况下都能分辨。
+ *
+ * 账单行是账号维度、本身没有机器归属，靠「request_id 与回合同源」反查得到。
+ * 反查不到的（CLI 会话、别的机器用同账号发出的请求、会话已清理）算「未标注」
+ * ——单列一类而不是丢掉，这样按机器筛选时不会悄悄少掉一笔积分。
+ */
+function machineLabel(id){
+  if(!id) return '未标注';
+  const m = (TokenData.get() || {}).machines || {};
+  return m[id] || String(id).slice(0, 8);
+}
+
 /** 模型 chip 是否展开。render() 每次都会重建 chips，靠它记住展开状态。 */
 let modelsOpen = false;
 
@@ -4460,6 +4493,7 @@ function renderChips(){
   const models  = [...new Set(state.all.map(x => x.model))].sort();
   const clients = [...new Set(state.all.map(x => x.client))].sort();
   const accts   = [...new Set(state.all.map(x => x.acct || ''))].sort();
+  const machines = [...new Set(state.all.map(x => x.mch || ''))].sort();
 
   const empty = '<span style="color:#a8b3c8;font-size:12px">—</span>';
 
@@ -4491,6 +4525,16 @@ function renderChips(){
     chipHtml('acct', u, acctLabel(u), state.filters.accounts.has(u))
   ).join('') || empty;
 
+  // 机器 chip：值同样是 id（空串＝未标注），显示名另取。
+  // 整组只在「数据里真有机器标识」时出现——没启用云同步时所有行都是空串，
+  // 那时铺一个孤零零的「未标注」组只会让人困惑，直接藏掉。
+  const hasMachines = machines.some(id => id);
+  $('machineChips').innerHTML = hasMachines
+    ? machines.map(id => chipHtml('machine', id, machineLabel(id), state.filters.machines.has(id))).join('')
+    : '';
+  const mGroup = $('machineChips').closest('.fgroup');
+  if(mGroup) mGroup.hidden = !hasMachines;
+
   // 空组标记：紧凑态下组内没有任何可见内容（未选中的 chip 都被藏了，模型组
   // 的 +N 也不显示，所以「有已选」才算非空）时整组隐藏。grp-empty 只在紧凑态
   // CSS 里生效，完整形态不受影响
@@ -4501,6 +4545,7 @@ function renderChips(){
   markEmpty('modelChips',  state.filters.models.size  > 0);
   markEmpty('clientChips', state.filters.clients.size > 0);
   markEmpty('acctChips',   state.filters.accounts.size > 0);
+  markEmpty('machineChips', state.filters.machines.size > 0);
 }
 
 /* 「▾ 展开 / ▴ 收起」与「+N」共用 no-collapse，两处切换都要同步文案 */
@@ -4652,16 +4697,18 @@ function bindChips(){
     }
 
     const {type, val} = b.dataset;
-    const set = type === 'model' ? state.filters.models
-              : type === 'acct'  ? state.filters.accounts
+    const set = type === 'model'   ? state.filters.models
+              : type === 'acct'    ? state.filters.accounts
+              : type === 'machine' ? state.filters.machines
               : state.filters.clients;
-    // val 可能是空串（未知账号），所以用 dataset 是否存在来判定，而非真值判断
+    // val 可能是空串（未知账号 / 未标注机器），所以用 dataset 是否存在来判定，而非真值判断
     set.has(val) ? set.delete(val) : set.add(val);
     render();
   };
   $('modelChips').addEventListener('click', handler);
   $('clientChips').addEventListener('click', handler);
   $('acctChips').addEventListener('click', handler);
+  $('machineChips').addEventListener('click', handler);
 
   // 模型数据表的 sparkline：点击弹出走势大图
   $('tblRank').addEventListener('click', e => {
@@ -4852,9 +4899,10 @@ function persistFilters(){
     Persist.saveMeta({
       filters: {
         // 日期范围刻意不存：看板每次打开都回到 DEFAULT_RECENT_DAYS 的默认窗口，
-        // 只有模型 / 客户端筛选沿用上次
+        // 只有模型 / 客户端 / 机器筛选沿用上次
         models:  [...state.filters.models],
-        clients: [...state.filters.clients]
+        clients: [...state.filters.clients],
+        machines: [...state.filters.machines]
       }
     });
   }, 300);
@@ -4880,9 +4928,11 @@ function applyDataset(rows, sheet, fileName){
   const validModels  = new Set(rows.map(x => x.model));
   const validClients = new Set(rows.map(x => x.client));
   const validAccts   = new Set(rows.map(x => x.acct || ''));
+  const validMachines = new Set(rows.map(x => x.mch || ''));
   state.filters.models   = new Set([...state.filters.models  ].filter(m => validModels.has(m)));
   state.filters.clients  = new Set([...state.filters.clients ].filter(c => validClients.has(c)));
   state.filters.accounts = new Set([...state.filters.accounts].filter(a => validAccts.has(a)));
+  state.filters.machines = new Set([...state.filters.machines].filter(m => validMachines.has(m)));
 
   const dates = [...new Set(rows.map(x => x.date))].sort();
   const minD = dates[0], maxD = dates[dates.length - 1];
@@ -4929,6 +4979,7 @@ async function tryRestore(){
       // 让看板每次都从「近 N 天」开始，而不是停在上次调过的范围
       (f.models  || []).forEach(m => state.filters.models.add(m));
       (f.clients || []).forEach(c => state.filters.clients.add(c));
+      (f.machines || []).forEach(m => state.filters.machines.add(m));
       render();
     }
 

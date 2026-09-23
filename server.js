@@ -78,6 +78,15 @@ try {
   wbApi = require('./workbuddy-api');
 } catch { /* 缺失时相关接口返回 503 */ }
 
+/**
+ * 云同步（Supabase 多端汇总）。模块缺失或没配 sync-config.json 时静默降级，
+ * 与本地功能完全解耦——云端连不上只影响「看不到别的机器」，不影响本机数据。
+ */
+let cloudSync = null;
+try {
+  cloudSync = require('./cloud-sync');
+} catch { /* 缺失时云同步不可用，其余功能照常 */ }
+
 // ---------------------------------------------------------------- CORS
 
 /**
@@ -230,13 +239,18 @@ async function handleSync(req, res) {
   }
 
   syncing = true;
+  let syncOk = false;
   try {
     const result = await runSync(part === 'all' ? undefined : part, uid);
+    syncOk = result.ok;
     json(res, result.ok ? 200 : 500, result);
   } catch (e) {
     json(res, 500, { ok: false, error: e.message });
   } finally {
     syncing = false;
+    // 手动同步刚写出新数据，顺带推上云（异步触发不阻塞响应；失败只打警告）。
+    // 放在 finally 里是为了先让出 syncing 锁，否则 runCloudTask 会因抢锁而直接返回。
+    if (syncOk) runCloudTask();
   }
 }
 
@@ -447,6 +461,14 @@ function handleStatus(req, res) {
     switching,
     meta: readDataMeta(),
     switchable,
+    // 云同步状态：页面排障用（周期、上次结果、本机标识）
+    cloud: {
+      enabled: !!(cloudSync && cloudSync.isEnabled()),
+      lastRunAt: cloudState.lastRunAt,
+      lastResult: cloudState.lastResult,
+      machineId: cloudState.machineId,
+      intervalMinutes: cloudState.intervalMinutes,
+    },
     // 页面据此把「连接本地会话」换成「服务已读取的路径」，省掉授权步骤
     scanDirs: SCAN_DIRS.map((s) => ({
       name: s.name,
@@ -758,6 +780,144 @@ async function handleAuto(req, res) {
   if (changed) saveAutoConfig();
   json(res, 200, { ok: true, config: { ...autoConfig }, lastRun: { ...autoState } });
 }
+
+// ---------------------------------------------------------------- 云同步调度
+
+/**
+ * 云同步状态（页面排障面板读它）。
+ *
+ * 与 autoState 分开维护：云同步的配置在 sync-config.json 里（含 Supabase 凭证），
+ * 不进 auto-config.json。后者是白名单式重建的——把云同步字段混进去，
+ * 页面点一次自动化开关就会被 loadAutoConfig 当未知字段丢掉。
+ */
+const cloudState = {
+  lastRunAt: 0,
+  lastResult: '',
+  machineId: '',
+  intervalMinutes: 0,
+};
+let cloudRunning = false;
+
+/**
+ * 读一次 sync-config.json，刷新展示字段（不联网）。
+ * 返回「是否已配置好可以跑」，未配置时调用方直接不跑。
+ */
+function refreshCloudState() {
+  if (!cloudSync) return false;
+  cloudSync.ensureConfigTemplate();   // 没有配置文件就先补一份模板出来
+  const cfg = cloudSync.loadConfig();
+  if (!cfg || !cfg.enabled || !cfg.url || !cfg.anonKey) {
+    cloudState.intervalMinutes = 0;
+    return false;
+  }
+  cloudState.intervalMinutes = cfg.intervalMinutes;
+  try {
+    cloudState.machineId = cloudSync.getMachineId();
+  } catch { /* 只是展示用，取不到也不影响同步 */ }
+  return true;
+}
+
+/**
+ * 跑一轮云同步。
+ *
+ * 抢的是 syncing 锁而不是另起一把：云同步要写 token-usage-data.js，而同步子进程
+ * 也在写同一个文件，两者必须串行。借同一把锁的好处是页面上的「一键同步」会自然
+ * 拿到 409「已有同步进行中」，不用再加一套并发提示。
+ *
+ * 失败只记结果、只打警告——云同步连不上不该影响本地数据产出，更不该影响看板。
+ */
+/** 云同步子进程超时：首次要把几万行推上去，给足 10 分钟。 */
+const CLOUD_SYNC_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * 跑 cloud-sync.js 子进程。
+ *
+ * 为什么用子进程而不是在进程内直接调函数：配置了代理时，代理环境变量必须在
+ * **进程启动时**就位——Node 的 fetch 只在初始化时读 `NODE_USE_ENV_PROXY`，
+ * 主进程里改 process.env 已经太晚（实测运行时设了照样 ECONNRESET）。
+ * 顺带也与 /api/sync 跑 report 的方式一致。
+ */
+function runCloudSyncProcess(cfg) {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [path.join(ROOT, 'cloud-sync.js')],
+      {
+        cwd: ROOT,
+        timeout: CLOUD_SYNC_TIMEOUT_MS,
+        maxBuffer: 4 * 1024 * 1024,
+        env: (cfg && cfg.proxy) ? cloudSync.proxyEnv(cfg) : process.env,
+      },
+      (err, stdout, stderr) => resolve({ err, stdout: stdout || '', stderr: stderr || '' })
+    );
+  });
+}
+
+/**
+ * 跑一轮云同步。
+ *
+ * 抢的是 syncing 锁而不是另起一把：云同步要写 token-usage-data.js，而同步子进程
+ * 也在写同一个文件，两者必须串行。借同一把锁的好处是页面上的「一键同步」会自然
+ * 拿到 409「已有同步进行中」，不用再加一套并发提示。
+ *
+ * 失败只记结果、只打警告——云同步连不上不该影响本地数据产出，更不该影响看板。
+ */
+async function runCloudTask() {
+  if (!cloudSync || syncing || cloudRunning) return;
+  if (!refreshCloudState()) return;   // 未配置或已关闭
+
+  cloudRunning = true;
+  syncing = true;
+  try {
+    const cfg = cloudSync.loadConfig();
+    const { err, stderr } = await runCloudSyncProcess(cfg);
+
+    // 子进程把结果写在自己维护的 sync-state.json 里（含本轮新增条数与时间）
+    const st = cloudSync.loadState();
+    if (err) {
+      const lastErr = (stderr || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
+      cloudState.lastRunAt = Date.now();   // 失败也等一个完整周期再试，免得每 30 秒刷屏
+      cloudState.lastResult = 'failed: ' + (err.killed ? '同步超时' : (lastErr || err.message));
+      console.warn('[cloud] \u2717 ' + cloudState.lastResult);
+    } else {
+      cloudState.lastRunAt = st.lastRunAt || Date.now();
+      cloudState.lastResult = String(st.lastResult || '').replace(/^ok\s*/, '') || '已完成';
+      console.log('[cloud] \u2713 ' + cloudState.lastResult);
+    }
+  } catch (e) {
+    cloudState.lastRunAt = Date.now();   // 同上：异常也等完整周期再试
+    cloudState.lastResult = 'failed: ' + (e.message || String(e));
+    console.warn('[cloud] \u2717 ' + cloudState.lastResult);
+  } finally {
+    syncing = false;
+    cloudRunning = false;
+  }
+}
+
+/**
+ * 云同步定时器：每 30 秒看一次是否到点。
+ *
+ * 用 30 秒粒度而不是精确到周期：云同步的周期是「分钟」量级（默认 30 分钟），
+ * 差几十秒无所谓；配置改了也最多 30 秒生效。服务刚起来时 lastRunAt 为 0，
+ * 会在第一次 tick 时就跑一轮，让新机器尽快看到汇总数据。
+ */
+setInterval(() => {
+  if (cloudRunning || syncing) return;
+  if (!refreshCloudState()) return;
+  if (Date.now() - cloudState.lastRunAt < cloudState.intervalMinutes * 60000) return;
+  runCloudTask();
+}, 30 * 1000);
+
+/**
+ * 服务起来后尽早跑一次，不用等满 30 秒。
+ *
+ * 对新机器特别有意义：刚 clone 下来时本地还没有数据文件，靠这一轮把云端已有的
+ * 数据拉回来，看板打开就是汇总视图。
+ *
+ * 延后 5 秒是为了避开启动瞬间那批自动任务——它们会抢 syncing 锁，抢不到时
+ * 云同步会直接返回（下一个 30 秒的 tick 还会再试）。
+ */
+setTimeout(runCloudTask, 5 * 1000);
 
 // ---------------------------------------------------------------- 启动
 

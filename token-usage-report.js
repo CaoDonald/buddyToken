@@ -379,13 +379,58 @@ async function collect(since) {
 // ------------------------------------------------ 看板数据（按回合聚合）
 
 /**
+ * 读云同步的本机标识（云同步未启用时返回 null）。
+ *
+ * 只在启用时给回合挂 mch 字段：几万个回合每个多一个 36 字符的 UUID，会让数据
+ * 文件平白涨好几 MB，纯本地用户没有理由付这个代价。
+ *
+ * cloud-sync.js 缺失或读配置失败一律返回 null，绝不影响本地流程。
+ */
+function loadCloudMachine() {
+  try {
+    const cs = require('./cloud-sync');
+    if (!cs.isEnabled()) return null;
+    const cfg = cs.loadConfig();
+    return { id: cs.getMachineId(), name: (cfg && cfg.machineName) || os.hostname() };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把云同步带来的字段补进产物：机器名册、账单行的机器归属（第 7 位）。
+ *
+ * 账单本身属于账号维度、没有机器概念，靠「request_id 与回合的
+ * conversationRequestId 同源」这一点反查。查不到的（CLI 会话、其他机器用同账号
+ * 发出的请求、会话已被清理）留空，看板上归入「未标注」。
+ *
+ * 只补空、不覆盖：从云端拉回来的机器归属比本机反查更权威（它记录了真正的产生方）。
+ * 机器名册则相反——本次的本机名要覆盖掉旧值（用户可能改过 machineName）。
+ */
+function applyCloudMachineInfo(data, prev, cloud) {
+  const machines = { ...((prev && prev.machines) || {}) };
+  if (cloud) machines[cloud.id] = cloud.name;
+  if (Object.keys(machines).length) data.machines = machines;
+
+  const turns = data.t || {};
+  for (const r of data.bill || []) {
+    if (!Array.isArray(r) || !r[0]) continue;
+    if (r[6] !== undefined && r[6] !== null) continue;   // 已有归属（含云端拉回的）不动
+    const t = turns[String(r[0]).toLowerCase()];
+    if (t && t.mch) r[6] = t.mch;
+  }
+}
+
+/**
  * 按 conversationRequestId 聚合，生成积分看板消费的 window.__TOKEN_DATA__。
  *
  * 一个回合 = 一次用户提问 = agent 串行发起的一批 API 请求，此处把整回合的
  * token 求和，以便与积分流水「一行积分 = 一个回合」一一对齐。
  * 键统一小写，查表侧同样归一化，避免大小写差异导致漏配。
+ *
+ * cloud 非空时（云同步已启用）给每个回合打上 mch（机器标识），看板据此按机器筛选。
  */
-function buildTokenDataJs(reqs, light, titles) {
+function buildTokenDataJs(reqs, light, titles, cloud) {
   const turns = new Map();
 
   for (const r of reqs) {
@@ -398,7 +443,9 @@ function buildTokenDataJs(reqs, light, titles) {
             m: '', s: r.session, src: r.source, p: r.project, best: -1, d: [],
             // 模型侧耗时：lat 为有效之和、latn 为有效条数。不依赖步骤明细，
             // 所以 --light 下依然可用（只是少了逐请求分布）。
-            lat: 0, latn: 0 };
+            lat: 0, latn: 0,
+            // 机器标识：云同步启用时才有值（未启用保持空串，不占体积）
+            mch: cloud ? cloud.id : '' };
       turns.set(key, t);
     }
     t.n++;
@@ -429,6 +476,8 @@ function buildTokenDataJs(reqs, light, titles) {
     const o = { n: t.n, in: t.in, out: t.out, cr: t.cr, cc: t.cc, tot: t.tot,
                 t0: t.t0, t1: t.t1, m: t.m, s: t.s, src: t.src, p: t.p,
                 lat: t.lat, latn: t.latn };
+    // 机器标识只在有值时写：未启用云同步就不该让每个回合多挂一个空字段
+    if (t.mch) o.mch = t.mch;
     if (!light) o.d = t.d.sort((a, b) => a[0] - b[0]);
     out[k] = o;
   }
@@ -460,8 +509,12 @@ function buildTokenDataJs(reqs, light, titles) {
       sources: [...new Set(reqs.map((r) => r.source))],
       light: !!light,
     },
-    ti,
+    // 回合数据（云同步启用时每个回合带 mch）
     t: out,
+    // 机器名册：看板把 machine_id 显示成可读名字用。云端拉回的其它机器由
+    // cloud-sync.js 补进来，这里只登记本机自己。
+    machines: cloud ? { [cloud.id]: cloud.name } : {},
+    ti,
   };
 }
 
@@ -671,7 +724,11 @@ function mergeOfficialData(prev, fresh, canMerge, partialUid) {
     if (!Array.isArray(r) || !r[0]) continue;
     // 老下标 → 老 uid → 新下标；老行没有账号归属（-1）时保持未知
     const uid = r[5] >= 0 ? prevUids[r[5]] : null;
-    byId.set(String(r[0]), [r[0], r[1], r[2], r[3], r[4], uid ? mapUid(uid) : -1]);
+    const row = [r[0], r[1], r[2], r[3], r[4], uid ? mapUid(uid) : -1];
+    // 第 7 位是云同步的机器归属，重建行时必须原样带上——漏掉的话每跑一次同步
+    // 就把云端拉回来的机器标注丢一层，看板「按机器」的统计会慢慢失真。
+    if (r[6] !== undefined) row.push(r[6]);
+    byId.set(String(r[0]), row);
   }
   let added = 0;
   for (const r of freshBill) {
@@ -760,6 +817,9 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid, light 
     console.error('缺少 workbuddy-api.js，无法同步官方数据');
     process.exit(1);
   }
+  // 云同步已启用时，本条路径产出的回合也要带机器标识（否则「🔄 刷积分」跑完
+  // 会把带 mch 的回合换成不带 mch 的，看板按机器筛选就断了）
+  const cloud = loadCloudMachine();
 
   const name = jsOut || 'token-usage-data.js';
   const jsPath = path.isAbsolute(name) ? name : path.join(outdir, name);
@@ -801,7 +861,7 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid, light 
   try {
     const since = days > 0 ? new Date(Date.now() - days * 86400000) : null;
     const { allReqs, titles } = await collect(since);
-    const local = buildTokenDataJs(allReqs, light, titles);
+    const local = buildTokenDataJs(allReqs, light, titles, cloud);
     if (noMerge) {
       data.t = local.t;
       data.ti = local.ti || {};
@@ -841,6 +901,9 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid, light 
   // 刷新数据生成时间：existing 沿用旧文件的 gen，不重置的话看板的
   // 「数据 X 小时前生成」会停在很久以前，让人误以为同步没生效
   data.gen = Date.now();
+
+  // 机器名册与账单机器位：补空不覆盖（云端拉回来的归属更权威）
+  applyCloudMachineInfo(data, existing, cloud);
 
   const scope = `账号 ${(official.accounts[0] && official.accounts[0].name) || uid}（其余账号保留）`;
   const head = '/* 由 token-usage-report.js 自动生成，请勿手工编辑 */\n' +
@@ -1032,7 +1095,9 @@ async function main() {
   if (emitJs) {
     const name = args['js-out'] || 'token-usage-data.js';
     jsPath = path.isAbsolute(name) ? name : path.join(outdir, name);
-    const data = buildTokenDataJs(reqs, light, titles);
+    // 云同步启用时：回合带机器标识、产物带机器名册（未启用则都为无，不占体积）
+    const cloud = loadCloudMachine();
+    const data = buildTokenDataJs(reqs, light, titles, cloud);
     const freshTurns = data.meta.turns;
 
     // 旧文件只读一次：官方账单合并、本地回合增量、--only=tokens 保留官方字段都要用
@@ -1048,6 +1113,8 @@ async function main() {
         if (prev.official) data.official = prev.official;
         if (prev.su) data.su = prev.su;
         if (prev.hist) data.hist = prev.hist;
+        // 机器名册也要带回：本次只扫本地，不带回就等于把云端拉回来的其他机器抹掉了
+        if (prev.machines) data.machines = { ...prev.machines, ...(data.machines || {}) };
       }
     }
 
@@ -1114,6 +1181,9 @@ async function main() {
         data.meta.merged = kept > 0;
       }
     }
+
+    // 机器名册与账单机器位（补空不覆盖：云端拉回来的归属比本机反查更权威）
+    applyCloudMachineInfo(data, prev, cloud);
 
     const head = '/* 由 token-usage-report.js 自动生成，请勿手工编辑 */\n' +
                  `/* ${fmtTime(new Date())} · 本次扫描 ${fmt(freshTurns)} 个回合` +
