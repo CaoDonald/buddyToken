@@ -231,6 +231,8 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .acct-bar i{display:block;height:100%;border-radius:3px;
   background:linear-gradient(90deg,var(--accent),var(--accent2))}
 .acct-warn{color:#c2410c;font-weight:600}
+/* 预计可用天数（按近期消耗节奏的估算）：悬停给出推算依据 */
+.acct-est{color:#5b6b8c;font-weight:600;cursor:help}
 /* 跨账号到期提醒：把各账号的到期时间放在一起比，直接给出先用哪个的结论 */
 .acct-tip{padding:12px 18px;border-color:#f0c9a8;background:linear-gradient(180deg,#fff8f2,#fffdfb)}
 .acct-tip-main{font-size:13px;line-height:1.7}
@@ -562,6 +564,8 @@ table.cal td.cal-cell.has:hover{
           <button class="chip" data-q="7"    title="最近 7 天（按数据最后一天回溯）">近7日</button>
           <button class="chip" data-q="14"   title="最近 14 天（按数据最后一天回溯）">近14日</button>
           <button class="chip" data-q="30"   title="最近 30 天（按数据最后一天回溯）">近30日</button>
+          <button class="chip" data-q="60"   title="最近 60 天（按数据最后一天回溯）">近60日</button>
+          <button class="chip" data-q="180"  title="最近 180 天（按数据最后一天回溯）">近180日</button>
           <button class="chip" data-q="1y"   title="最近一年">近1年</button>
           <i class="q-sep"></i>
           <button class="chip" data-q="all"  title="清除日期限制，显示全部数据">全部</button>
@@ -584,7 +588,7 @@ table.cal td.cal-cell.has:hover{
         <div class="auto-row" data-auto="checkin">
           <div class="auto-line1">
             <i class="auto-dot"></i><span class="auto-name">自动签到</span>
-            <span class="auto-cycle" title="执行周期">每 6 小时</span>
+            <span class="auto-cycle" title="执行周期，可在 auto-config.json 里调整"></span>
             <button class="chip auto-chip" type="button">已关闭</button>
           </div>
           <div class="auto-desc">到点为<b>全部账号</b>自动签到领积分。签到接口幂等：当天已签到的账号自动跳过，不会重复提交；手动点「✅ 签到」不受影响。</div>
@@ -593,7 +597,7 @@ table.cal td.cal-cell.has:hover{
         <div class="auto-row" data-auto="travel">
           <div class="auto-line1">
             <i class="auto-dot"></i><span class="auto-name">自动猫猫</span>
-            <span class="auto-cycle" title="执行周期">每 30 分钟</span>
+            <span class="auto-cycle" title="执行周期，可在 auto-config.json 里调整"></span>
             <button class="chip auto-chip" type="button">已关闭</button>
           </div>
           <div class="auto-desc">按旅行状态机自动照看<b>全部账号</b>的猫猫：空闲就派出、到点自动领奖励、旅行中等待。查得勤才能在到达后第一时间领奖，不漏领每日积分。</div>
@@ -602,19 +606,19 @@ table.cal td.cal-cell.has:hover{
         <div class="auto-row" data-auto="switch">
           <div class="auto-line1">
             <i class="auto-dot"></i><span class="auto-name">自动切换账号</span>
-            <span class="auto-cycle" title="执行周期">每 1 小时</span>
+            <span class="auto-cycle" title="执行周期，可在 auto-config.json 里调整"></span>
             <button class="chip auto-chip" type="button">已关闭</button>
           </div>
-          <div class="auto-desc">发现某账号积分将在 <b>14 天内到期</b>且还没用完时，自动把 <b>WorkBuddy 桌面端</b>与 <b>CodeBuddy CLI</b> 都切换到它，优先用掉即将过期的积分。桌面端仅在其正在运行时才会重启生效；切换前自动备份登录态，可随时手动切回。</div>
+          <div class="auto-desc">发现某账号积分将在 <b><span class="auto-horizon">14</span> 天内到期</b>且还没用完时，自动把 <b>WorkBuddy 桌面端</b>与 <b>CodeBuddy CLI</b> 都切换到它，优先用掉即将过期的积分。桌面端仅在其正在运行时才会重启生效；切换前自动备份登录态，可随时手动切回。</div>
           <div class="auto-detail" hidden></div>
         </div>
         <div class="auto-row" data-auto="refresh">
           <div class="auto-line1">
             <i class="auto-dot"></i><span class="auto-name">自动刷新积分</span>
-            <span class="auto-cycle" title="执行周期">每 30 分钟</span>
+            <span class="auto-cycle" title="执行周期，可在 auto-config.json 里调整"></span>
             <button class="chip auto-chip" type="button">已关闭</button>
           </div>
-          <div class="auto-desc">定时拉取官方账单与<b>各账号余额</b>（含 429 后的恢复情况），数据文件增量合并、历史不丢。开启后看板余额自动保持新鲜，无需手动点「💰 同步积分」。</div>
+          <div class="auto-desc">定时拉取官方账单与<b>各账号余额</b>，数据文件增量合并、历史不丢。开启后看板余额自动保持新鲜，无需手动点「💰 同步积分」。</div>
           <div class="auto-detail" hidden></div>
         </div>
       </div>
@@ -1626,6 +1630,27 @@ function renderAccounts(){
     const spend = DailySpend.recent(a.uid);
     const spendHtml = `<div class="ck-spend" title="今日 / 昨日消耗（积分）&#10;官方账单明细按自然日汇总。&#10;今日（${spend.todayKey}）当天可能略偏小——官方对跨日记录有尾部结算，后续同步会自动补正；昨日（${spend.yesterdayKey}）已结算完毕，是稳定值。"><span>今日<b>${fmt2(spend.today)}</b></span><span>昨日<b>${fmt2(spend.yesterday)}</b></span></div>`;
 
+    // 预计可用天数：按最近三周的实际消耗节奏推算（同样只聚合账单，不涉及余额反推）
+    const est = DailySpend.estimate(a.uid, a.remaining, days);
+    let estHtml = '';
+    if(est){
+      const avgTxt = est.avg >= 1 ? fmt0(est.avg) : est.avg.toFixed(2);
+      const basis = est.sampleDays
+        ? `近 ${est.sampleDays} 天消耗 ${fmt0(est.total)} 积分，日均 ${avgTxt}`
+        : '近期账单里没有该账号的消耗记录';
+      const tip = (extra, text, cls) =>
+        ` · <span class="${cls}" title="按最近三周账单消耗推算可用天数&#10;${basis}&#10;${extra}">${text}</span>`;
+      if(est.insufficient){
+        estHtml = tip('样本太少或几乎没有消耗，暂不估算', '样本不足', 'acct-est');
+      }else if(est.limitedByExpiry){
+        estHtml = tip(`按此节奏可用约 ${fmt0(est.estDays)} 天，但 ${days} 天后积分就到期了——到期前用不完`,
+          '到期前用不完', 'acct-est acct-warn');
+      }else{
+        estHtml = tip(`剩余 ${fmt0(a.remaining)} ÷ 日均 ${avgTxt} ≈ ${fmt0(est.estDays)} 天`,
+          est.usableDays > 0 ? `预计可用 ${est.usableDays} 天` : '不足 1 天', 'acct-est');
+      }
+    }
+
     return `
       <div class="card c6">
         <h3>
@@ -1640,7 +1665,7 @@ function renderAccounts(){
           ${updTime}
         </div>
         <div class="acct-bar"><i style="width:${Math.min(100, usedPct).toFixed(1)}%"></i></div>
-        <div class="kpi-sub">${expiry}${
+        <div class="kpi-sub">${expiry}${estHtml}${
           a.expired ? ` · <span class="acct-warn">已过期 ${fmt0(a.expiredRemaining)}</span>` : ''}</div>
         <div style="margin-top:10px">${pkgs}${more}</div>
         ${renderCheckinStrip(a.uid, spendHtml)}
@@ -1677,6 +1702,36 @@ function renderAccounts(){
  * 拉各账号签到/旅行状态与模型限流台账（只读），拿到后重渲染账号卡片。
  * 页面加载时异步调用，不阻塞首屏；之后由定时器周期刷新。
  */
+/**
+ * 自动猫猫的即时领奖：开启「自动猫猫」后，60s 轮询已经能看到某账号旅行已到达
+ * （travel.state === 'arrived'，卡片显示可领奖励 chip），但后端自动任务的默认周期是
+ * 30min，最多要等半小时才领——这就出现「轮询看得到能领却干等」的不一致。这里在
+ * 轮询拿到状态后顺手触发一次领奖（复用 /api/travel 的状态机），第一时间把积分拿到手；
+ * 后端 30min 周期退化为兜底（看板没打开时仍会领）。领奖幂等（已领过接口回 already），
+ * _travelClaiming 防住同一轮询窗口内对同一账号重复请求。
+ */
+const _travelClaiming = new Set();
+async function autoClaimArrivedTravel(){
+  if(!AutoTasks.isOn || !AutoTasks.isOn('travel')) return;     // 没开自动猫猫就不抢领
+  const arrived = Object.values(state.checkins || {})
+    .filter(c => c && c.travel && c.travel.state === 'arrived');
+  for(const c of arrived){
+    const uid = c.uid;
+    if(_travelClaiming.has(uid)) continue;                    // 该账号正在领奖中，跳过
+    _travelClaiming.add(uid);
+    try{
+      const r = await ServerSync.travel(uid);
+      // 成功或「已领取」都视为已完成：本地把状态置为 idle（下次轮询用真实数据覆盖），
+      // 卡片上的「可领」chip 立即消失，无需等下一轮轮询
+      if(r && r.ok){
+        if(state.checkins[uid] && state.checkins[uid].travel) state.checkins[uid].travel.state = 'idle';
+        renderAccounts();
+      }
+    }catch{ /* 领奖失败不阻塞轮询，下一轮再试 */ }
+    finally{ _travelClaiming.delete(uid); }
+  }
+}
+
 async function loadCheckinStatus(){
   if(!await ServerSync.available()) return;
   // 每轮强制重拉服务状态：这是个 60s 轮询，读缓存的话，在客户端里手动切换的
@@ -1695,6 +1750,8 @@ async function loadCheckinStatus(){
     state.limits = { scannedAt: lim.scannedAt, byUid };
   }
   renderAccounts();
+  // 轮询发现猫猫已到达且自动猫猫开启：立即触发领奖，不必等后端 30min 周期
+  await autoClaimArrivedTravel();
 }
 
 /**
@@ -3405,6 +3462,10 @@ const OfficialBill = (() => {
 const DailySpend = (() => {
   let _cache = { data:null, map:null };
 
+  /** 「预计可用天数」的推算窗口（天）与最小样本天数。 */
+  const BURN_WINDOW_DAYS = 21;
+  const BURN_MIN_SAMPLE_DAYS = 3;
+
   /** uid →（YYYY-MM-DD → 消耗积分）。按数据引用缓存，避免每次重渲染都重算。 */
   function byAccount(){
     const d = TokenData.get();
@@ -3439,7 +3500,52 @@ const DailySpend = (() => {
     };
   }
 
-  return { on, recent };
+  /**
+   * 按最近三周的实际消耗节奏，推算当前剩余积分还够用多久。
+   *
+   * 三条口径约束，缺一条这个数字就会骗人：
+   *   · 窗口取 D-21 ~ D-1，不含今天——今天的账单还在尾部结算，计进去会把日均压低；
+   *   · 分母是「窗口内该账号有账单可查的自然日数」，样本不满三周就按实际天数算
+   *     （新启用的账号只有几天数据，拿 21 当分母会严重低估日均）；
+   *   · 积分到期即清零，所以结果再与「距最近到期天数」取小——否则会算出
+   *     「还能用 41 天」，而它 22 天后就过期了。
+   *
+   * 消耗节奏会随账号切换而突变（各账号并非稳定并行使用），所以这只是量级估算。
+   * 返回 null = 算不了（无余额 / 无账单）；insufficient = 样本太少或近期没消耗。
+   */
+  function estimate(uid, remaining, expireDays){
+    const m = byAccount().get(uid);
+    if(!(remaining > 0) || !m || !m.size) return null;
+
+    const t = new Date();
+    const today0 = new Date(t.getFullYear(), t.getMonth(), t.getDate());
+    const winStart = new Date(t.getFullYear(), t.getMonth(), t.getDate() - BURN_WINDOW_DAYS);
+    // 账号首条账单若晚于窗口起点，分母就只算它自己的天数
+    const firstKey = [...m.keys()].sort()[0];
+    const firstDay = new Date(firstKey + 'T00:00:00');
+    const start = firstDay > winStart ? firstDay : winStart;
+
+    let total = 0, sampleDays = 0;
+    for(const d = new Date(start); d < today0; d.setDate(d.getDate() + 1)){
+      total += m.get(fmtDate(d)) || 0;
+      sampleDays++;
+    }
+
+    const avg = sampleDays ? total / sampleDays : 0;
+    if(sampleDays < BURN_MIN_SAMPLE_DAYS || avg <= 0){
+      return { insufficient:true, sampleDays, total, avg, estDays:0, usableDays:0, limitedByExpiry:false };
+    }
+
+    const estDays = remaining / avg;
+    const limitedByExpiry = expireDays !== null && estDays > expireDays;
+    return {
+      insufficient:false, sampleDays, total, avg, estDays,
+      usableDays: limitedByExpiry ? expireDays : Math.floor(estDays),
+      limitedByExpiry,
+    };
+  }
+
+  return { on, recent, estimate };
 })();
 
 /* =========================================================
@@ -3621,8 +3727,18 @@ const ServerSync = (() => {
  * =======================================================*/
 const AutoTasks = (() => {
   const KEY_LABELS = { checkin: '签到', travel: '猫猫', switch: '切换账号', refresh: '刷新积分' };
-  const INTERVALS = { checkin: 21600000, travel: 1800000, switch: 3600000, refresh: 10800000 };
+  /** 服务端没给参数时的兜底，与 server.js 的 AUTO_INTERVAL_DEFAULTS / SWITCH_HORIZON_DEFAULT_DAYS 一致。 */
+  const FALLBACK_MINUTES = { checkin: 360, travel: 30, switch: 60, refresh: 30 };
+  const FALLBACK_HORIZON_DAYS = 14;
   let cfg = null, lastRun = {};
+
+  /** 周期人话：45 →「45 分钟」、360 →「6 小时」、90 →「1 小时 30 分」。 */
+  function fmtPeriod(mins){
+    const m = Math.max(1, Math.round(Number(mins) || 0));
+    if(m < 60) return m + ' 分钟';
+    if(m % 60 === 0) return (m / 60) + ' 小时';
+    return Math.floor(m / 60) + ' 小时 ' + (m % 60) + ' 分';
+  }
 
   /** 拉取当前开关与上次运行时间。拿不到（服务未启动）返回 false。 */
   async function load(){
@@ -3668,6 +3784,11 @@ const AutoTasks = (() => {
       chip.classList.toggle('ok', enabled && newest === 'ok');
       chip.classList.toggle('err', enabled && newest === 'err');
       chip.textContent = enabled ? '已开启' : '已关闭';
+      // 周期与切换阈值都以服务端配置为准（auto-config.json 可改，改完随即生效）
+      const cyc = row.querySelector('.auto-cycle');
+      if(cyc) cyc.textContent = '每 ' + fmtPeriod((cfg.intervalMinutes && cfg.intervalMinutes[k]) || FALLBACK_MINUTES[k]);
+      const hz = row.querySelector('.auto-horizon');
+      if(hz) hz.textContent = cfg.switchHorizonDays || FALLBACK_HORIZON_DAYS;
       const dot = row.querySelector('.auto-dot');
       dot.classList.toggle('ok', newest === 'ok');
       dot.classList.toggle('err', newest === 'err');
@@ -3734,7 +3855,7 @@ const AutoTasks = (() => {
     });
   }
 
-  return { load, render, bind, isOn, lastRunOf, INTERVALS };
+  return { load, render, bind, isOn, lastRunOf };
 })();
 
 
@@ -4572,13 +4693,22 @@ function persistFilters(){
   _pfTimer = setTimeout(() => {
     Persist.saveMeta({
       filters: {
-        from: state.filters.from,
-        to:   state.filters.to,
+        // 日期范围刻意不存：看板每次打开都回到 DEFAULT_RECENT_DAYS 的默认窗口，
+        // 只有模型 / 客户端筛选沿用上次
         models:  [...state.filters.models],
         clients: [...state.filters.clients]
       }
     });
   }, 300);
+}
+
+/** 打开看板时的默认日期范围（天），按数据最后一天回溯；与快捷按钮的 data-q 保持一致。 */
+const DEFAULT_RECENT_DAYS = 60;
+
+/** 快捷范围按钮的选中态：点亮的即当前生效的范围；手动改日期输入框后传空串全部熄灭。 */
+function markQuick(q){
+  $('quickBtns').querySelectorAll('[data-q]').forEach(b =>
+    b.classList.toggle('on', b.dataset.q === q));
 }
 
 /* 应用数据集（保留筛选语义） */
@@ -4599,7 +4729,15 @@ function applyDataset(rows, sheet, fileName){
   const dates = [...new Set(rows.map(x => x.date))].sort();
   const minD = dates[0], maxD = dates[dates.length - 1];
 
-  // 日期范围只扩不缩
+  // 日期范围只扩不缩；打开看板时若还没有范围（首次导入 / 刚清空筛选），
+  // 默认落在最近 DEFAULT_RECENT_DAYS 天——数据够长时不必每次都从最早那天看起
+  if(!state.filters.from && !state.filters.to){
+    const d = parseDs(maxD);
+    d.setDate(d.getDate() - (DEFAULT_RECENT_DAYS - 1));
+    state.filters.to = maxD;
+    state.filters.from = fmtDate(d) < minD ? minD : fmtDate(d);   // 数据不满窗口就退回首日
+    markQuick(String(DEFAULT_RECENT_DAYS));
+  }
   if(!state.filters.from || state.filters.from < minD) state.filters.from = minD;
   if(!state.filters.to   || state.filters.to   > maxD) state.filters.to   = maxD;
 
@@ -4629,8 +4767,8 @@ async function tryRestore(){
     const meta = Persist.loadMeta();
     const f = meta.filters;
     if(f){
-      if(f.from){ state.filters.from = f.from; $('dateFrom').value = f.from; }
-      if(f.to)  { state.filters.to   = f.to;   $('dateTo').value   = f.to;   }
+      // 日期范围不在此列（见 persistFilters）：留着 applyDataset 给的默认窗口，
+      // 让看板每次都从「近 N 天」开始，而不是停在上次调过的范围
       (f.models  || []).forEach(m => state.filters.models.add(m));
       (f.clients || []).forEach(c => state.filters.clients.add(c));
       render();
@@ -4928,12 +5066,6 @@ async function loadFile(file){
      按现在算多半一条都筛不出来。设置成功返回 true，调用方据此点亮按钮。 */
   const clearTs = () => { state.filters.fromTs = 0; state.filters.toTs = 0; };
 
-  /* 快捷按钮选中态：点亮的即当前生效的范围；手动改日期输入框后全部熄灭 */
-  const markQuick = q => {
-    $('quickBtns').querySelectorAll('[data-q]').forEach(b =>
-      b.classList.toggle('on', b.dataset.q === q));
-  };
-
   const setRecentDays = n => {
     const dates = [...new Set(state.all.map(x => x.date))].sort();
     if(!dates.length) return false;
@@ -4976,7 +5108,7 @@ async function loadFile(file){
     if(q === '30m'){ if(setRecentMs(30 * 60e3)) markQuick(q); return; }
     if(q === '1h'){  if(setRecentMs(3600e3))     markQuick(q); return; }
     if(q === '3h'){  if(setRecentMs(3 * 3600e3)) markQuick(q); return; }
-    // +'1y' 是 NaN，必须单独翻译；其余数字（7/14/30）直接用
+    // +'1y' 是 NaN，必须单独翻译；其余数字（7/14/30/60/180）直接用
     if(setRecentDays(q === 'today' ? 1 : (q === '1y' ? 365 : +q))) markQuick(q);
   };
 

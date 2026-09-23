@@ -461,53 +461,120 @@ function handleStatus(req, res) {
 /**
  * 四个自动任务：自动签到 / 自动猫猫 / 自动切换账号 / 自动刷新积分。
  *
- * 开关存 auto-config.json（只存四个布尔，不含任何 token），默认全关——
- * 页面上点开哪个，哪个就按自己的周期开始跑。调度本身常驻，只是被开关门控。
+ * 参数全在 auto-config.json 里（不含任何 token）：
+ *   · 四个开关（布尔）——默认全关，页面上点开哪个，哪个就按自己的周期开始跑；
+ *   · intervalMinutes——各任务的执行周期，单位分钟；
+ *   · jitterPercent——每次触发的随机抖动幅度（±N%）；
+ *   · switchHorizonDays——「自动切换账号」的触发阈值：有积分将在这么多天内到期才切；
+ *   · switchCooldownHours——自动切换成功后的冷却时长（小时）。
+ * 调度常驻，只是被开关门控；手改参数后下一秒自动重载，不必重启服务。
  *
- * 周期（毫秒）按任务性质定：
+ * 默认周期按任务性质定：
  *   · 签到：每天至少一次即可，6h 一查（doCheckin 幂等，已签不再提交）。
- *   · 猫猫：状态机 idle→traveling→arrived 跨度可能几小时，30min 一查才能在
- *     到达后及时领奖；查得太稀会漏掉领取窗口。
+ *   · 猫猫：状态机 idle→traveling→arrived 跨度可能几小时。看板前端 60s 轮询发现
+ *     arrived 会立即触发领奖（前端 autoClaimArrivedTravel），所以这里 30min 周期只是
+ *     兜底——看板没开时仍能按时领；前端领过后状态回到 idle，本任务再跑会接着派下一只，
+ *     不会漏领也不会重复领（领奖接口幂等）。
  *   · 切换账号：每小时评估一次「有没有更该用的账号」。
  *   · 刷新积分：每 30min 拉一次官方余额，保持看板数据新鲜。
  */
 const AUTO_CONFIG_FILE = path.join(ROOT, 'auto-config.json');
 const AUTO_KEYS = ['checkin', 'travel', 'switch', 'refresh'];
-const AUTO_INTERVALS = {
-  checkin: 6 * 60 * 60 * 1000,
-  travel: 30 * 60 * 1000,
-  switch: 60 * 60 * 1000,
-  refresh: 30 * 60 * 1000,
-};
-/** 自动切换只在「有账号积分即将到期（默认 14 天内）」时才切，避免无谓切换。 */
-const SWITCH_HORIZON_DAYS = 14;
+const AUTO_INTERVAL_DEFAULTS = { checkin: 360, travel: 30, switch: 60, refresh: 30 };  // 分钟
+const JITTER_DEFAULT_PERCENT = 10;
+/** 防呆：周期至少 1 分钟（再小就是连着打官方接口），抖动上限 ±50%（再大就不叫周期了）。 */
+const AUTO_INTERVAL_MIN_MINUTES = 1;
+const JITTER_MAX_PERCENT = 50;
+/** 「自动切换账号」到期阈值的默认值（天），auto-config.json 的 switchHorizonDays 可覆盖。 */
+const SWITCH_HORIZON_DEFAULT_DAYS = 14;
 
-/**
- * 下次触发的随机抖动：±10% 周期（30min 任务即 ±3min，6h 任务即 ±36min）。
- * 固定间隔的规律性请求容易被识别为脚本，每次执行时重摇一次，
- * 让各任务的实际间隔在标称周期附近随机浮动。
- */
-function nextJitter(period) {
-  return Math.round((Math.random() * 2 - 1) * period * 0.1);
+/** 某任务的当前周期（毫秒）。 */
+function intervalMs(name) {
+  return autoConfig.intervalMinutes[name] * 60000;
 }
 
-let autoConfig = loadAutoConfig();
+/**
+ * 下次触发的随机抖动：±jitterPercent% 周期（默认 ±10%，30min 任务即 ±3min）。
+ * 固定间隔的规律性请求容易被识别为脚本，每次执行时重摇一次，
+ * 让各任务的实际间隔在标称周期附近随机浮动。幅度在 auto-config.json 里调。
+ */
+function nextJitter(period) {
+  return Math.round((Math.random() * 2 - 1) * period * (autoConfig.jitterPercent / 100));
+}
+
+/** 当前配置文件 mtime（读不到即 0，表示没有文件）。 */
+function autoConfigFileMtime() {
+  try { return fs.statSync(AUTO_CONFIG_FILE).mtimeMs; } catch { return 0; }
+}
+
+let autoConfigMtime = autoConfigFileMtime();
+let autoConfig = loadAutoConfig(null);
 /** key → { tryAt, okAt, failAt, error, info }：上次尝试/成功/失败时间与结果摘要。 */
 const autoState = {};
 const autoRunning = new Set();
 
-function loadAutoConfig() {
+/**
+ * 读 auto-config.json。开关由页面写、周期与抖动由人写，两者共用一个文件，
+ * 所以 saveAutoConfig 必须整份回写——否则页面点一次开关就把手写参数抹了。
+ *
+ * 单个字段缺失或填错一律回退默认值；整个文件解析失败时沿用 fallback
+ * （运行中把文件改成了坏 JSON，不能让四个开关被静默关掉）。fallback 为 null
+ * 表示首次加载，此时按默认值起。
+ */
+function loadAutoConfig(fallback) {
+  let raw;
   try {
-    const c = JSON.parse(fs.readFileSync(AUTO_CONFIG_FILE, 'utf8'));
-    const o = {};
-    for (const k of AUTO_KEYS) o[k] = !!c[k];
-    return o;
+    raw = JSON.parse(fs.readFileSync(AUTO_CONFIG_FILE, 'utf8'));
   } catch {
-    return { checkin: false, travel: false, switch: false, refresh: false };
+    if (fallback) return fallback;
+    raw = {};
   }
+
+  const o = {};
+  // 下划线开头的自留字段原样带过（如 _comment 写明各字段单位）——JSON 没有注释，
+  // 这是让配置文件自我说明的办法；带着它走，saveAutoConfig 回写时才不会把它抹掉。
+  for (const k of Object.keys(raw)) {
+    if (k.startsWith('_')) o[k] = raw[k];
+  }
+  for (const k of AUTO_KEYS) o[k] = !!raw[k];
+
+  o.intervalMinutes = {};
+  const src = (raw.intervalMinutes && typeof raw.intervalMinutes === 'object') ? raw.intervalMinutes : {};
+  for (const k of AUTO_KEYS) {
+    const v = Number(src[k]);
+    o.intervalMinutes[k] = Number.isFinite(v) && v >= AUTO_INTERVAL_MIN_MINUTES
+      ? v : AUTO_INTERVAL_DEFAULTS[k];
+  }
+
+  const j = Number(raw.jitterPercent);
+  o.jitterPercent = Number.isFinite(j) && j >= 0 && j <= JITTER_MAX_PERCENT
+    ? j : JITTER_DEFAULT_PERCENT;
+
+  // 下限 1 天：填 0 会让「距到期还早」的判定永远成立，等价于关掉自动切换——那该用开关表达
+  const h = Number(raw.switchHorizonDays);
+  o.switchHorizonDays = Number.isFinite(h) && h >= 1 ? h : SWITCH_HORIZON_DEFAULT_DAYS;
+
+  // 下限 1 小时：冷却是防震荡的最后一道闸，填 0 等于每次评估都可能切
+  const c = Number(raw.switchCooldownHours);
+  o.switchCooldownHours = Number.isFinite(c) && c >= 1 ? c : SWITCH_COOLDOWN_DEFAULT_HOURS;
+
+  return o;
 }
 function saveAutoConfig() {
-  try { fs.writeFileSync(AUTO_CONFIG_FILE, JSON.stringify(autoConfig, null, 2), 'utf8'); } catch { /* 忽略 */ }
+  try {
+    fs.writeFileSync(AUTO_CONFIG_FILE, JSON.stringify(autoConfig, null, 2), 'utf8');
+    autoConfigMtime = autoConfigFileMtime();   // 自己写的，无需再重载
+  } catch { /* 忽略 */ }
+}
+
+/** 手改 auto-config.json 后下一秒自动生效，不必重启服务。 */
+function reloadAutoConfigIfChanged() {
+  const m = autoConfigFileMtime();
+  if (!m || m === autoConfigMtime) return;   // 没有文件（被删）或没变过：保持现状
+  autoConfigMtime = m;
+  const before = JSON.stringify(autoConfig);
+  autoConfig = loadAutoConfig(autoConfig);
+  if (JSON.stringify(autoConfig) !== before) console.log('[auto] 配置已重载');
 }
 
 /** WorkBuddy 桌面端是否正在运行（决定是否在切换后重启它）。 */
@@ -528,12 +595,12 @@ function isWorkbuddyRunning() {
  * 目标账号必须在目标应用有登录快照才可切（token 域不同，跨域借用会被网关拒）。
  *
  * 防震荡：切换的排序键（到期时刻）不因切换而改变，切到手的账号只要临期批次
- * 没花完就不会再动；冷却兜底——自动切换成功后 24h 内不再切（手动 /api/switch
- * 不受限），即使官方数据抖动也不会反复改登录文件、重启桌面端。
+ * 没花完就不会再动；冷却兜底——自动切换成功后 switchCooldownHours 小时内不再切
+ * （手动 /api/switch 不受限），即使官方数据抖动也不会反复改登录文件、重启桌面端。
  *
  * 返回结果摘要（供前端展示）；没有可切换的对象时原样返回说明，不报错。
  */
-const AUTO_SWITCH_COOLDOWN = 24 * 60 * 60 * 1000;
+const SWITCH_COOLDOWN_DEFAULT_HOURS = 24;
 let lastAutoSwitchAt = 0;   // 上次自动切换成功时刻（内存态，重启归零；手动切换不记）
 
 async function autoSwitchAccount() {
@@ -547,17 +614,19 @@ async function autoSwitchAccount() {
     if (c.soonestExpireAt < best) { best = c.soonestExpireAt; target = c; }
   }
   if (!target) return '各账号均无带到期时间的剩余积分，无需切换';
+  const horizonDays = autoConfig.switchHorizonDays;
   const days = Math.ceil((best - Date.now()) / 86400000);
-  if (best > Date.now() + SWITCH_HORIZON_DAYS * 86400000) {
-    return `最近到期的积分还有 ${days} 天（超过 ${SWITCH_HORIZON_DAYS} 天），暂不切换`;
+  if (best > Date.now() + horizonDays * 86400000) {
+    return `最近到期的积分还有 ${days} 天（超过 ${horizonDays} 天），暂不切换`;
   }
 
   const sw = wbApi.listSwitchableAccounts();
-  // 两个应用都已在该账号上时无需冷却判断（本来就不动）；否则看 24h 冷却。
+  // 两个应用都已在该账号上时无需冷却判断（本来就不动）；否则看冷却
+  const cooldownHours = autoConfig.switchCooldownHours;
   const cur = sw.currentByApp || {};
   const allCurrent = ['workbuddy-desktop', 'codebuddy-cli'].every((app) => (cur[app] || null) === target.uid);
-  if (!allCurrent && Date.now() - lastAutoSwitchAt < AUTO_SWITCH_COOLDOWN) {
-    return '24 小时内已自动切换过，冷却中，暂不切换';
+  if (!allCurrent && Date.now() - lastAutoSwitchAt < cooldownHours * 3600000) {
+    return `${cooldownHours} 小时内已自动切换过，冷却中，暂不切换`;
   }
   const done = [];
   for (const app of ['workbuddy-desktop', 'codebuddy-cli']) {
@@ -644,7 +713,7 @@ async function runAutoTask(name) {
   if (!autoState[name]) autoState[name] = { tryAt: 0, okAt: 0, failAt: 0, error: '', info: '', jitter: 0 };
   const st = autoState[name];
   st.tryAt = Date.now();
-  st.jitter = nextJitter(AUTO_INTERVALS[name]);   // 本次执行时决定下次的触发偏移
+  st.jitter = nextJitter(intervalMs(name));   // 本次执行时决定下次的触发偏移
   try {
     if (!wbApi) throw new Error('缺少 workbuddy-api.js');
     st.info = await runAutoTaskBody(name);
@@ -660,20 +729,21 @@ async function runAutoTask(name) {
   }
 }
 
-/** 每分钟评估一次：开关开着且距上次「尝试」已超「周期+随机抖动」，就触发（失败也等完整周期再重试）。 */
+/** 每秒评估一次：开关开着且距上次「尝试」已超「周期+随机抖动」，就触发（失败也等完整周期再重试）。 */
 function autoTick() {
+  reloadAutoConfigIfChanged();   // 先看参数有没有被手改
   const now = Date.now();
   for (const name of AUTO_KEYS) {
     if (!autoConfig[name]) continue;
     const st = autoState[name];
-    if (now - ((st && st.tryAt) || 0) >= AUTO_INTERVALS[name] + ((st && st.jitter) || 0)) runAutoTask(name);
+    if (now - ((st && st.tryAt) || 0) >= intervalMs(name) + ((st && st.jitter) || 0)) runAutoTask(name);
   }
 }
 
 /** 自动任务配置读写：GET 返回当前配置与上次执行时间；POST 合并开关（打开即跑一次）。 */
 async function handleAuto(req, res) {
   if (req.method !== 'POST') {
-    json(res, 200, { ok: true, config: { ...autoConfig }, lastRun: { ...autoState }, intervals: AUTO_INTERVALS });
+    json(res, 200, { ok: true, config: { ...autoConfig }, lastRun: { ...autoState } });
     return;
   }
   const body = await readBody(req);
@@ -756,5 +826,11 @@ function listen(port, remaining) {
 
 listen(DEFAULT_PORT, PORT_SCAN_LIMIT);
 
-/** 自动化调度：每分钟评估一次四个开关，谁开着且到点就跑。 */
-setInterval(autoTick, 60 * 1000);
+/**
+ * 自动化调度：每秒评估一次四个开关，谁开着且到点就跑。
+ *
+ * 用 1 秒粒度而不是整分钟：抖动的意义是让请求不像脚本，而分钟粒度会把触发时刻
+ * 全钉在整分钟上（秒数恒为 00），反倒留下另一种规律。代价可忽略——每次只是一次
+ * 循环比较加一次 statSync，顺带让配置热重载的最长延迟降到 1 秒。
+ */
+setInterval(autoTick, 1000);
