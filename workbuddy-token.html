@@ -978,6 +978,7 @@ const state = {
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
   detail: { mode:'all', q:'', page:0, expanded:null },   // expanded = 展开步骤明细的回合 ID
   checkins: {},           // uid → 签到状态（服务模式下异步拉取；含 travel 旅行状态）
+  checkinsAt: 0,          // 最近一次成功拉到 checkin-status 的时间（猫猫明细的「实时」时刻）
   limits: { scannedAt: 0, byUid: {} },   // uid → 429 受限模型列表（服务模式异步拉取）
   serverStatus: null,     // /api/status 缓存（switchable 账号列表等）
   rank: { sort:'count', dir:'desc' },     // 模型数据卡的表头排序（默认请求数倒序）
@@ -1743,6 +1744,7 @@ async function loadCheckinStatus(){
     for(const c of list){
       if(c && c.uid) state.checkins[c.uid] = c;
     }
+    state.checkinsAt = Date.now();
   }
   if(lim){
     const byUid = {};
@@ -3794,17 +3796,14 @@ const AutoTasks = (() => {
       dot.classList.toggle('err', newest === 'err');
       // 明细行 = 最近一次结果 + 相对时间（悬浮显示绝对时间）
       const detail = row.querySelector('.auto-detail');
-      if (k === 'travel' && enabled) {
-        // 自动猫猫明细用实时状态，避免「上次运行结果」滞后误导（见 travelLiveSummary）
-        const s = travelLiveSummary();
-        if (s) {
-          detail.hidden = false;
-          detail.className = 'auto-detail good';
-          detail.textContent = '实时：' + s;
-          detail.title = '猫猫实时状态（前端每 60s 轮询刷新）';
-        } else {
-          detail.hidden = true;
-        }
+      // 自动猫猫优先用实时状态，避免「上次运行结果」滞后误导（见 travelLiveSummary）；
+      // 拿不到实时状态时回落到与其他任务相同的「上次结果」行，不留空
+      const live = (k === 'travel' && enabled) ? travelLiveSummary() : '';
+      if (live) {
+        detail.hidden = false;
+        detail.className = 'auto-detail good';
+        detail.textContent = '✓ ' + live + ' · ' + fmtAgo(state.checkinsAt);
+        detail.title = '猫猫实时状态 · ' + fmtAbs(state.checkinsAt) + '\n（前端每 60s 轮询刷新）';
       } else if(newest === 'err' && r.error){
         detail.hidden = false;
         detail.className = 'auto-detail bad';
@@ -3843,7 +3842,8 @@ const AutoTasks = (() => {
     if (arrived)   parts.push(arrived + ' 只可领');
     if (idle)      parts.push(idle + ' 只已领/空闲');
     if (none)      parts.push(none + ' 个无 Buddy');
-    return parts.length ? parts.join('，') : '无账号';
+    // 一个账号状态都没拿到（服务未启 / 无凭证）时返回空串，由调用方隐藏该行
+    return parts.join('，');
   }
 
   /** 某任务上次成功执行时间戳（0 表示还没跑过）。 */
