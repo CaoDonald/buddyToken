@@ -19,6 +19,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 
 // ---------------------------------------------------------------- 常量
 
@@ -1067,6 +1068,170 @@ async function runTravel(acct) {
   };
 }
 
+// ---------------------------------------------------------------- CodeBuddy IDE 登录态（只读）
+
+/**
+ * CodeBuddy IDE 的数据目录（CN 版优先，国际版无 CN 后缀）。
+ *
+ * IDE 与 CLI、桌面端**不共用目录**：auth 目录里只有 CLI 与桌面端两家的快照，
+ * IDE 把登录态写进自己 VSCode 存储的 state.vscdb（DPAPI + AES-256-GCM 加密）。
+ * 这里只读、不写回——buddyToken 不支持切换 IDE 账号。
+ */
+const IDE_STATE_DIRS = [
+  'CodeBuddy CN',
+  'CodeBuddy',
+].map((name) => path.join(
+  process.env.APPDATA || path.join(process.env.USERPROFILE || '.', 'AppData', 'Roaming'),
+  name
+));
+
+/** 看板里 IDE 的 app 名，与前端 APP_BADGES 的 codebuddy-ide 对齐。 */
+const IDE_APP = 'codebuddy-ide';
+
+/**
+ * 借一次 PowerShell 解 DPAPI（Windows 用户态）。
+ *
+ * node 没有原生 DPAPI 接口，只能这样拿那 32 字节 AES key；密文经环境变量传入，
+ * 不出现在命令行里。解出的 key 只在内存中使用，绝不写盘。
+ */
+function dpapiUnprotect(blob) {
+  const { spawnSync } = require('child_process');
+  // 必须显式加载 System.Security：powershell.exe(5.1) 默认会话里找不到 ProtectedData 类型
+  const ps = 'Add-Type -AssemblyName System.Security;'
+    + '[Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Unprotect('
+    + '[Convert]::FromBase64String($env:BUDDY_DPAPI_BLOB),$null,'
+    + '[System.Security.Cryptography.DataProtectionScope]::CurrentUser))';
+  let r;
+  try {
+    r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
+      encoding: 'utf8', timeout: 10000, windowsHide: true,
+      env: { ...process.env, BUDDY_DPAPI_BLOB: blob.toString('base64') },
+    });
+  } catch {
+    return null;
+  }
+  if (!r || r.status !== 0) return null;
+  let key;
+  try { key = Buffer.from(String(r.stdout || '').trim(), 'base64'); } catch { return null; }
+  return key.length === 32 ? key : null;   // AES-256
+}
+
+/** 解 AES-256-GCM 的 `v10` 载荷：3 字节版本 + 12 字节 nonce + 密文，tag 在末尾 16 字节。 */
+function openV10(buf, key) {
+  try {
+    const d = crypto.createDecipheriv('aes-256-gcm', key, buf.subarray(3, 15));
+    d.setAuthTag(buf.subarray(buf.length - 16));
+    return Buffer.concat([d.update(buf.subarray(15, buf.length - 16)), d.final()]).toString('utf8');
+  } catch {
+    return null;   // 密钥不匹配或数据被截断
+  }
+}
+
+/** ItemTable 的值可能是 BLOB，也可能被包成 {"type":"Buffer","data":[...]}。 */
+function valueToBuffer(v) {
+  if (v instanceof Uint8Array) return Buffer.from(v);
+  if (typeof v === 'string') {
+    try {
+      const o = JSON.parse(v);
+      if (o && o.data) return Buffer.from(o.data);
+    } catch { /* 不是包装格式，按二进制处理不了 */ }
+  }
+  return null;
+}
+
+/**
+ * 两个缓存都按来源文件的 mtime 失效：起 PowerShell 大约要几百毫秒，而
+ * /api/status 是 60s 轮询、每次都走 listSwitchableAccounts，不缓存会白烧进程。
+ */
+let ideLoginCache = { stamp: '', value: null };
+let ideKeyCache = { stamp: '', key: null };
+
+/** 读 IDE 的 AES key（`Local State` 未变则复用上次结果）。 */
+function readIdeAesKey(localStateFile) {
+  let mtime;
+  try { mtime = fs.statSync(localStateFile).mtimeMs; } catch { return null; }
+  if (ideKeyCache.stamp === String(mtime)) return ideKeyCache.key;
+
+  let key = null;
+  try {
+    const ls = JSON.parse(fs.readFileSync(localStateFile, 'utf8'));
+    const b64 = atPath(ls, ['os_crypt', 'encrypted_key']);
+    if (b64) {
+      const raw = Buffer.from(b64, 'base64');
+      // 旧版 Chromium 的约定：前 5 字节是 "DPAPI" 前缀，去掉后才是密文
+      if (raw.subarray(0, 5).toString() === 'DPAPI') key = dpapiUnprotect(raw.subarray(5));
+    }
+  } catch { key = null; }
+  ideKeyCache = { stamp: String(mtime), key };
+  return key;
+}
+
+/** 解出 IDE 的登录态；解不开一律 null（不抛错、不猜）。 */
+function decodeIdeLogin(dbFile, localStateFile) {
+  const key = readIdeAesKey(localStateFile);
+  if (!key) return null;
+
+  let DatabaseSync;
+  try {
+    // node:sqlite 会打一条 ExperimentalWarning，脚本输出里很吵，这里只静音加载那一瞬
+    const origEmit = process.emitWarning;
+    process.emitWarning = () => {};
+    try { ({ DatabaseSync } = require('node:sqlite')); } finally { process.emitWarning = origEmit; }
+  } catch {
+    return null;   // Node 版本过低，降级成「无 IDE 数据源」
+  }
+
+  let db = null;
+  try {
+    db = new DatabaseSync(dbFile, { readOnly: true });
+    const rows = db.prepare("SELECT key, value FROM ItemTable WHERE key LIKE 'secret://%'").all();
+    for (const row of rows) {
+      // 同一张表里二十来行 secret 大多是缓存时间戳，只有这一行是凭证
+      if (!/planning-genie\.new\.accessToken/i.test(String(row.key))) continue;
+      const buf = valueToBuffer(row.value);
+      if (!buf || buf.length <= 19 || buf.subarray(0, 3).toString() !== 'v10') continue;
+      const text = openV10(buf, key);
+      if (!text) continue;
+      let j;
+      try { j = JSON.parse(text); } catch { continue; }
+      const uid = atPath(j, ['account', 'uid']);
+      if (!uid) continue;
+      return {
+        uid: String(uid),
+        name: atPath(j, ['account', 'nickname']) || String(uid).slice(0, 8),
+        expiresAt: num(atPath(j, ['auth', 'expiresAt'])) || 0,
+        source: 'state.vscdb',
+      };
+    }
+  } catch {
+    return null;   // vscdb 被 IDE 独占或结构有变
+  } finally {
+    try { if (db) db.close(); } catch { /* 已经关了 */ }
+  }
+  return null;
+}
+
+/**
+ * 读 CodeBuddy IDE 的当前登录态（只读）。
+ *
+ * 返回 { uid, name, expiresAt, source } 或 null。任何一步失败都返回 null，
+ * 调用方按「无 IDE 数据源」处理，不影响 CLI 与桌面端。
+ */
+function readIdeLogin() {
+  if (process.platform !== 'win32') return null;   // 解密链路是 Windows 专属
+  for (const dir of IDE_STATE_DIRS) {
+    const dbFile = path.join(dir, 'User', 'globalStorage', 'state.vscdb');
+    let mtime;
+    try { mtime = fs.statSync(dbFile).mtimeMs; } catch { continue; }   // 这个版本没装
+    const stamp = dbFile + '|' + mtime;
+    if (ideLoginCache.stamp === stamp) return ideLoginCache.value;
+    const value = decodeIdeLogin(dbFile, path.join(dir, 'Local State'));
+    ideLoginCache = { stamp, value };
+    return value;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- 桌面端账号库与切换
 
 /**
@@ -1085,7 +1250,8 @@ const DESKTOP_AUTH_PREFIX = 'workbuddy-desktop';
  *   workbuddy-desktop.info            → WorkBuddy 桌面端
  *   Tencent-Cloud.coding-copilot.info → CodeBuddy CLI
  *     （归属实证：~/.codebuddy/logs 的 CLI 日志鉴权 uid 与该文件 account.uid 一致）
- * CodeBuddy IDE 的登录态不在此目录、本机也未登录，无法判定/切换。
+ * CodeBuddy IDE 的登录态不在此目录（走 state.vscdb，见 readIdeLogin），
+ * 所以不在这张表里，也不参与切换。
  */
 const APP_AUTH_FILES = {
   'workbuddy-desktop': DESKTOP_AUTH_FILE,
@@ -1096,7 +1262,8 @@ const APP_AUTH_FILES = {
  * 扫描 auth 目录里全部登录快照，按 (uid, app) 双重分组各取最新一份。
  *
  * 返回：
- *   currentByApp — 各应用当前登录的 uid（读 APP_AUTH_FILES，读不到为 null）
+ *   currentByApp — 各应用当前登录的 uid（桌面端/CLI 读 APP_AUTH_FILES，
+ *                  IDE 读 state.vscdb；读不到都是 null）
  *   accounts     — 可切换账号列表（不含任何 token）：uid、展示名、
  *                  snapshots（该账号在每个 app 的最新快照文件名）、凭证有效期。
  * 账号在某 app「可切换」= snapshots[app] 存在；「当前登录」= currentByApp[app] === uid。
@@ -1118,6 +1285,14 @@ function listSwitchableAccounts() {
     } catch {
       currentByApp[app] = null;
     }
+  }
+  // IDE 不在 auth 目录，另走 state.vscdb（只读）。它只有「当前登录」这一种状态，
+  // 没有历史快照，所以既不进 accounts[].snapshots，也不会有可点击的切换按钮。
+  try {
+    const ide = readIdeLogin();
+    currentByApp[IDE_APP] = (ide && ide.uid) || null;
+  } catch {
+    currentByApp[IDE_APP] = null;
   }
 
   // 按 (uid, app) 分组，各取最新快照
@@ -1369,6 +1544,8 @@ module.exports = {
   AUTH_DIR,
   DESKTOP_AUTH_FILE,
   APP_AUTH_FILES,
+  IDE_APP,
+  readIdeLogin,
   discoverAccounts,
   listSwitchableAccounts,
   switchAppAccount,

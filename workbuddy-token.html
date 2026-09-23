@@ -1582,7 +1582,10 @@ function renderExpiryTip(list, now){
 
 /**
  * 应用图标定义：固定呈现三个（顺序对齐参考卡片：桌面端 / IDE / CLI）。
- * `>_`（终端符）是 CLI 的图标；CodeBuddy IDE 本机未登录、无登录数据源，恒置灰。
+ * `>_`（终端符）是 CLI 的图标。
+ *
+ * 三者的数据源不同：桌面端/CLI 读 auth 目录的登录快照，IDE 走 state.vscdb
+ * （服务端解密后只下发 uid）；IDE 只读、不支持切换。
  */
 const APP_BADGES = [
   { app: 'workbuddy-desktop', icon: 'W',   label: 'WorkBuddy 桌面端' },
@@ -1594,7 +1597,11 @@ const APP_BADGES = [
  * 账号卡片右上角的应用登录图标（三个恒定呈现，图标即状态）：
  *   · 该应用当前登录的就是此账号 → 亮色 + ✓ 角标，不可点；
  *   · 此账号在该应用有登录快照 → 可点击（点击切换为该应用当前账号，有二次确认）；
- *   · 无快照 / 无登录数据源（IDE）→ 置灰。
+ *   · 没有快照 / 没有登录数据源 → 置灰。
+ *
+ * IDE 只有「当前登录」这一种状态（后端只读 state.vscdb，不提供快照，也不支持切换），
+ * 所以它取决于 currentByApp 里有没有 codebuddy-ide 这个键：有键即可点亮当前账号，
+ * 没有键（非 Windows / IDE 没装 / 解不开）就维持置灰。
  */
 function renderAppBadges(a){
   const sw = state.serverStatus && state.serverStatus.switchable;
@@ -1602,7 +1609,7 @@ function renderAppBadges(a){
   // 该账号在各应用的可切换快照（来自 /api/status；只有存在性会出现在前端，token 不下发）
   const snapOf = (sw && Array.isArray(sw.accounts) && sw.accounts.find(x => x.uid === a.uid)) || null;
   return '<span class="login-badges">' + APP_BADGES.map(b => {
-    const supported = b.app !== 'codebuddy-ide';
+    const supported = b.app !== 'codebuddy-ide' || Object.prototype.hasOwnProperty.call(cur, b.app);
     const isCurrent = supported && cur[b.app] === a.uid;
     const hasSnap = supported && !!(snapOf && snapOf.snapshots && snapOf.snapshots[b.app]);
     if (isCurrent) {
@@ -1612,7 +1619,8 @@ function renderAppBadges(a){
       return `<button class="lg-ico lg-switch" data-act="appswitch" data-app="${esc(b.app)}"
                 data-uid="${esc(a.uid)}" title="设为${esc(b.label)}的当前登录账号">${esc(b.icon)}</button>`;
     }
-    const why = supported ? '该账号无此应用的登录快照' : '暂不支持（本机未检测到登录数据源）';
+    const why = !supported ? '暂不支持（本机未检测到登录数据源）'
+      : (b.app === 'codebuddy-ide' ? '该账号当前未在此应用登录' : '该账号无此应用的登录快照');
     return `<span class="lg-ico lg-dim" title="${esc(b.label)} · ${why}">${esc(b.icon)}</span>`;
   }).join('') + '</span>';
 }
