@@ -3794,7 +3794,18 @@ const AutoTasks = (() => {
       dot.classList.toggle('err', newest === 'err');
       // 明细行 = 最近一次结果 + 相对时间（悬浮显示绝对时间）
       const detail = row.querySelector('.auto-detail');
-      if(newest === 'err' && r.error){
+      if (k === 'travel' && enabled) {
+        // 自动猫猫明细用实时状态，避免「上次运行结果」滞后误导（见 travelLiveSummary）
+        const s = travelLiveSummary();
+        if (s) {
+          detail.hidden = false;
+          detail.className = 'auto-detail good';
+          detail.textContent = '实时：' + s;
+          detail.title = '猫猫实时状态（前端每 60s 轮询刷新）';
+        } else {
+          detail.hidden = true;
+        }
+      } else if(newest === 'err' && r.error){
         detail.hidden = false;
         detail.className = 'auto-detail bad';
         detail.textContent = '✗ ' + r.error + ' · ' + fmtAgo(r.failAt);
@@ -3811,6 +3822,29 @@ const AutoTasks = (() => {
   }
 
   function isOn(key){ return !!(cfg && cfg[key]); }
+
+  /**
+   * 自动猫猫的实时状态摘要：按前端 60s 轮询的 checkin-status 算，不依赖后端 30min
+   * 周期的上次运行结果——否则会出现「卡片上早已领奖、明细却还显示 N 只旅行中」的
+   * 滞后误导（前端即时领奖把这种滞后放大得更显眼）。
+   */
+  function travelLiveSummary(){
+    const cs = Object.values(state.checkins || {});
+    let traveling = 0, arrived = 0, idle = 0, none = 0;
+    for (const c of cs) {
+      const tv = c && c.travel;
+      if (!tv || !tv.state) { none++; continue; }
+      if (tv.state === 'traveling') traveling++;
+      else if (tv.state === 'arrived') arrived++;
+      else idle++;                 // idle = 已领奖励 / 空闲可派
+    }
+    const parts = [];
+    if (traveling) parts.push(traveling + ' 只旅行中');
+    if (arrived)   parts.push(arrived + ' 只可领');
+    if (idle)      parts.push(idle + ' 只已领/空闲');
+    if (none)      parts.push(none + ' 个无 Buddy');
+    return parts.length ? parts.join('，') : '无账号';
+  }
 
   /** 某任务上次成功执行时间戳（0 表示还没跑过）。 */
   function lastRunOf(key){ return (lastRun[key] && lastRun[key].okAt) || 0; }
