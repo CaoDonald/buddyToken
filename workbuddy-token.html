@@ -695,7 +695,7 @@ table.cal td.cal-cell.has:hover{
       </div>
 
       <div class="card c5">
-        <h3><span class="dot"></span>模型明细</h3>
+        <h3><span class="dot"></span>模型环比 <span class="tag">本期 vs 等长上期</span></h3>
         <div class="tbl-scroll"><table class="tbl" id="tblModel"></table></div>
       </div>
 
@@ -1008,21 +1008,60 @@ function agg(list, keyFn){
   return [...m.values()].sort((a,b) => b.sum - a.sum);
 }
 
-function getFiltered(){
+/**
+ * 按当前筛选取记录。
+ *
+ * 传 range（{from,to} 毫秒）时只按该时间区间过滤，模型/客户端/账号三个维度
+ * 的条件照旧——「模型环比」用它取等长前移的上期；不传时按筛选栏的日期与
+ * 时间粒度过滤。
+ */
+function getFiltered(range){
   const f = state.filters;
   return state.all.filter(x => {
-    if(f.from && x.date < f.from) return false;
-    if(f.to   && x.date > f.to)   return false;
-    // 时间粒度快捷（近30分/近1时/近3时）：在日期过滤之上再按精确时间戳裁剪。
-    // from/to 日期串仍会同步设为对应当天，所以两层过滤不冲突
-    if(f.fromTs && x.time.getTime() < f.fromTs) return false;
-    if(f.toTs   && x.time.getTime() > f.toTs)   return false;
+    const ts = x.time.getTime();
+    if(range){
+      if(ts < range.from || ts > range.to) return false;
+    }else{
+      if(f.from && x.date < f.from) return false;
+      if(f.to   && x.date > f.to)   return false;
+      // 时间粒度快捷（近30分/近1时/近3时）：在日期过滤之上再按精确时间戳裁剪。
+      // from/to 日期串仍会同步设为对应当天，所以两层过滤不冲突
+      if(f.fromTs && ts < f.fromTs) return false;
+      if(f.toTs   && ts > f.toTs)   return false;
+    }
     if(f.models.size   && !f.models.has(x.model))       return false;
     if(f.clients.size  && !f.clients.has(x.client))     return false;
     // 账号：空串代表「未知」（手工导入的 Excel 行没有账号归属）
     if(f.accounts.size && !f.accounts.has(x.acct || '')) return false;
     return true;
   });
+}
+
+/**
+ * 本期时间区间（毫秒），返回 null 表示无从确定（没有可对比的基准）。
+ *
+ * 两种口径要分开：时间粒度快捷（近30分/近1时/近3时）只写了左端、右端留 0，且
+ * 基准是「数据里最新一条」而不是此刻（数据不实时，按此刻算多半一条都选不出来）；
+ * 日期级筛选则两端都有，解析成当天的起止时刻。
+ */
+function currentRangeMs(){
+  const f = state.filters;
+  if(f.fromTs){
+    let last = 0;
+    for(const x of state.all){ const t = x.time.getTime(); if(t > last) last = t; }
+    if(!last) return null;
+    return { from: f.fromTs, to: f.toTs || last };
+  }
+  const from = f.from ? new Date(f.from + 'T00:00:00').getTime() : null;
+  const to   = f.to   ? new Date(f.to + 'T23:59:59.999').getTime() : null;
+  if(from == null || to == null || to < from) return null;
+  return { from, to };
+}
+
+/** 上期区间 = 本期区间等长前移（紧邻本期起点之前），用于模型环比。 */
+function prevRangeMs(cur){
+  const len = cur.to - cur.from;
+  return { from: cur.from - len - 1, to: cur.from - 1 };
 }
 
 /**
@@ -2374,27 +2413,7 @@ function renderTables(d){
       </tr>`).join('')
     }</tbody>`;
 
-  const maxModelSum = s.byModel[0]?.sum || 1;
-  $('tblModel').innerHTML = `
-    <thead><tr>
-      <th>模型</th><th class="num">积分</th><th class="num">Token</th>
-      <th class="num">Token/积分</th><th class="num">占比</th>
-      <th class="num">次数</th><th style="width:70px"></th>
-    </tr></thead>
-    <tbody>${ s.byModel.map((x,i) => `
-      <tr>
-        <td><span class="pill" style="background:${
-          PALETTE[i%PALETTE.length]+'1f'};color:${PALETTE[i%PALETTE.length]}">${esc(x.key)}</span></td>
-        <td class="num">${fmt2(x.sum)}</td>
-        <td class="num">${x.tk ? fmtTok(x.tk) : '<span style="color:#c8d1e2">—</span>'}</td>
-        <td class="num" style="color:#6b7891">${
-          x.tk && x.sum > 0 ? fmtTok(x.tk / x.sum) : '<span style="color:#c8d1e2">—</span>'
-        }</td>
-        <td class="num" style="color:#6b7891">${pct(x.sum, s.total)}</td>
-        <td class="num" style="color:#6b7891">${x.count}</td>
-        <td><div class="bar-mini"><i style="width:${(x.sum/maxModelSum*100).toFixed(1)}%"></i></div></td>
-      </tr>`).join('')
-    }</tbody>`;
+  renderModelDelta(s.byModel);
 
   $('tblClient').innerHTML = `
     <thead><tr>
@@ -2498,6 +2517,103 @@ function renderTables(d){
         </tr>` : ''
       }</tbody>`;
   }
+}
+
+/* =========================================================
+ *  8.3 模型环比（本期 vs 等长前移的上期）
+ * =======================================================*/
+/** 毫秒区间 →「YYYY-MM-DD ~ YYYY-MM-DD」，表头悬浮提示用。 */
+function fmtRangeTxt(fromMs, toMs){
+  const f = ms => {
+    const t = new Date(ms);
+    return `${t.getFullYear()}-${pad(t.getMonth()+1)}-${pad(t.getDate())}`;
+  };
+  return f(fromMs) + ' ~ ' + f(toMs);
+}
+
+/**
+ * 模型环比：同一个模型在紧邻的上一个等长周期花了多少积分。
+ *
+ * 这张卡原先是「模型明细」，与大卡「模型数据」是同一份聚合的两个切面（大卡是
+ * 超集），信息重复；而「积分为什么涨了、是哪个模型涨的」全看板没人回答——换成
+ * 环比正是补这个缺口。上期区间由 prevRangeMs() 等长前移得到，模型/客户端/账号
+ * 三个筛选维度沿用当前条件，保证与本期同口径。
+ */
+function renderModelDelta(byModel){
+  const tbl = $('tblModel');
+  if(!tbl) return;
+  if(!state.all.length){ tbl.innerHTML = ''; return; }
+
+  const cur  = currentRangeMs();
+  const prev = cur ? prevRangeMs(cur) : null;
+
+  if(!prev){
+    tbl.innerHTML = '<tbody><tr><td style="color:var(--muted);line-height:1.9">' +
+      '当前筛选没有时间范围，无法确定上期。<br>' +
+      '在筛选栏选择具体日期，或用「近 30 分 / 近 1 时 / 近 3 时」后即可看到环比。' +
+      '</td></tr></tbody>';
+    return;
+  }
+
+  const dPrev = getFiltered(prev);
+  // 上期一条记录都没有（多半是当前区间已经顶到数据最早那天），给提示而不是渲染
+  // 一屏「新增」——那会让人误以为这些模型是本期才启用的
+  if(!dPrev.length){
+    tbl.innerHTML = '<tbody><tr><td style="color:var(--muted);line-height:1.9">' +
+      `上期（${fmtRangeTxt(prev.from, prev.to)}）没有任何记录，无法对比。<br>` +
+      '当前区间多半已经覆盖了全部数据，换一个更窄的时间范围再试。' +
+      '</td></tr></tbody>';
+    return;
+  }
+
+  const pMap = new Map(agg(dPrev, x => x.model).map(o => [o.key, o]));
+  const cMap = new Map(byModel.map(o => [o.key, o]));
+
+  // 本期∪上期：上期用过、本期已停用的模型也要露出来（那正是「省下来了」）
+  const rows = [...new Set([...cMap.keys(), ...pMap.keys()])].map(key => {
+    const c = cMap.get(key) || { sum:0, count:0 };
+    const p = pMap.get(key) || { sum:0, count:0 };
+    return { key, cSum:c.sum, pSum:p.sum,
+             dSum:c.sum - p.sum, cCnt:c.count, pCnt:p.count, dCnt:c.count - p.count };
+  }).sort((a, b) => b.cSum - a.cSum || b.pSum - a.pSum);
+
+  if(!rows.length){
+    tbl.innerHTML = '<tbody><tr><td style="color:var(--muted)">当前区间没有记录。</td></tr></tbody>';
+    return;
+  }
+
+  const curTxt  = fmtRangeTxt(cur.from, cur.to);
+  const prevTxt = fmtRangeTxt(prev.from, prev.to);
+  // 积分涨＝花得更多 → 警示色；降 → 绿色。只表示变化方向，不代表模型好坏
+  const colOf  = v => v > 0 ? 'var(--danger)' : v < 0 ? 'var(--ok)' : 'var(--muted)';
+  const signed = v => (v > 0 ? '+' : '') + fmt2(v);
+  const rateOf = r => {
+    if(r.pSum <= 0) return r.cSum > 0 ? '<span style="color:var(--danger)">新增</span>' : '—';
+    const p = r.dSum / r.pSum * 100;
+    // 变化较小时保留一位小数，否则 +0.4% 会被 toFixed(0) 抹成 +0%
+    return (p > 0 ? '+' : '') + (Math.abs(p) < 10 ? p.toFixed(1) : p.toFixed(0)) + '%';
+  };
+
+  tbl.innerHTML = `
+    <thead><tr>
+      <th>模型</th>
+      <th class="num" title="本期：${curTxt}">本期</th>
+      <th class="num" title="上期：${prevTxt}">上期</th>
+      <th class="num" title="本期 − 上期（积分）">Δ积分</th>
+      <th class="num" title="Δ积分 ÷ 上期积分">Δ%</th>
+      <th class="num" title="请求数变化（本期 − 上期）">Δ请求</th>
+    </tr></thead>
+    <tbody>${ rows.map((r,i) => `
+      <tr>
+        <td><span class="pill" style="background:${
+          PALETTE[i%PALETTE.length]+'1f'};color:${PALETTE[i%PALETTE.length]}">${esc(r.key)}</span></td>
+        <td class="num">${fmt2(r.cSum)}</td>
+        <td class="num" style="color:#6b7891">${fmt2(r.pSum)}</td>
+        <td class="num" style="color:${colOf(r.dSum)};font-weight:600">${r.dSum ? signed(r.dSum) : '0'}</td>
+        <td class="num" style="color:${colOf(r.dSum)}">${rateOf(r)}</td>
+        <td class="num" style="color:${colOf(r.dCnt)}">${r.dCnt ? (r.dCnt > 0 ? '+' : '') + r.dCnt : '0'}</td>
+      </tr>`).join('')
+    }</tbody>`;
 }
 
 /* =========================================================
