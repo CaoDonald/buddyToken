@@ -143,7 +143,7 @@ body{overflow-anchor:none}  /* .floating 切换会改变文档流高度，滚动
 .filters{
   background:var(--card);border:1px solid var(--line);border-radius:14px;
   padding:12px 16px;margin:16px 0;box-shadow:var(--shadow);
-  display:flex;gap:10px 18px;flex-wrap:wrap;align-items:center;
+  display:flex;gap:14px 34px;flex-wrap:wrap;align-items:center;
 }
 .filters.float-mode{
   position:sticky;top:var(--filters-top,60px);z-index:49;
@@ -172,8 +172,20 @@ body{overflow-anchor:none}  /* .floating 切换会改变文档流高度，滚动
 .filters.floating:not(.no-collapse) .quick-btns{display:none}
 .quick-btns{display:inline-flex;gap:6px;flex-wrap:wrap;align-items:center}
 .q-sep{width:1px;height:14px;background:var(--line);flex:none}
-.fgroup{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.fgroup>label{font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.3px}
+/* flex-basis:100% —— 每个筛选维度独占一行，分组之间不再互相挤压。
+   日期 / 模型 / 客户端 各占一行，账号与机器合并为最后一行（见下），共 4 行；
+   比原先的 3 行高一些，紧凑钉顶时会多遮一点内容 */
+.fgroup{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex-basis:100%}
+/* 账号与机器各占一半宽度、共处最后一行（其余维度仍各占一行）。
+   flex-basis:0 + grow:1 让它们平分扣除组间距后的剩余宽度，不必写死 calc(50% - …)。
+   机器组在未启用云同步时是 hidden，此时账号组自然占满整行 */
+#acctGroup,#machineGroup{flex:1 1 0}
+/* 标签固定成一列，值区统一从同一个 x 坐标开始——一眼看得出有几组筛选，
+   也不再有「标签混在 chip 里」的错觉。这是它像表单、而不像标签墙的关键 */
+.fgroup>label{flex:0 0 52px;font-size:12px;color:#4a5670;font-weight:700;letter-spacing:.3px}
+/* 值区吃满剩余宽度、在内部折行，别被标签挤到下一行去（那样标签会孤零零占一行） */
+.fgroup>.chips,.fgroup>.quick-btns{flex:1 1 auto;min-width:0}
+.fgroup>input[type=date]{flex:0 0 auto}
 input[type=date]{
   border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px;
   color:var(--text);font-family:inherit;background:#fff;
@@ -573,8 +585,8 @@ table.cal td.cal-cell.has:hover{
       </div>
       <div class="fgroup" id="modelGroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
-      <div class="fgroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
-      <div class="fgroup"><label>机器</label><div class="chips" id="machineChips"></div></div>
+      <div class="fgroup" id="acctGroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
+      <div class="fgroup" id="machineGroup"><label>机器</label><div class="chips" id="machineChips"></div></div>
       <button class="chip chip-more float-expand" id="floatExpand" type="button">▾ 展开</button>
       <div class="statline" id="statLine"></div>
       <button class="pin-toggle" id="pinToggle" type="button" aria-pressed="false"></button>
