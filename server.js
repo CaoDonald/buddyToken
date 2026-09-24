@@ -23,6 +23,10 @@ const os = require('os');
 const path = require('path');
 const { exec, execFile } = require('child_process');
 
+// 启动前先做配置体检：补齐缺失的 JSON 配置、提醒未填的值（见 config-doctor.js）。
+// 必须在下面首次 loadAutoConfig 之前跑，生成的 auto-config.json 才能被读到。
+require('./config-doctor').runConfigDoctor();
+
 const ROOT = __dirname;
 const DEFAULT_PORT = 8099;
 const PORT_SCAN_LIMIT = 10;
@@ -509,6 +513,9 @@ const AUTO_INTERVAL_MIN_MINUTES = 1;
 const JITTER_MAX_PERCENT = 50;
 /** 「自动切换账号」到期阈值的默认值（天），auto-config.json 的 switchHorizonDays 可覆盖。 */
 const SWITCH_HORIZON_DEFAULT_DAYS = 14;
+/** 「自动切换账号」冷却时长的默认值（小时），auto-config.json 的 switchCooldownHours 可覆盖。
+ *  必须定义在 loadAutoConfig 之前——模块顶层的首次 loadAutoConfig(null) 会读到它。 */
+const SWITCH_COOLDOWN_DEFAULT_HOURS = 24;
 
 /** 某任务的当前周期（毫秒）。 */
 function intervalMs(name) {
@@ -622,7 +629,6 @@ function isWorkbuddyRunning() {
  *
  * 返回结果摘要（供前端展示）；没有可切换的对象时原样返回说明，不报错。
  */
-const SWITCH_COOLDOWN_DEFAULT_HOURS = 24;
 let lastAutoSwitchAt = 0;   // 上次自动切换成功时刻（内存态，重启归零；手动切换不记）
 
 async function autoSwitchAccount() {

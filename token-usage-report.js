@@ -981,6 +981,9 @@ function resetDataFiles(outdir, jsOut) {
 }
 
 async function main() {
+  // 配置体检：补齐缺失的 JSON 配置、提醒未填的值（双击 bat 走的就是这里）
+  require('./config-doctor').runConfigDoctor();
+
   let args;
   try {
     args = parseArgs({
