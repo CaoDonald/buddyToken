@@ -158,7 +158,18 @@ body{overflow-anchor:none}  /* .floating 切换会改变文档流高度，滚动
 /* 浮动紧凑态的「▾ 展开」入口：未选中 chip 都被藏起来了，靠它临时放开出选；
    展开后文案切「▴ 收起」，再点收回紧凑 */
 .float-expand{display:none}
-.filters.floating .float-expand{display:inline-block}
+/* 紧凑条右侧的圆形展开钮：与 📌/🎈 开关同尺寸同风格（30px 圆、细边框），
+   替代原先的「▾ 展开」虚线文字胶囊——图标语义（滑杆=筛选）+ hover 提示 */
+.filters.floating .chip.float-expand{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:30px;height:30px;padding:0;flex:none;border-radius:999px;
+  border-style:solid;border-color:var(--line);background:#fbfcfe;color:var(--muted);
+}
+.filters.floating .chip.float-expand:hover{border-color:#b9c5e6;color:var(--text)}
+/* 紧凑态显示滑杆图标；展开后（no-collapse）换成「▴ 收起」 */
+.float-expand .ico-collapse{display:none}
+.filters.floating.no-collapse .float-expand .ico-sliders{display:none}
+.filters.floating.no-collapse .float-expand .ico-collapse{display:block}
 /* ---- 浮动紧凑态单行化 ----
    统计句（已筛选 N 条…）不占地方；快捷按钮组整个隐藏（随「▾ 展开」一起出）；
    没有已选内容的组整组隐藏，保证紧凑条只有一行 */
@@ -591,7 +602,21 @@ table.cal td.cal-cell.has:hover{
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
       <div class="fgroup" id="machineGroup"><label>机器</label><div class="chips" id="machineChips"></div></div>
       <div class="fgroup" id="acctGroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
-      <button class="chip chip-more float-expand" id="floatExpand" type="button">▾ 展开</button>
+      <button class="chip chip-more float-expand" id="floatExpand" type="button" title="展开筛选">
+        <svg class="ico-sliders" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <g stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none">
+            <path d="M1.5 4h13M1.5 8h13M1.5 12h13"/>
+          </g>
+          <g fill="currentColor">
+            <circle cx="5.5" cy="4" r="1.9"/><circle cx="10.5" cy="8" r="1.9"/><circle cx="4" cy="12" r="1.9"/>
+          </g>
+        </svg>
+        <svg class="ico-collapse" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+          <g stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 10.5l5-5 5 5"/>
+          </g>
+        </svg>
+      </button>
       <div class="statline" id="statLine"></div>
       <button class="pin-toggle" id="pinToggle" type="button" aria-pressed="false"></button>
     </section>
@@ -4564,10 +4589,11 @@ function renderChips(){
   markEmpty('machineChips', state.filters.machines.size > 0);
 }
 
-/* 「▾ 展开 / ▴ 收起」与「+N」共用 no-collapse，两处切换都要同步文案 */
+/* 「展开/收起」与「+N」共用 no-collapse，两处切换都要同步状态；
+   图标显隐交给 CSS（.no-collapse 控制滑杆/▴ 互换），这里只同步 hover 提示 */
 function syncFloatExpand(open){
   const fx = document.getElementById('floatExpand');
-  if(fx) fx.textContent = open ? '▴ 收起' : '▾ 展开';
+  if(fx) fx.title = open ? '收起筛选' : '展开筛选';
 }
 
 /* ---------- 走势大图：点击模型数据表的 sparkline 弹出 ---------- */
