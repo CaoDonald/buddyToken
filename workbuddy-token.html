@@ -174,23 +174,16 @@ body{overflow-anchor:none}  /* .floating 切换会改变文档流高度，滚动
 .filters.floating:not(.no-collapse) .fgroup{flex:0 0 auto}
 /* 紧凑态不显示「日期/模型/客户端…」标签——单行条里标签是噪音，chip 自解释 */
 .filters.floating:not(.no-collapse) .fgroup>label{display:none}
-/* 紧凑态组间用固定小间距（.filters 的 34px 列间距是展开态分维度用的）；
-   账号/机器组的 flex-grow（展开态用来平分整行）在这里必须归零，
-   否则剩余宽度被吃成大空隙，机器 chip 会漂到老远 */
+/* 紧凑态组间用固定小间距（.filters 的 34px 列间距是展开态分维度用的），
+   让所有有已选内容的组拼回一行——气球收起条永远单行 */
 .filters.floating:not(.no-collapse){gap:8px 14px}
-.filters.floating:not(.no-collapse) #acctGroup,
-.filters.floating:not(.no-collapse) #machineGroup{flex:0 0 auto}
 .filters.floating:not(.no-collapse) .quick-btns{display:none}
 .quick-btns{display:inline-flex;gap:6px;flex-wrap:wrap;align-items:center}
 .q-sep{width:1px;height:14px;background:var(--line);flex:none}
 /* flex-basis:100% —— 每个筛选维度独占一行，分组之间不再互相挤压。
-   日期 / 模型 / 客户端 各占一行，账号与机器合并为最后一行（见下），共 4 行；
-   比原先的 3 行高一些，紧凑钉顶时会多遮一点内容 */
-.fgroup{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex-basis:100%}
-/* 账号与机器各占一半宽度、共处最后一行（其余维度仍各占一行）。
-   flex-basis:0 + grow:1 让它们平分扣除组间距后的剩余宽度，不必写死 calc(50% - …)。
+   日期 / 模型 / 客户端 / 机器 / 账号 各占一行；
    机器组在未启用云同步时是 hidden，此时账号组自然占满整行 */
-#acctGroup,#machineGroup{flex:1 1 0}
+.fgroup{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex-basis:100%}
 /* 标签固定成一列，值区统一从同一个 x 坐标开始——一眼看得出有几组筛选，
    也不再有「标签混在 chip 里」的错觉。这是它像表单、而不像标签墙的关键 */
 .fgroup>label{flex:0 0 52px;font-size:12px;color:#4a5670;font-weight:700;letter-spacing:.3px}
@@ -596,8 +589,8 @@ table.cal td.cal-cell.has:hover{
       </div>
       <div class="fgroup" id="modelGroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
-      <div class="fgroup" id="acctGroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
       <div class="fgroup" id="machineGroup"><label>机器</label><div class="chips" id="machineChips"></div></div>
+      <div class="fgroup" id="acctGroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
       <button class="chip chip-more float-expand" id="floatExpand" type="button">▾ 展开</button>
       <div class="statline" id="statLine"></div>
       <button class="pin-toggle" id="pinToggle" type="button" aria-pressed="false"></button>
