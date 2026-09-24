@@ -796,7 +796,7 @@ table.cal td.cal-cell.has:hover{
           <br>
           <b>响应 P50 / 首字延迟 / 输出速度</b>：三者都针对<b>单次 API 请求</b>，
           已排除工具执行时间但含网络与排队。后两者由「耗时 ≈ 首字延迟 + 输出 token ÷ 速度」
-          分箱回归拟合得出（样本不足 60 条时留空）。带 <span style="color:#c8a24a">*</span> 表示样本不足 30 条。
+          分箱回归拟合得出（拟合不成立时留空）。带 <span style="color:#c8a24a">*</span> 表示样本不足 60 条。
           <b>单次请求耗时不等于用户等待时间</b>——用户等的是整个回合，见上方 KPI 的「模型耗时占比」。
           <br>
           <b>数字下方的小走势</b>：当前筛选范围内该指标的逐桶走势——范围 ≤2 天按小时、
@@ -1144,30 +1144,36 @@ function prevRangeMs(cur){
 }
 
 /**
- * 用稳健分箱回归把响应耗时拆成「首字延迟」与「输出速度」：
+ * 把响应耗时拆成「首字延迟」与「输出速度」：
  *   latency ≈ ttft + 输出token / speed
  *
- * 单次请求的耗时波动很大（网络抖动、服务端负载、缓存命中与否），直接对原
- * 始点做最小二乘会被离群点带偏。所以先按输出 token 排序分成若干箱、每箱取
- * 中位数，得到一个平滑的点列后再做最小二乘。样本太少时返回 null——回归出来
- * 的速度没有参考价值。
+ * 不设样本门槛：少量样本直接对原始点做最小二乘（精度差但能出数）。
+ * 单次请求的耗时波动很大（网络抖动、服务端负载、缓存命中与否），攒够
+ * 16 条才先按输出 token 排序分箱、每箱取中位数得到平滑点列再回归，以
+ * 抗离群点。返回 null 只发生在拟合本身不成立时：少于 2 个点、输出量
+ * 无方差（den=0）、或斜率非正（没有「输出越多越慢」的规律）。
  *
  * pairs 是 [输出token, 耗时ms] 的数组。返回 { ttft(秒), speed(tok/s), n }。
  */
 function fitLatency(pairs){
-  if(pairs.length < 60) return null;
+  if(pairs.length < 2) return null;
   const s = [...pairs].sort((a, b) => a[0] - b[0]);
-  // 箱数随样本量收放：固定 25 箱时小样本的每箱不足 8 条会被大量跳过，
-  // 最后组不出足够的点，回归直接失败。
-  const BINS = Math.max(6, Math.min(25, Math.floor(s.length / 8))), pts = [];
-  for(let i = 0; i < BINS; i++){
-    const seg = s.slice(Math.floor(i * s.length / BINS), Math.floor((i + 1) * s.length / BINS));
-    if(seg.length < 8) continue;
-    const xs = seg.map(p => p[0]).sort((a, b) => a - b);
-    const ys = seg.map(p => p[1]).sort((a, b) => a - b);
-    pts.push([xs[Math.floor(xs.length / 2)], ys[Math.floor(ys.length / 2)]]);
+  // 样本攒够 16 条才分箱抗离群；更少的直接用原始点回归。
+  let pts = s;
+  if(s.length >= 16){
+    pts = [];
+    // 箱数随样本量收放，下限 4 箱：保证每箱至少 4 条中位数样本，
+    // 不至于被整箱跳过、组不出足够的点导致回归失败。
+    const BINS = Math.max(4, Math.min(25, Math.floor(s.length / 8)));
+    for(let i = 0; i < BINS; i++){
+      const seg = s.slice(Math.floor(i * s.length / BINS), Math.floor((i + 1) * s.length / BINS));
+      if(seg.length < 4) continue;
+      const xs = seg.map(p => p[0]).sort((a, b) => a - b);
+      const ys = seg.map(p => p[1]).sort((a, b) => a - b);
+      pts.push([xs[Math.floor(xs.length / 2)], ys[Math.floor(ys.length / 2)]]);
+    }
+    if(pts.length < 4) return null;
   }
-  if(pts.length < 4) return null;
   const n = pts.length;
   const mx = pts.reduce((a, p) => a + p[0], 0) / n;
   const my = pts.reduce((a, p) => a + p[1], 0) / n;
@@ -2790,8 +2796,9 @@ function buildModelSeries(d, f){
       }else{
         s.latP50.push(null);
       }
-      // 与单元格同口径：桶内分箱回归，样本不足 60 的桶断线
-      const fit = b.pairs.length >= 60 ? fitLatency(b.pairs) : null;
+      // 与单元格同口径：桶内分箱回归（样本门槛由 fitLatency 内部把控，
+      // 不足的桶返回 null 断线）
+      const fit = fitLatency(b.pairs);
       s.ttft.push(fit ? fit.ttft : null);
       s.speed.push(fit ? fit.speed : null);
     }
@@ -2930,10 +2937,10 @@ function renderModelRank(d){
         ? `<td class="num"><span class="free-tag">免费</span></td>`
         : sparkTd(`<span style="font-weight:600">${fmtTok(m.perPoint)}</span>`, sr, 'perPoint')}
       ${sparkTd(`<span style="color:#6b7891"${
-        m.latP50 != null && m.latN < 30 ? ` title="样本仅 ${m.latN} 条，参考价值有限"` : ''}>${
+        m.latP50 != null && m.latN < 60 ? ` title="样本仅 ${m.latN} 条，参考价值有限"` : ''}>${
         m.latP50 != null
           ? (m.latP50 / 1000).toFixed(1) + 's' +
-            (m.latN < 30 ? '<span style="color:#c8a24a" title="样本不足">*</span>' : '')
+            (m.latN < 60 ? '<span style="color:#c8a24a" title="样本不足">*</span>' : '')
           : '—'}</span>`, sr, 'latP50')}
       ${sparkTd(`<span style="color:#6b7891">${m.ttft != null ? m.ttft.toFixed(1) + 's' : '—'}</span>`, sr, 'ttft')}
       ${sparkTd(`<span style="color:#6b7891">${m.speed != null ? m.speed.toFixed(0) + ' tok/s' : '—'}</span>`, sr, 'speed')}
@@ -3420,9 +3427,9 @@ function buildMarkdown(d){
       `${m.ttft  != null ? m.ttft.toFixed(1) + 's' : '—'} | ` +
       `${m.speed != null ? m.speed.toFixed(0) + ' tok/s' : '—'} | ${m.thru.toFixed(0)} tok/s |`));
     L.push('');
-    L.push(`- 首字延迟与输出速度按「耗时 ≈ 首字延迟 + 输出 token ÷ 速度」拟合，样本不足 60 条时留空`);
+    L.push(`- 首字延迟与输出速度按「耗时 ≈ 首字延迟 + 输出 token ÷ 速度」拟合，拟合不成立时留空`);
     L.push(`- 有效吞吐 = Σ输出 token ÷ Σ耗时，含首字延迟影响，比纯流式速度保守`);
-    if(s.latModels.some(m => m.n < 30)) L.push(`- \`*\` 样本不足 30 条，参考价值有限`);
+    if(s.latModels.some(m => m.n < 60)) L.push(`- \`*\` 样本不足 60 条，参考价值有限`);
   }else{
     L.push(`当前数据没有请求级耗时——可能是 token-usage-data.js 由 \`--light\` 模式生成，`);
     L.push(`或本地会话记录缺少可推算时间的成对记录。`);
