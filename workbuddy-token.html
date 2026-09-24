@@ -2185,12 +2185,13 @@ function renderCharts(d){
     borderRadius:3, barPercentage:.72
   }));
   const others = s.byModel.slice(6);
+  const otherNames = new Set(others.map(x => x.key));
+  const otherIdx = datasets.length;   // 「其他」即将占用的下标，tooltip 靠它认出这根灰柱
   if(others.length){
-    const names = new Set(others.map(x => x.key));
     datasets.push({
       label: `其他 (${others.length})`,
       data: s.byDate.map(day => {
-        const rows = d.filter(x => x.date === day.key && names.has(x.model));
+        const rows = d.filter(x => x.date === day.key && otherNames.has(x.model));
         return Math.round(rows.reduce((a,b) => a + b.points, 0) * 100) / 100;
       }),
       backgroundColor:'#c8d1e2', borderRadius:3, barPercentage:.72
@@ -2206,7 +2207,31 @@ function renderCharts(d){
         legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
           usePointStyle:true, pointStyle:'circle', padding:10}},
         tooltip:{filter:it => it.parsed.y > 0,
-          callbacks:{label:c => ` ${c.dataset.label}：${fmt2(c.parsed.y)}`}}
+          callbacks:{
+            label:c => ` ${c.dataset.label}：${fmt2(c.parsed.y)}`,
+            // 「其他」是把长尾模型合起来的灰柱，光看高度分不出里面是什么。
+            // 悬停到它时把当天被合并的模型按积分列出来。必须先按模型汇总——
+            // d 是账单行（一次 API 请求一行），直接列会同一模型重复几十次。
+            // 0 积分的免费模型压在最后一行只是点名，它们也是「其他」变大的原因之一。
+            footer(items){
+              const hit = items.find(x => x.datasetIndex === otherIdx);
+              if(!hit || !(hit.parsed.y > 0)) return '';
+              const day = s.byDate[hit.dataIndex];
+              if(!day) return '';
+              const sum = new Map();
+              for(const x of d){
+                if(x.date !== day.key || !otherNames.has(x.model)) continue;
+                sum.set(x.model, (sum.get(x.model) || 0) + x.points);
+              }
+              const list = [...sum].sort((a,b) => b[1] - a[1]);
+              const paid = list.filter(x => x[1] > 0);
+              const free = list.filter(x => x[1] <= 0).map(x => x[0]);
+              return [`　└ 当天构成：${paid.length} 个有积分` +
+                        (free.length ? ` + ${free.length} 个 0 积分` : ''),
+                ...paid.map(x => `　　${x[0]}：${fmt2(x[1])}`),
+                ...(free.length ? [`　　（0 积分：${free.join('、')}）`] : [])];
+            }
+          }}
       },
       scales:{
         x:{stacked:true, grid:{display:false},
