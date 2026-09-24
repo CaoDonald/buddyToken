@@ -172,6 +172,8 @@ body{overflow-anchor:none}  /* .floating 切换会改变文档流高度，滚动
 /* 紧凑态取消「每维度独占一行」（fgroup 的 flex-basis:100% 是展开态的表单布局），
    让所有有已选内容的组拼回一行——气球收起条永远单行 */
 .filters.floating:not(.no-collapse) .fgroup{flex:0 0 auto}
+/* 紧凑态不显示「日期/模型/客户端…」标签——单行条里标签是噪音，chip 自解释 */
+.filters.floating:not(.no-collapse) .fgroup>label{display:none}
 .filters.floating:not(.no-collapse) .quick-btns{display:none}
 .quick-btns{display:inline-flex;gap:6px;flex-wrap:wrap;align-items:center}
 .q-sep{width:1px;height:14px;background:var(--line);flex:none}
