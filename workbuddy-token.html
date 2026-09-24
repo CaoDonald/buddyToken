@@ -263,9 +263,9 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 }
 .sn-item:hover .sn-bar{background:#8a97b8}
 .sn-item.active .sn-bar{width:26px;background:var(--accent)}
-/* 点击跳转的落点留出 sticky 顶栏与浮动筛选条的高度，别让标题被盖住 */
-#kpis,#acctGrid,#tokTrendCard,#rankCard,#sessCard,#detailCard,
-#dailyCard,#heatCard,#dayCard,#reportCard{scroll-margin-top:76px}
+/* 点击跳转的落点留出 sticky 顶栏与浮动筛选条的高度，别让标题被盖住。
+   按容器类型整体给，省得以后每加一张卡片都要回来补一次 id */
+#dash .card,#dash .kpis,#dash .grid{scroll-margin-top:76px}
 @media(max-width:1380px){.side-nav{display:none}}
 
 /* ---------- KPI ---------- */
@@ -705,20 +705,20 @@ table.cal td.cal-cell.has:hover{
     <section class="kpis" id="kpis"></section>
 
     <section class="grid">
-      <div class="card c4">
+      <div class="card c4" id="modelPieCard">
         <h3><span class="dot"></span>模型消耗占比</h3>
         <div class="chart-box"><canvas id="cModel"></canvas></div>
       </div>
-      <div class="card c4">
+      <div class="card c4" id="clientPieCard">
         <h3><span class="dot"></span>客户端消耗占比</h3>
         <div class="chart-box"><canvas id="cClient"></canvas></div>
       </div>
-      <div class="card c4">
+      <div class="card c4" id="hourCard">
         <h3><span class="dot"></span>分时消耗分布 <span class="tag">0–23 时</span></h3>
         <div class="chart-box"><canvas id="cHour"></canvas></div>
       </div>
 
-      <div class="card c12">
+      <div class="card c12" id="calCard">
         <h3>
           <span class="dot"></span>每日日历热力图
           <span class="tag">行=星期 · 列=周 · 悬停查看明细</span>
@@ -746,7 +746,7 @@ table.cal td.cal-cell.has:hover{
         <div class="tbl-scroll"><table class="tbl" id="tblTool"></table></div>
       </div>
 
-      <div class="card c12">
+      <div class="card c12" id="stackCard">
         <h3><span class="dot"></span>各模型每日消耗 <span class="tag">堆叠</span></h3>
         <div class="chart-box tall"><canvas id="cStack"></canvas></div>
       </div>
@@ -764,17 +764,17 @@ table.cal td.cal-cell.has:hover{
         <div id="heatWrap"></div>
       </div>
 
-      <div class="card c7">
+      <div class="card c7" id="topReqCard">
         <h3><span class="dot"></span>Top 10 高消耗请求</h3>
         <div class="tbl-scroll"><table class="tbl" id="tblTop"></table></div>
       </div>
 
-      <div class="card c5">
+      <div class="card c5" id="deltaCard">
         <h3><span class="dot"></span>模型环比 <span class="tag">本期 vs 等长上期</span></h3>
         <div class="tbl-scroll"><table class="tbl" id="tblModel"></table></div>
       </div>
 
-      <div class="card c5">
+      <div class="card c5" id="clientTblCard">
         <h3><span class="dot"></span>客户端明细</h3>
         <table class="tbl" id="tblClient"></table>
       </div>
@@ -5730,12 +5730,26 @@ async function loadFile(file){
  *  独立于 init：script 在 body 末尾执行时 DOM 已就绪，直接构建。
  * =======================================================*/
 (function(){
+  /* 顺序必须与页面上区块的先后一致：滚动高亮是「取最后一个顶部过线的区块」，
+     数组顺序错乱会让高亮在滚动时乱跳。带 hidden 的区块由下方 Observer 自动隐去。 */
   const NAV_ITEMS=[
-    ['kpis','数据总览'],
+    ['autoCard','自动任务'],
     ['acctGrid','账号卡片'],
+    ['kpis','数据总览'],
+    ['modelPieCard','模型占比'],
+    ['clientPieCard','客户端占比'],
+    ['hourCard','分时分布'],
+    ['calCard','日历热力图'],
     ['dailyCard','每日趋势'],
     ['tokTrendCard','Token 趋势'],
-    ['heatCard','时段热力图'],
+    ['tokenTopCard','Token Top 10'],
+    ['toolCard','工具 Token'],
+    ['stackCard','各模型每日'],
+    ['latCard','响应耗时'],
+    ['heatCard','模型×时段'],
+    ['topReqCard','高消耗请求'],
+    ['deltaCard','模型环比'],
+    ['clientTblCard','客户端明细'],
     ['dayCard','每日汇总'],
     ['rankCard','模型数据'],
     ['sessCard','Session 消耗'],
