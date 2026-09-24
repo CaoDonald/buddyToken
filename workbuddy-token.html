@@ -235,6 +235,39 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 }
 .pin-toggle:hover{border-color:#b9c5e6}
 
+/* ---------- 左侧极简导航 ----------
+   贴边一列灰色短横线；整列悬停时滑出白色气泡、露出各区块标题；
+   点击平滑滚动到对应区块，滚动时高亮当前区块（蓝色长条）。
+   无数据的区块（hidden）对应的点自动隐藏；窄屏内容贴边时整个隐藏 */
+.side-nav{
+  position:fixed;left:14px;top:50%;transform:translateY(-50%);
+  z-index:55;display:flex;flex-direction:column;gap:9px;
+  padding:12px 10px;border-radius:14px;
+  transition:background .2s,box-shadow .2s;
+}
+.side-nav:hover{background:#fff;box-shadow:0 8px 28px rgba(30,40,80,.14)}
+.sn-item{
+  display:flex;align-items:center;justify-content:flex-end;gap:8px;
+  padding:0;border:0;background:none;cursor:pointer;font-family:inherit;
+}
+.sn-label{
+  font-size:12px;line-height:16px;color:var(--muted);white-space:nowrap;
+  max-width:0;opacity:0;overflow:hidden;transition:max-width .2s,opacity .2s,color .15s;
+}
+.side-nav:hover .sn-label{max-width:150px;opacity:1}
+.sn-item:hover .sn-label{color:var(--text)}
+.sn-item.active .sn-label{color:var(--accent);font-weight:700}
+.sn-bar{
+  flex:none;width:14px;height:2px;border-radius:2px;background:#c9d2e3;
+  transition:width .2s,background .15s;
+}
+.sn-item:hover .sn-bar{background:#8a97b8}
+.sn-item.active .sn-bar{width:26px;background:var(--accent)}
+/* 点击跳转的落点留出 sticky 顶栏与浮动筛选条的高度，别让标题被盖住 */
+#kpis,#acctGrid,#tokTrendCard,#rankCard,#sessCard,#detailCard,
+#dailyCard,#heatCard,#dayCard,#reportCard{scroll-margin-top:76px}
+@media(max-width:1380px){.side-nav{display:none}}
+
 /* ---------- KPI ---------- */
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px}
 .kpi{
@@ -693,7 +726,7 @@ table.cal td.cal-cell.has:hover{
         <div class="cal-grid" id="calGrid"></div>
       </div>
 
-      <div class="card c12">
+      <div class="card c12" id="dailyCard">
         <h3><span class="dot"></span>每日趋势 <span class="tag">柱=积分 / Token / 请求数</span></h3>
         <div class="chart-box tall"><canvas id="cDaily"></canvas></div>
       </div>
@@ -726,7 +759,7 @@ table.cal td.cal-cell.has:hover{
         <div class="chart-box tall"><canvas id="cLatency"></canvas></div>
       </div>
 
-      <div class="card c12">
+      <div class="card c12" id="heatCard">
         <h3><span class="dot"></span>模型 × 时段 热力图</h3>
         <div id="heatWrap"></div>
       </div>
@@ -746,7 +779,7 @@ table.cal td.cal-cell.has:hover{
         <table class="tbl" id="tblClient"></table>
       </div>
 
-      <div class="card c7">
+      <div class="card c7" id="dayCard">
         <h3><span class="dot"></span>每日汇总</h3>
         <div class="tbl-scroll"><table class="tbl" id="tblDay"></table></div>
       </div>
@@ -794,13 +827,15 @@ table.cal td.cal-cell.has:hover{
         <div class="detail-pager" id="detailPager"></div>
       </div>
 
-      <div class="card c12">
+      <div class="card c12" id="reportCard">
         <h3><span class="dot"></span>📝 分析报告 <span class="tag">自动生成</span></h3>
         <div class="report" id="report"></div>
       </div>
     </section>
   </main>
 </div>
+
+<nav class="side-nav no-print" id="sideNav" aria-label="页面导航"></nav>
 
 <div id="modalRoot"></div>
 
@@ -5654,6 +5689,80 @@ async function loadFile(file){
       }, 60000);
     }
   })();
+})();
+
+/* =========================================================
+ * 16. 左侧极简导航
+ *  贴边短横线列；整列悬停滑出标题气泡；点击平滑滚动到区块；
+ *  滚动监听高亮当前区块；区块 hidden（无数据）时对应的点同步隐藏。
+ *  独立于 init：script 在 body 末尾执行时 DOM 已就绪，直接构建。
+ * =======================================================*/
+(function(){
+  const NAV_ITEMS=[
+    ['kpis','数据总览'],
+    ['acctGrid','账号卡片'],
+    ['dailyCard','每日趋势'],
+    ['tokTrendCard','Token 趋势'],
+    ['heatCard','时段热力图'],
+    ['dayCard','每日汇总'],
+    ['rankCard','模型数据'],
+    ['sessCard','Session 消耗'],
+    ['detailCard','完整明细'],
+    ['reportCard','分析报告'],
+  ];
+  const nav=document.getElementById('sideNav');
+  if(!nav) return;
+  const items=NAV_ITEMS.map(([id,label])=>{
+    const el=document.getElementById(id);
+    if(!el) return null;
+    const b=document.createElement('button');
+    b.className='sn-item';b.type='button';b.dataset.target=id;
+    const lab=document.createElement('span');
+    lab.className='sn-label';lab.textContent=label;
+    const bar=document.createElement('span');
+    bar.className='sn-bar';
+    b.append(lab,bar);
+    b.addEventListener('click',()=>{
+      el.scrollIntoView({behavior:'smooth',block:'start'});
+      setActive(id);   // 点击立即点亮，不等滚动过程走完
+    });
+    nav.appendChild(b);
+    return {id,el,btn:b};
+  }).filter(Boolean);
+  if(!items.length) return;
+
+  function setActive(id){
+    items.forEach(it=>it.btn.classList.toggle('active',it.id===id));
+  }
+
+  /* 显隐同步：渲染流程会切换这些区块的 hidden 属性，Observer 跟着显隐导航点 */
+  function syncVisible(){
+    items.forEach(it=>{ it.btn.style.display=it.el.hidden?'none':''; });
+  }
+  const mo=new MutationObserver(syncVisible);
+  items.forEach(it=>mo.observe(it.el,{attributes:true,attributeFilter:['hidden']}));
+
+  /* 滚动高亮：取「顶部已过线（<=96px）的最后一个」区块；
+     都在线下（页面顶部）时取第一个可见区块；无可见区块则全灭 */
+  let ticking=false;
+  function spy(){
+    ticking=false;
+    let cur=null,first=null;
+    for(const it of items){
+      if(it.el.hidden) continue;
+      const r=it.el.getBoundingClientRect();
+      if(r.height<2) continue;   // 空区块（如未渲染的 kpis）不算
+      if(!first) first=it;
+      if(r.top<=96) cur=it;
+    }
+    setActive(cur?cur.id:(first?first.id:null));
+  }
+  addEventListener('scroll',()=>{
+    if(!ticking){ticking=true;requestAnimationFrame(spy);}
+  },{passive:true});
+
+  syncVisible();
+  spy();
 })();
 </script>
 </body>
