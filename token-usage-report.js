@@ -94,6 +94,9 @@ const path = require('path');
 const readline = require('readline');
 const { parseArgs } = require('util');
 
+// console 输出同步落盘到 logs/buddytoken-YYYYMMDD.log（见 app-logger.js）
+require('./app-logger');
+
 // 官方接口封装（拉账单 / 查积分余额）。读取失败时降级为纯本地扫描，
 // 不影响脚本原有行为。见 workbuddy-api.js。
 let wbApi = null;

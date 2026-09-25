@@ -21,6 +21,87 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
+// ---------------------------------------------------------------- 加密字段兼容（WorkBuddy 5.6.2+）
+
+/**
+ * WorkBuddy 5.6.2 起把 auth 快照里的 accessToken/refreshToken/nickname 等敏感字段
+ * 改为加密信封存储：{$wbEncrypted:1, envelope:"<base64>"}。旧版本/CLI 侧仍是明文。
+ * 两种形态都必须兼容：字符串直接用；信封对象解密后用。
+ *
+ * 信封格式（suite 1 = AES-256-GCM）：
+ *   envelope(base64) → {"suite":1,"keyId":"<16hex>","nonce":b64(12B),"authTag":b64(16B),"ciphertext":b64}
+ * 解密密钥不是信封里的，而是客户端构建期静态串（atRestSecretKey）：
+ *   key   = sha256(secret)            （32B）
+ *   keyId = sha256(key) hex 的前 16 位（即 envelope.keyId，用来挑密钥）
+ * secret 在本机取证获得，存于项目根 wb-field-key.json（已 gitignore）。客户端升级
+ * 换 secret 时按 keyId 匹配，匹配不到再报「密钥过期」。
+ *
+ * AAD（field framing, sym-v1）按官方实现逐字节复刻：
+ *   "WB-AAD\0" + 0x01 + lenpfx("WBEV1") + lenpfx("sym-v1") + u32(suite)
+ *   + lenpfx(keyId) + 0x02(field) + 0x00(sequence 缺省) + 0x00(final 缺省)
+ */
+
+/** 加密信封的 key → keyId 缓存（keyId → key）。 */
+const _wbFieldKeyCache = new Map();
+
+/** 读取本机保存的 build secret 列表并派生 key。文件缺失/损坏返回空 Map。 */
+function loadWbFieldKeys() {
+  if (_wbFieldKeyCache.size) return _wbFieldKeyCache;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'wb-field-key.json'), 'utf8'));
+    for (const secret of cfg.secrets || []) {
+      const key = crypto.createHash('sha256').update(String(secret), 'utf8').digest();
+      const keyId = crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
+      _wbFieldKeyCache.set(keyId, key);
+    }
+  } catch { /* 没有密钥文件 = 只支持明文快照 */ }
+  return _wbFieldKeyCache;
+}
+
+/** 判断值是否为加密信封对象。 */
+function isWbEncrypted(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v) && v.$wbEncrypted === 1
+    && typeof v.envelope === 'string';
+}
+
+/**
+ * 解一个加密字段，返回明文字符串；任何一步失败返回 null（调用方决定降级策略）。
+ * 非信封形态原样返回（明文兼容路径）。
+ */
+function openWbEncryptedField(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'string') return v;   // 旧版/CLI 明文
+  if (!isWbEncrypted(v)) return null;
+  let env;
+  try { env = JSON.parse(Buffer.from(v.envelope, 'base64').toString('utf8')); } catch { return null; }
+  if (!env || env.suite !== 1) return null;
+  const key = loadWbFieldKeys().get(env.keyId);
+  if (!key) return null;   // 密钥过期（客户端换了 build secret）
+  let nonce, tag, ct;
+  try {
+    nonce = Buffer.from(env.nonce, 'base64');
+    tag = Buffer.from(env.authTag, 'base64');
+    ct = Buffer.from(env.ciphertext || '', 'base64');
+  } catch { return null; }
+  if (nonce.length !== 12 || tag.length !== 16) return null;
+  const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n); return b; };
+  const lenpfx = (s) => { const b = Buffer.from(s, 'utf8'); return Buffer.concat([u32(b.length), b]); };
+  const aad = Buffer.concat([
+    Buffer.from('WB-AAD\0', 'ascii'), Buffer.from([1]),
+    lenpfx('WBEV1'), lenpfx('sym-v1'), u32(env.suite),
+    lenpfx(env.keyId),
+    Buffer.from([2]),   // framing: field
+    Buffer.from([0]),   // sequence: 缺省
+    Buffer.from([0]),   // final: 缺省
+  ]);
+  try {
+    const d = crypto.createDecipheriv('aes-256-gcm', key, nonce);
+    d.setAAD(aad);
+    d.setAuthTag(tag);
+    return Buffer.concat([d.update(ct), d.final()]).toString('utf8');
+  } catch { return null; }
+}
+
 // ---------------------------------------------------------------- 常量
 
 /** 登录态快照目录（WorkBuddy 桌面端写入）。 */
@@ -190,22 +271,30 @@ function discoverAccounts() {
     const account = raw.account || {};
     const auth = raw.auth || {};
     const uid = account.uid || raw.uid;
-    const accessToken = auth.accessToken || account.accessToken || raw.accessToken;
-    if (!uid || !accessToken) continue;
+    // 5.6.2+ 桌面端这些字段是加密信封对象；旧版/CLI 是明文字符串。统一走兼容 opener。
+    const accessToken = openWbEncryptedField(auth.accessToken ?? account.accessToken ?? raw.accessToken);
+    if (!uid || !accessToken) continue;   // 缺 token 或信封解不开（密钥过期）都视为不可用快照
 
     const mtime = fs.statSync(full).mtimeMs;
     const key = uid + '|' + appFromSnapshot(file);
     const prev = byKey.get(key);
     if (prev && prev._mtime >= mtime) continue;
 
+    const nickname = openWbEncryptedField(account.nickname);
     byKey.set(key, {
       _mtime: mtime,
       _app: appFromSnapshot(file),
       uid,
-      /** 展示名：昵称优先，缺失时退化为 uid 前 8 位。 */
-      name: account.nickname || String(uid).slice(0, 8),
+      /**
+       * 展示名：昵称优先（明文或解密所得），缺失/解密失败时退化为 uid 前 8 位。
+       * 加密对象不可直接当字符串用，否则会打出 [object Object]。
+       */
+      name: (typeof nickname === 'string' && nickname.trim())
+        ? nickname
+        : String(uid).slice(0, 8),
       accessToken,
-      refreshToken: auth.refreshToken || '',
+      // refreshToken 解不开只损失「静默续期」能力，access token 30 天内仍可用
+      refreshToken: openWbEncryptedField(auth.refreshToken) || '',
       domain: auth.domain || '',
       expiresAt: num(auth.expiresAt) || 0,
       /** 凭证来源文件名，便于排查。 */
@@ -1313,7 +1402,9 @@ function listSwitchableAccounts() {
     if (prev && prev.mtime >= mtime) continue;
     byKey.set(key, {
       uid,
-      name: (raw.account && raw.account.nickname) || String(uid).slice(0, 8),
+      // nickname 在 5.6.2+ 是加密信封，同样走兼容 opener（解不开退 uid 前 8 位）
+      name: (() => { const n = openWbEncryptedField(raw.account && raw.account.nickname);
+        return (typeof n === 'string' && n.trim()) ? n : String(uid).slice(0, 8); })(),
       expiresAt: num(raw.auth && raw.auth.expiresAt) || 0,
       mtime,
       source: file,

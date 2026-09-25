@@ -16,6 +16,9 @@ sync-state.json
 wb-accounts.json
 billing-data.js
 switch-backups/
+# WorkBuddy 5.6.2 加密字段的解密密钥（build secret 派生）与运行日志
+wb-field-key.json
+logs/
 
 # 自己导出的账单文件
 *.xlsx

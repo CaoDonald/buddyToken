@@ -32,6 +32,9 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
+// console 输出同步落盘到 logs/buddytoken-YYYYMMDD.log（见 app-logger.js）
+require('./app-logger');
+
 const ROOT = __dirname;
 const CONFIG_FILE = path.join(ROOT, 'sync-config.json');
 const STATE_FILE = path.join(ROOT, 'sync-state.json');

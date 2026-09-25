@@ -23,6 +23,10 @@ const os = require('os');
 const path = require('path');
 const { exec, execFile } = require('child_process');
 
+// console 输出同步落盘到 logs/buddytoken-YYYYMMDD.log（见 app-logger.js）。
+// 必须先于 config-doctor：体检输出也要进日志。
+require('./app-logger');
+
 // 启动前先做配置体检：补齐缺失的 JSON 配置、提醒未填的值（见 config-doctor.js）。
 // 必须在下面首次 loadAutoConfig 之前跑，生成的 auto-config.json 才能被读到。
 require('./config-doctor').runConfigDoctor();
