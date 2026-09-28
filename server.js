@@ -38,6 +38,22 @@ const PORT_SCAN_LIMIT = 10;
 const SYNC_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
+ * 后台任务（云同步）占用同步锁时，用户的手动同步最多排队等它多久。
+ *
+ * 云同步一轮通常 10~40 秒，等它让出锁再跑，比直接回 409「已有同步进行中」
+ * 让用户干瞪眼要好；等不到（首次全量推送可能跑很久）才拒绝。
+ */
+const SYNC_LOCK_WAIT_MS = 60 * 1000;
+
+/**
+ * 用户主动同步之后的「云同步让路窗口」：这段时间内云同步定时器不启动新一轮。
+ *
+ * 「一键同步」是连着两发请求（先积分后 Token），第一发完成后紧接着会顺带推云，
+ * 若立刻占锁，第二发就撞上 409。让云同步等用户停手再跑，把冲突从源头消掉。
+ */
+const USER_GRACE_MS = 20 * 1000;
+
+/**
  * 看板文件路径：统一用它打开，而不是 http://127.0.0.1:端口/workbuddy-token.html。
  *
  * 浏览器的存储（IndexedDB / localStorage）按地址隔离，http 与 file 是两个
@@ -71,6 +87,8 @@ const MIME = {
 
 /** 同一时间只允许一次同步：重复点击直接拒绝，避免两个脚本抢写数据文件。 */
 let syncing = false;
+/** 最近一次用户主动同步/清空的时刻，云同步定时器据此给用户操作让路。 */
+let lastUserSyncAt = 0;
 /** 切换账号同理：写认证文件期间不允许并发（备份→写→重启必须原子）。 */
 let switching = false;
 
@@ -222,6 +240,28 @@ function runSync(part, uid) {
   });
 }
 
+/**
+ * 等同步锁释放，仅用于「后台任务（云同步）占用」的场合。
+ *
+ * 返回 true 表示轮询到了锁空闲——调用方必须在同一个事件循环回合里紧接着
+ * `syncing = true`（中间不能有 await），否则可能和别的等待者一起抢到。
+ * 返回 false 表示超时，调用方按「正忙」拒绝。
+ *
+ * 用 250ms 轮询而不是事件通知：锁的唯一持有者是云同步子进程，结束后在
+ * execFile 回调里放锁，跨进程拿不到事件，轮询最省事、代价也可忽略。
+ */
+function waitSyncLockFree(timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (!syncing) return resolve(true);
+      if (Date.now() - t0 >= timeoutMs) return resolve(false);
+      setTimeout(tick, 250);
+    };
+    tick();
+  });
+}
+
 async function handleSync(req, res) {
   // 允许 /api/sync、/api/sync/credits、/api/sync/tokens 三种写法
   const part = req.url.split('?')[0].replace(/^\/api\/sync\/?/, '').trim() || 'all';
@@ -229,12 +269,11 @@ async function handleSync(req, res) {
     json(res, 400, { ok: false, error: '未知的同步类型：' + part });
     return;
   }
-  if (syncing) {
-    json(res, 409, { ok: false, error: '已有同步进行中，请稍候' });
-    return;
-  }
+  // 用户主动操作的痕迹：云同步定时器会避开这段时间（见 USER_GRACE_MS）
+  lastUserSyncAt = Date.now();
 
-  // body 可选：{ uid } 表示只刷新该账号（看板账号卡片上的「刷新」按钮）
+  // body 可选：{ uid } 表示只刷新该账号（看板账号卡片上的「刷新」按钮）。
+  // 读出与校验放在抢锁之前——它们不碰数据文件，失败时也不白占锁
   const body = await readBody(req);
   const uid = String(body.uid || '').trim();
   if (uid && !/^[0-9a-zA-Z_-]{1,64}$/.test(uid)) {
@@ -246,6 +285,20 @@ async function handleSync(req, res) {
     return;
   }
 
+  if (syncing) {
+    // 云同步是后台任务，晚一轮毫无影响——排队等它让出锁，不让用户看到失败；
+    // 只有在跑的是另一个「手动同步」时才直接拒绝（连点场景，等也等不出结果）
+    if (!cloudRunning) {
+      json(res, 409, { ok: false, error: '已有同步进行中，请稍候' });
+      return;
+    }
+    if (!(await waitSyncLockFree(SYNC_LOCK_WAIT_MS))) {
+      json(res, 409, { ok: false, error: '已有同步进行中，请稍候再试' });
+      return;
+    }
+  }
+
+  // 上面等锁的 await 之后到这里中间不能有别的 await，否则别的等待者会跟我们一起抢
   syncing = true;
   let syncOk = false;
   try {
@@ -257,8 +310,10 @@ async function handleSync(req, res) {
   } finally {
     syncing = false;
     // 手动同步刚写出新数据，顺带推上云（异步触发不阻塞响应；失败只打警告）。
-    // 放在 finally 里是为了先让出 syncing 锁，否则 runCloudTask 会因抢锁而直接返回。
-    if (syncOk) runCloudTask();
+    // 延后几秒再跑：把时间窗留给「一键同步」的下一发请求（先积分后 Token 是
+    // 连着两发），否则云同步会抢在第二发前面占锁。若那时锁仍被占，本轮直接
+    // 跳过——云同步本来就有周期定时器，等用户停手后自然会补上。
+    if (syncOk) setTimeout(runCloudTask, 3000);
   }
 }
 
@@ -272,11 +327,16 @@ async function handleSync(req, res) {
  * 不动 switch-backups/ 账号凭证备份，也不碰 ~/.workbuddy 下的原始会话记录。
  * 看板侧的快照存在浏览器里，需要页面自己清（见页面里的清空流程）。
  */
-function handleReset(req, res) {
+async function handleReset(req, res) {
+  // 与 handleSync 同一套规则：云同步占锁时排队等它让出，手动同步在跑才拒绝
+  lastUserSyncAt = Date.now();
   if (syncing) {
-    json(res, 409, { ok: false, error: '已有同步进行中，请稍候再清空' });
-    return;
+    if (!cloudRunning || !(await waitSyncLockFree(SYNC_LOCK_WAIT_MS))) {
+      json(res, 409, { ok: false, error: '已有同步进行中，请稍候再清空' });
+      return;
+    }
   }
+  // 等锁的 await 之后到这里中间不能有别的 await，否则会和别的等待者一起抢
   syncing = true;
   execFile(
     process.execPath,
@@ -905,18 +965,24 @@ async function runCloudTask() {
 }
 
 /**
- * 云同步定时器：每 30 秒看一次是否到点。
+ * 云同步的一轮调度检查（周期定时器与启动发车共用）。
  *
- * 用 30 秒粒度而不是精确到周期：云同步的周期是「分钟」量级（默认 30 分钟），
- * 差几十秒无所谓；配置改了也最多 30 秒生效。服务刚起来时 lastRunAt 为 0，
- * 会在第一次 tick 时就跑一轮，让新机器尽快看到汇总数据。
+ * 三道闸门：① 同步锁被占（有任务在跑）不启动；② 用户刚操作过——USER_GRACE_MS
+ * 的让路窗口内不启动，免得抢在手动同步前面占锁；③ 没到周期不启动。
+ * 放行后 runCloudTask 自己还会再检查一遍锁，这里只是尽量别去打扰用户。
+ *
+ * 用 30 秒粒度而不是精确到周期：云同步的周期是「分钟」量级，差几十秒无所谓；
+ * 配置改了也最多 30 秒生效。服务刚起来时 lastRunAt 为 0，第一次 tick 就跑。
  */
-setInterval(() => {
+function cloudTick() {
   if (cloudRunning || syncing) return;
+  if (Date.now() - lastUserSyncAt < USER_GRACE_MS) return;
   if (!refreshCloudState()) return;
   if (Date.now() - cloudState.lastRunAt < cloudState.intervalMinutes * 60000) return;
   runCloudTask();
-}, 30 * 1000);
+}
+
+setInterval(cloudTick, 30 * 1000);
 
 /**
  * 服务起来后尽早跑一次，不用等满 30 秒。
@@ -924,10 +990,10 @@ setInterval(() => {
  * 对新机器特别有意义：刚 clone 下来时本地还没有数据文件，靠这一轮把云端已有的
  * 数据拉回来，看板打开就是汇总视图。
  *
- * 延后 5 秒是为了避开启动瞬间那批自动任务——它们会抢 syncing 锁，抢不到时
- * 云同步会直接返回（下一个 30 秒的 tick 还会再试）。
+ * 同样走 cloudTick：启动后 5 秒内用户若已经开始操作，「让路窗口」会把这一轮
+ * 推到下一个 tick，不会出现「用户刚点同步就被云同步占锁」的开局体验。
  */
-setTimeout(runCloudTask, 5 * 1000);
+setTimeout(cloudTick, 5 * 1000);
 
 // ---------------------------------------------------------------- 启动
 
