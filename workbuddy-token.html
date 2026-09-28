@@ -621,6 +621,7 @@ table.cal td.cal-cell.has:hover{
           <button class="chip" data-q="3h"   title="数据里最新一条往前 3 小时">近3时</button>
           <i class="q-sep"></i>
           <button class="chip" data-q="today" title="把日期范围设为数据里最后一天">今日</button>
+          <button class="chip" data-q="3"    title="最近 3 天（按数据最后一天回溯）">近3日</button>
           <button class="chip" data-q="7"    title="最近 7 天（按数据最后一天回溯）">近7日</button>
           <button class="chip" data-q="14"   title="最近 14 天（按数据最后一天回溯）">近14日</button>
           <button class="chip" data-q="30"   title="最近 30 天（按数据最后一天回溯）">近30日</button>
@@ -727,7 +728,7 @@ table.cal td.cal-cell.has:hover{
       </div>
 
       <div class="card c12" id="dailyCard">
-        <h3><span class="dot"></span>每日趋势 <span class="tag">柱=积分 / Token / 请求数</span></h3>
+        <h3><span class="dot"></span>积分 · Token · 请求数趋势 <span class="tag" id="granTag">按天</span></h3>
         <div class="chart-box tall"><canvas id="cDaily"></canvas></div>
       </div>
 
@@ -747,7 +748,7 @@ table.cal td.cal-cell.has:hover{
       </div>
 
       <div class="card c12" id="stackCard">
-        <h3><span class="dot"></span>各模型每日消耗 <span class="tag">堆叠</span></h3>
+        <h3><span class="dot"></span>各模型积分 <span class="tag">堆叠</span></h3>
         <div class="chart-box tall"><canvas id="cStack"></canvas></div>
       </div>
 
@@ -760,7 +761,7 @@ table.cal td.cal-cell.has:hover{
       </div>
 
       <div class="card c12" id="heatCard">
-        <h3><span class="dot"></span>模型 × 时段 热力图</h3>
+        <h3><span class="dot"></span>模型 × 时段 热力图 <span class="tag" id="heatGranTag"></span></h3>
         <div id="heatWrap"></div>
       </div>
 
@@ -1186,6 +1187,94 @@ function fitLatency(pairs){
   return { ttft: Math.max(my - b * mx, 0) / 1000, speed: 1000 / b, n: pairs.length };
 }
 
+/* 图表粒度档位：按筛选范围跨度（span 毫秒）从上到下取第一条满足的档。
+   想调整「什么时间范围用什么粒度」改这张表即可（最后一档 upTo 必须是 Infinity），
+   只影响趋势/堆叠/热力图，不影响「模型数据」卡的走势分桶（那边自成一套阈值）。 */
+const GRAN_TIERS = [
+  { name:'分钟', unitMs:60e3,    upTo:3 * 3600e3  },   // 范围 ≤3 小时
+  { name:'小时', unitMs:3600e3,  upTo:3 * 86400e3 },   // 范围 ≤3 天
+  { name:'天',   unitMs:86400e3, upTo:Infinity     },   // 更长（最大粒度就是天）
+];
+
+/**
+ * 图表时间桶：积分/Token/请求趋势、各模型堆叠、模型×时段热力图共用。
+ *
+ * 分桶口径与「模型数据」卡的 buildModelSeries 保持一致：同一套范围解析
+ * （时间粒度快捷 > 日期选择 > 数据首尾）、同款「对齐到整分/整点/0 点后
+ * 切等长桶、空桶补 0」。粒度档位见上方 GRAN_TIERS（最粗固定为天，不引入周）。
+ *
+ * 返回 { unitMs, label, s0, n, buckets, matrix }：
+ *   buckets[i] = { t0, label, sum, count, tk, tkIn, tkOut, tkCr }
+ *   matrix     = 模型 → { pts:[每桶积分], cnt:[每桶请求数] }
+ */
+function buildBuckets(d, f){
+  let lo = Infinity, hi = -Infinity;
+  for(const x of d){
+    const t = x.time.getTime();
+    if(t < lo) lo = t;
+    if(t > hi) hi = t;
+  }
+  // 空数据直接给空骨架，避免 Infinity 参与 span 运算得 NaN
+  if(!d.length) return { unitMs:86400000, label:'天', s0:0, n:0, buckets:[], matrix:new Map() };
+
+  let start, end;
+  if(f.fromTs || f.toTs){                       // 分钟级快捷（近30分/近1时/近3时）
+    start = f.fromTs || lo;
+    end   = f.toTs   || hi;
+  }else if(f.from || f.to){                     // 日期选择（某天～某天）
+    start = f.from ? new Date(f.from + 'T00:00:00').getTime() : lo;
+    end   = f.to   ? new Date(f.to   + 'T23:59:59.999').getTime() : hi;
+  }else{
+    start = lo; end = hi;
+  }
+  const span = Math.max(end - start, 0);
+  const tier = GRAN_TIERS.find(t => span <= t.upTo) || GRAN_TIERS[GRAN_TIERS.length - 1];
+  const unitMs = tier.unitMs;
+  const label = tier.name;
+  // 分钟/小时桶对齐整分/整点、天桶对齐本地 0 点，避免从数据中间硬切出半截桶
+  let s0;
+  if(unitMs === 86400000){
+    const dd = new Date(start);
+    s0 = new Date(dd.getFullYear(), dd.getMonth(), dd.getDate()).getTime();
+  }else{
+    s0 = Math.floor(start / unitMs) * unitMs;
+  }
+  const n = Math.max(1, Math.ceil((end - s0) / unitMs));
+
+  // 固定 n 桶补 0：空时段在柱状图上表现为 0 高柱而不是缺柱（与走势补平线同理）
+  const buckets = Array.from({length:n}, (_, i) => ({
+    t0: s0 + i * unitMs, label:'',
+    sum:0, count:0, tk:0, tkIn:0, tkOut:0, tkCr:0
+  }));
+  const matrix = new Map();
+  for(const x of d){
+    const bi = Math.min(n - 1, Math.max(0, Math.floor((x.time.getTime() - s0) / unitMs)));
+    const b = buckets[bi];
+    b.sum += x.points; b.count++;
+    if(x.token){
+      b.tk    += x.token.tot;
+      b.tkIn  += x.token.in;
+      b.tkOut += x.token.out;
+      b.tkCr  += x.token.cr;
+    }
+    let cell = matrix.get(x.model);
+    if(!cell){ cell = { pts:new Array(n).fill(0), cnt:new Array(n).fill(0) }; matrix.set(x.model, cell); }
+    cell.pts[bi] += x.points;
+    cell.cnt[bi] += 1;
+  }
+  // label：单天内只显示时刻，跨天带上日期前缀，避免「两个 14:00 分不清是哪天」
+  const daySet = new Set(buckets.map(b => fmtDate(new Date(b.t0))));
+  const crossDay = daySet.size > 1;
+  for(const b of buckets){
+    const t = new Date(b.t0);
+    const pre = crossDay ? `${pad(t.getMonth()+1)}-${pad(t.getDate())} ` : '';
+    b.label = unitMs === 86400000 ? fmtDate(t)
+            : unitMs === 3600000  ? pre + pad(t.getHours()) + '时'
+            :                       pre + `${pad(t.getHours())}:${pad(t.getMinutes())}`;
+  }
+  return { unitMs, label, s0, n, buckets, matrix };
+}
+
 function computeStats(d){
   const total = d.reduce((s,x) => s + x.points, 0);
   const count = d.length;
@@ -1370,6 +1459,7 @@ function computeStats(d){
 
   return {
     total, count, byModel, byClient, byDate, byHour, hourArr,
+    buckets: buildBuckets(d, state.filters),
     top, zeroCnt, dates, peakHour, peakDay, top10Sum, maxReq,
     days: byDate.length,
     avg: count ? total / count : 0,
@@ -1953,8 +2043,9 @@ async function onAcctAction(btn){
       btn.textContent = label;
     }
     if(!r || !r.ok){
-      toast('刷新失败：' + (r && r.error || '未知错误'));
-      setSaveState('saved', '刷新失败，数据未更新');
+      toast(r && r.busy ? '已有同步正在进行，请稍候再试'
+                        : '刷新失败：' + (r && r.error || '未知错误'));
+      setSaveState('saved', r && r.busy ? '其他同步进行中，稍候再试' : '刷新失败，数据未更新');
       return;
     }
 
@@ -2070,23 +2161,27 @@ function renderCharts(d){
     }
   });
 
-  const dayLabels = s.byDate.map(x => x.key);
-  /* ---- 每日三轴并排柱：积分（左）· Token（右内）· 请求数（右外）----
+  // 时间桶：粒度随筛选范围自动切换（分钟/小时/天），与「模型数据」卡走势同口径
+  const bk = s.buckets;
+  const granTag = $('granTag');
+  if(granTag) granTag.textContent = `按${bk.label}`;
+  const dayLabels = bk.buckets.map(x => x.label);
+  /* ---- 三轴并排柱：积分（左）· Token（右内）· 请求数（右外）----
      无 Token 数据时退化为「积分 + 请求数」两轴，请求数独占右轴。 */
   const dailyDatasets = [
-    {type:'bar', label:'积分消耗', data: s.byDate.map(x => Math.round(x.sum*100)/100),
+    {type:'bar', label:'积分消耗', data: bk.buckets.map(x => Math.round(x.sum*100)/100),
      yAxisID:'y', backgroundColor:'rgba(79,110,247,.75)', borderRadius:4,
      categoryPercentage:.85, barPercentage:.9}
   ];
   if(s.hasToken){
     dailyDatasets.push(
-      {type:'bar', label:'Token', data: s.byDate.map(x => x.tk),
+      {type:'bar', label:'Token', data: bk.buckets.map(x => x.tk),
        yAxisID:'y1', backgroundColor:'rgba(245,159,0,.75)', borderRadius:4,
        categoryPercentage:.85, barPercentage:.9}
     );
   }
   dailyDatasets.push(
-    {type:'bar', label:'请求数', data: s.byDate.map(x => x.count),
+    {type:'bar', label:'请求数', data: bk.buckets.map(x => x.count),
      yAxisID: s.hasToken ? 'y2' : 'y1', backgroundColor:'rgba(18,184,134,.75)', borderRadius:4,
      categoryPercentage:.85, barPercentage:.9}
   );
@@ -2126,8 +2221,8 @@ function renderCharts(d){
     }
   });
 
-  /* ---- Token 趋势：逐日堆叠柱，缓存读 / 未命中输入 / 输出 ----
-     三段相加 = 当日总 Token（cr 是 in 的子集，必须从 in 里扣出去，不能平铺相加）。 */
+  /* ---- Token 趋势：分桶堆叠柱，缓存读 / 未命中输入 / 输出 ----
+     三段相加 = 该时段总 Token（cr 是 in 的子集，必须从 in 里扣出去，不能平铺相加）。 */
   const tokTrendCard = $('tokTrendCard');
   if(tokTrendCard) tokTrendCard.hidden = !s.hasToken;
   if(s.hasToken){
@@ -2138,11 +2233,11 @@ function renderCharts(d){
       data:{
         labels: dayLabels,
         datasets:[
-          {label:'未命中输入', data: s.byDate.map(x => Math.max(0, x.tkIn - x.tkCr)),
+          {label:'未命中输入', data: bk.buckets.map(x => Math.max(0, x.tkIn - x.tkCr)),
            backgroundColor:'#4f6ef7', borderRadius:3, barPercentage:.62},
-          {label:'缓存读', data: s.byDate.map(x => x.tkCr),
+          {label:'缓存读', data: bk.buckets.map(x => x.tkCr),
            backgroundColor:'#b3c0fd', borderRadius:3, barPercentage:.62},
-          {label:'输出', data: s.byDate.map(x => x.tkOut),
+          {label:'输出', data: bk.buckets.map(x => x.tkOut),
            backgroundColor:'#f59f00', borderRadius:3, barPercentage:.62}
         ]
       },
@@ -2156,10 +2251,10 @@ function renderCharts(d){
             callbacks:{
               label(c){ return ` ${c.dataset.label}：${fmt0(c.parsed.y)}`; },
               footer(items){
-                const day = s.byDate[items[0].dataIndex];
-                if(!day) return '';
-                const rate = day.tkIn ? day.tkCr / day.tkIn : 0;
-                return `合计 ${fmt0(day.tk)} token · 缓存命中 ${(rate*100).toFixed(1)}%`;
+                const seg = bk.buckets[items[0].dataIndex];
+                if(!seg) return '';
+                const rate = seg.tkIn ? seg.tkCr / seg.tkIn : 0;
+                return `合计 ${fmt0(seg.tk)} token · 缓存命中 ${(rate*100).toFixed(1)}%`;
               }
             }
           }
@@ -2175,24 +2270,26 @@ function renderCharts(d){
   }
 
   const topModels = s.byModel.slice(0, 6).map(x => x.key);
-  const datasets = topModels.map((m, i) => ({
-    label: m,
-    data: s.byDate.map(day => {
-      const rows = d.filter(x => x.date === day.key && x.model === m);
-      return Math.round(rows.reduce((a,b) => a + b.points, 0) * 100) / 100;
-    }),
-    backgroundColor: PALETTE[i % PALETTE.length],
-    borderRadius:3, barPercentage:.72
-  }));
+  // 桶 × 模型的积分矩阵已在 buildBuckets 一次遍历得出，这里直接取列
+  const datasets = topModels.map((m, i) => {
+    const pts = bk.matrix.get(m)?.pts || [];
+    return {
+      label: m,
+      data: bk.buckets.map((_, bi) => Math.round((pts[bi] || 0) * 100) / 100),
+      backgroundColor: PALETTE[i % PALETTE.length],
+      borderRadius:3, barPercentage:.72
+    };
+  });
   const others = s.byModel.slice(6);
   const otherNames = new Set(others.map(x => x.key));
   const otherIdx = datasets.length;   // 「其他」即将占用的下标，tooltip 靠它认出这根灰柱
   if(others.length){
     datasets.push({
       label: `其他 (${others.length})`,
-      data: s.byDate.map(day => {
-        const rows = d.filter(x => x.date === day.key && otherNames.has(x.model));
-        return Math.round(rows.reduce((a,b) => a + b.points, 0) * 100) / 100;
+      data: bk.buckets.map((_, bi) => {
+        let v = 0;
+        for(const m of otherNames) v += (bk.matrix.get(m)?.pts || [])[bi] || 0;
+        return Math.round(v * 100) / 100;
       }),
       backgroundColor:'#c8d1e2', borderRadius:3, barPercentage:.72
     });
@@ -2210,23 +2307,22 @@ function renderCharts(d){
           callbacks:{
             label:c => ` ${c.dataset.label}：${fmt2(c.parsed.y)}`,
             // 「其他」是把长尾模型合起来的灰柱，光看高度分不出里面是什么。
-            // 悬停到它时把当天被合并的模型按积分列出来。必须先按模型汇总——
-            // d 是账单行（一次 API 请求一行），直接列会同一模型重复几十次。
+            // 悬停到它时把该时段被合并的模型按积分列出来（从桶×模型矩阵取，
+            // 不再全量 filter）。cnt>0 才算该时段真的出现过这个模型——
             // 0 积分的免费模型压在最后一行只是点名，它们也是「其他」变大的原因之一。
             footer(items){
               const hit = items.find(x => x.datasetIndex === otherIdx);
               if(!hit || !(hit.parsed.y > 0)) return '';
-              const day = s.byDate[hit.dataIndex];
-              if(!day) return '';
-              const sum = new Map();
-              for(const x of d){
-                if(x.date !== day.key || !otherNames.has(x.model)) continue;
-                sum.set(x.model, (sum.get(x.model) || 0) + x.points);
+              const bi = hit.dataIndex;
+              const list = [];
+              for(const m of otherNames){
+                const cell = bk.matrix.get(m);
+                if(cell && cell.cnt[bi] > 0) list.push([m, cell.pts[bi]]);
               }
-              const list = [...sum].sort((a,b) => b[1] - a[1]);
+              list.sort((a,b) => b[1] - a[1]);
               const paid = list.filter(x => x[1] > 0);
               const free = list.filter(x => x[1] <= 0).map(x => x[0]);
-              return [`　└ 当天构成：${paid.length} 个有积分` +
+              return [`　└ 该时段构成：${paid.length} 个有积分` +
                         (free.length ? ` + ${free.length} 个 0 积分` : ''),
                 ...paid.map(x => `　　${x[0]}：${fmt2(x[1])}`),
                 ...(free.length ? [`　　（0 积分：${free.join('、')}）`] : [])];
@@ -2297,36 +2393,38 @@ function renderCharts(d){
  * =======================================================*/
 function renderHeatmap(d){
   const s = computeStats(d);
+  const bk = s.buckets;
   const models = s.byModel.slice(0, 8).map(x => x.key);
   if(!models.length){ $('heatWrap').innerHTML = '<p style="color:#93a0b8">无数据</p>'; return; }
 
-  const mat = new Map();
-  for(const m of models) mat.set(m, new Array(24).fill(0));
-  for(const x of d){
-    if(!mat.has(x.model)) continue;
-    mat.get(x.model)[x.hour] += x.points;
-  }
+  // 列 = 时间桶（粒度随筛选范围：分钟/小时/天，与趋势图同一套桶），行 = 模型；
+  // 桶 × 模型的积分矩阵 buildBuckets 已算好，这里只取数
+  const heatTag = $('heatGranTag');
+  if(heatTag) heatTag.textContent = `按${bk.label}`;
+
   let max = 0;
-  for(const arr of mat.values()) for(const v of arr) if(v > max) max = v;
+  for(const m of models){
+    const pts = bk.matrix.get(m)?.pts;
+    if(pts) for(const v of pts) if(v > max) max = v;
+  }
   if(max === 0) max = 1;
 
-  const hours = Array.from({length:24}, (_,i) => i);
   let html = '<div class="heat-scroll"><table class="heat"><thead><tr><th></th>';
-  html += hours.map(h => `<th>${pad(h)}</th>`).join('');
+  html += bk.buckets.map(b => `<th>${b.label}</th>`).join('');
   html += '</tr></thead><tbody>';
 
   for(const m of models){
-    const arr = mat.get(m);
+    const pts = bk.matrix.get(m)?.pts || [];
     html += `<tr><td class="mname" title="${esc(m)}">${esc(m)}</td>`;
-    for(const h of hours){
-      const v = arr[h];
+    for(let i = 0; i < bk.buckets.length; i++){
+      const v = pts[i] || 0;
       if(v <= 0){
         html += '<td class="cell empty">·</td>';
       } else {
         const t = Math.pow(v / max, 0.62);
         const alpha = 0.12 + 0.86 * t;
         html += `<td class="cell" style="background:rgba(79,110,247,${alpha.toFixed(3)})"
-          title="${esc(m)} · ${pad(h)}:00 · ${fmt2(v)} 积分">${
+          title="${esc(m)} · ${bk.buckets[i].label} · ${fmt2(v)} 积分">${
           v >= 10 ? fmt0(v) : (Math.round(v*10)/10)
         }</td>`;
       }
@@ -3889,6 +3987,9 @@ const ServerSync = (() => {
         body: body || undefined,
       });
       const j = await r.json();
+      // 409 = 服务端被别的同步占用（一般是云同步在跑）：是「稍候再试」而不是失败，
+      // 前端据此换用等待类文案，别吓唬用户说「数据未更新」
+      if(j && !j.ok && r.status === 409) j.busy = true;
       return j || { ok:false, error:'服务返回空响应' };
     }catch(e){
       return { ok:false, error: String((e && e.message) || e) };
@@ -4476,8 +4577,9 @@ async function runServerSync(part, btn){
   btn.textContent = label;
 
   if(!r.ok){
-    toast('同步失败：' + (r.error || '未知错误'));
-    setSaveState('saved', '同步失败，数据未更新');
+    toast(r.busy ? '已有同步正在进行，请稍候再试'
+                 : '同步失败：' + (r.error || '未知错误'));
+    setSaveState('saved', r.busy ? '其他同步进行中，稍候再试' : '同步失败，数据未更新');
     return;
   }
 
@@ -4531,8 +4633,9 @@ async function runServerSyncAll(btn){
     if(!r.ok){
       btn.disabled = false;
       btn.textContent = label;
-      toast(`${s.name}同步失败：` + (r.error || '未知错误'));
-      setSaveState('saved', `${s.name}同步失败，数据未更新`);
+      toast(r.busy ? '已有同步正在进行，请稍候再试'
+                   : `${s.name}同步失败：` + (r.error || '未知错误'));
+      setSaveState('saved', r.busy ? '其他同步进行中，稍候再试' : `${s.name}同步失败，数据未更新`);
       return;                    // 前一步失败就不跑下一步，避免半套数据
     }
     done.push(r);
@@ -5426,7 +5529,7 @@ async function loadFile(file){
     if(q === '30m'){ if(setRecentMs(30 * 60e3)) markQuick(q); return; }
     if(q === '1h'){  if(setRecentMs(3600e3))     markQuick(q); return; }
     if(q === '3h'){  if(setRecentMs(3 * 3600e3)) markQuick(q); return; }
-    // +'1y' 是 NaN，必须单独翻译；其余数字（7/14/30/60/180）直接用
+    // +'1y' 是 NaN，必须单独翻译；其余数字（3/7/14/30/60/180）直接用
     if(setRecentDays(q === 'today' ? 1 : (q === '1y' ? 365 : +q))) markQuick(q);
   };
 
@@ -5740,11 +5843,11 @@ async function loadFile(file){
     ['clientPieCard','客户端占比'],
     ['hourCard','分时分布'],
     ['calCard','日历热力图'],
-    ['dailyCard','每日趋势'],
+    ['dailyCard','积分·Token·请求趋势'],
     ['tokTrendCard','Token 趋势'],
     ['tokenTopCard','Token Top 10'],
     ['toolCard','工具 Token'],
-    ['stackCard','各模型每日'],
+    ['stackCard','各模型积分'],
     ['latCard','响应耗时'],
     ['heatCard','模型×时段'],
     ['topReqCard','高消耗请求'],
