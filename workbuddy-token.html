@@ -452,6 +452,9 @@ tr.expand-row>td{background:#f7f9fd;padding:0 !important;border-bottom:1px solid
   font-size:10.5px;font-variant-numeric:tabular-nums;
 }
 .heat td.cell.empty{background:#f4f6fb;color:#c8d1e2}
+/* 分钟粒度 60 列，格子收窄控制总宽 */
+.heat.dense td.cell{width:21px;height:23px;font-size:9.5px}
+.heat.dense th{padding:2px 2px;font-size:9.5px}
 .legend-row{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:11.5px;
   color:var(--muted);flex-wrap:wrap}
 .legend-scale{display:flex;gap:3px}
@@ -1189,7 +1192,9 @@ function fitLatency(pairs){
 
 /* 图表粒度档位：按筛选范围跨度（span 毫秒）从上到下取第一条满足的档。
    想调整「什么时间范围用什么粒度」改这张表即可（最后一档 upTo 必须是 Infinity），
-   只影响趋势/堆叠/热力图，不影响「模型数据」卡的走势分桶（那边自成一套阈值）。 */
+   决定趋势/堆叠图的时间桶，也决定热力图的列轴（分钟→0-59 分，小时→0-23 时，
+   天→范围 ≤7 天按星期一~日、7 天外按月内日期 1-31），
+   不影响「模型数据」卡的走势分桶（那边自成一套阈值）。 */
 const GRAN_TIERS = [
   { name:'分钟', unitMs:60e3,    upTo:3 * 3600e3  },   // 范围 ≤3 小时
   { name:'小时', unitMs:3600e3,  upTo:3 * 86400e3 },   // 范围 ≤3 天
@@ -1197,11 +1202,13 @@ const GRAN_TIERS = [
 ];
 
 /**
- * 图表时间桶：积分/Token/请求趋势、各模型堆叠、模型×时段热力图共用。
+ * 图表时间桶：积分/Token/请求趋势、各模型堆叠图共用的时间轴分桶。
+ * 模型×时段热力图不走这套桶（列是固定的 0-59 分 / 0-23 时 / 周一~周日），
+ * 只借用这里的粒度档位判定（GRAN_TIERS，结果反映在返回的 label 上）。
  *
  * 分桶口径与「模型数据」卡的 buildModelSeries 保持一致：同一套范围解析
  * （时间粒度快捷 > 日期选择 > 数据首尾）、同款「对齐到整分/整点/0 点后
- * 切等长桶、空桶补 0」。粒度档位见上方 GRAN_TIERS（最粗固定为天，不引入周）。
+ * 切等长桶、空桶补 0」。
  *
  * 返回 { unitMs, label, s0, n, buckets, matrix }：
  *   buckets[i] = { t0, label, sum, count, tk, tkIn, tkOut, tkCr }
@@ -2393,38 +2400,70 @@ function renderCharts(d){
  * =======================================================*/
 function renderHeatmap(d){
   const s = computeStats(d);
-  const bk = s.buckets;
   const models = s.byModel.slice(0, 8).map(x => x.key);
   if(!models.length){ $('heatWrap').innerHTML = '<p style="color:#93a0b8">无数据</p>'; return; }
 
-  // 列 = 时间桶（粒度随筛选范围：分钟/小时/天，与趋势图同一套桶），行 = 模型；
-  // 桶 × 模型的积分矩阵 buildBuckets 已算好，这里只取数
+  // 列 = 固定的「周期内位置」，不按时间轴铺桶：
+  // 分钟粒度 → 一小时内 0-59 分；小时粒度 → 一天内 0-23 时；
+  // 天粒度再细分：范围 ≤7 天 → 一周内周一~周日，7 天外 → 一月内日期 1-31（日历式）。
+  // 粒度判定与趋势图同一套（GRAN_TIERS，经 buildBuckets 的 label 带出来），
+  // 天粒度的 7 天边界用桶数 n（天桶时 n 即覆盖天数）判断
+  const gran = s.buckets.label;
+  let nCols, colIdx, colLabel, colTitle, tagText, dense = false;
+  if(gran === '分钟'){
+    nCols = 60; dense = true;
+    colIdx   = x => x.time.getMinutes();
+    colLabel = i => pad(i);
+    colTitle = i => i + '分';
+    tagText  = '分钟 0-59';
+  }else if(gran === '小时'){
+    nCols = 24;
+    colIdx   = x => x.time.getHours();
+    colLabel = colTitle = i => i + '时';
+    tagText  = '小时 0-23';
+  }else if(s.buckets.n <= 7){
+    nCols = 7;
+    colIdx   = x => (x.time.getDay() + 6) % 7;   // 周一=0 … 周日=6
+    colLabel = colTitle = i => '周' + '一二三四五六日'[i];
+    tagText  = '星期一~星期日';
+  }else{
+    nCols = 31; dense = true;
+    colIdx   = x => x.time.getDate() - 1;         // 1 号=0 … 31 号=30，跨月同号合并
+    colLabel = i => i + 1;
+    colTitle = i => (i + 1) + '日';
+    tagText  = '日期 1-31';
+  }
   const heatTag = $('heatGranTag');
-  if(heatTag) heatTag.textContent = `按${bk.label}`;
+  if(heatTag) heatTag.textContent = tagText;
+
+  // 模型 × 列位 的积分矩阵：一次遍历明细，每条记录按其周期内位置累加（跨小时/跨天合并到同一列）
+  const matrix = new Map();
+  for(const m of models) matrix.set(m, new Array(nCols).fill(0));
+  for(const x of d){
+    const row = matrix.get(x.model);
+    if(row) row[colIdx(x)] += x.points;
+  }
 
   let max = 0;
-  for(const m of models){
-    const pts = bk.matrix.get(m)?.pts;
-    if(pts) for(const v of pts) if(v > max) max = v;
-  }
+  for(const row of matrix.values()) for(const v of row) if(v > max) max = v;
   if(max === 0) max = 1;
 
-  let html = '<div class="heat-scroll"><table class="heat"><thead><tr><th></th>';
-  html += bk.buckets.map(b => `<th>${b.label}</th>`).join('');
+  let html = `<div class="heat-scroll"><table class="heat${dense ? ' dense' : ''}"><thead><tr><th></th>`;
+  html += Array.from({length:nCols}, (_, i) => `<th>${colLabel(i)}</th>`).join('');
   html += '</tr></thead><tbody>';
 
   for(const m of models){
-    const pts = bk.matrix.get(m)?.pts || [];
+    const row = matrix.get(m);
     html += `<tr><td class="mname" title="${esc(m)}">${esc(m)}</td>`;
-    for(let i = 0; i < bk.buckets.length; i++){
-      const v = pts[i] || 0;
+    for(let i = 0; i < nCols; i++){
+      const v = row[i];
       if(v <= 0){
         html += '<td class="cell empty">·</td>';
       } else {
         const t = Math.pow(v / max, 0.62);
         const alpha = 0.12 + 0.86 * t;
         html += `<td class="cell" style="background:rgba(79,110,247,${alpha.toFixed(3)})"
-          title="${esc(m)} · ${bk.buckets[i].label} · ${fmt2(v)} 积分">${
+          title="${esc(m)} · ${colTitle(i)} · ${fmt2(v)} 积分">${
           v >= 10 ? fmt0(v) : (Math.round(v*10)/10)
         }</td>`;
       }
@@ -2456,10 +2495,15 @@ function buildCalendar(d){
   const keys = [...map.keys()].sort();
   if(!keys.length) return null;
 
+  // 滚动窗口：数据不足 6 个月就从第一天画起，超过则只回看最近 6 个月。
+  // 传入的是全量数据（render 传 state.all），不随筛选项变化
   const first = parseDs(keys[0]);
   const last  = parseDs(keys[keys.length-1]);
+  const sixMoAgo = new Date(last);
+  sixMoAgo.setMonth(sixMoAgo.getMonth() - 6);
+  const winStart = first > sixMoAgo ? first : sixMoAgo;
 
-  const start = new Date(first);
+  const start = new Date(winStart);
   const dow = (start.getDay() + 6) % 7;
   start.setDate(start.getDate() - dow);
 
@@ -2492,7 +2536,7 @@ function buildCalendar(d){
     if(m !== lastM){ months.push({col:i, text:(m+1)+'月'}); lastM = m; }
   });
 
-  return { weeks, months, from: keys[0], to: keys[keys.length-1] };
+  return { weeks, months, from: keys[0], to: keys[keys.length-1], days: keys.length };
 }
 
 function renderCalendarUnit(cal, mode, color, title, unitLabel){
@@ -2515,10 +2559,10 @@ function renderCalendarUnit(cal, mode, color, title, unitLabel){
     return `rgba(${r},${g},${b},${a.toFixed(3)})`;
   };
 
+  const weekdays = ['一','二','三','四','五','六','日'];
+
   const monthHead = new Array(cal.weeks.length).fill('');
   for(const m of cal.months) monthHead[m.col] = m.text;
-
-  const weekdays = ['一','二','三','四','五','六','日'];
 
   let html = '<div class="cal-scroll"><table class="cal">';
   html += '<thead><tr><th class="rowlbl"></th>';
@@ -2529,7 +2573,7 @@ function renderCalendarUnit(cal, mode, color, title, unitLabel){
     html += `<tr><th class="rowlbl">${weekdays[r]}</th>`;
     for(let c = 0; c < cal.weeks.length; c++){
       const cell = cal.weeks[c][r];
-      if(!cell.inRange){
+      if(!cell){
         html += '<td class="cal-cell out"></td>';
         continue;
       }
@@ -2543,6 +2587,10 @@ function renderCalendarUnit(cal, mode, color, title, unitLabel){
   }
   html += '</tbody></table></div>';
 
+  // 标题行徽标已是总量（「共 X」），这里给日均：按有记录的天数平均，空白天不摊薄
+  const avg = total / (cal.days || 1);
+  const avgText = mode === 'points' ? fmt2(avg) + ' 积分' : (Math.round(avg * 10) / 10) + ' 次';
+
   const steps = [0, 0.25, 0.5, 0.75, 1];
   html += `<div class="cal-legend">
     <span>少</span>
@@ -2555,9 +2603,7 @@ function renderCalendarUnit(cal, mode, color, title, unitLabel){
     <span style="margin-left:10px">峰值 <b style="color:#182135">${
       mode === 'points' ? fmt2(max) + ' 积分' : max + ' 次'
     }</b></span>
-    <span style="margin-left:auto">合计 <b style="color:#182135">${
-      mode === 'points' ? fmt2(total) + ' 积分' : total + ' 次'
-    }</b></span>
+    <span style="margin-left:auto">日均 <b style="color:#182135">${avgText}</b></span>
   </div>`;
 
   return `
@@ -4937,7 +4983,7 @@ function render(){
   renderChips();
   renderKPIs(d);
   renderAccounts();          // 账号余额是账号级信息，不随筛选变化
-  renderDateHeatmap(d);
+  renderDateHeatmap(state.all); // 日历热力图吃全量数据，不随筛选项变化（窗口固定为最近 6 个月）
   renderCharts(d);
   renderHeatmap(d);
   renderTables(d);
