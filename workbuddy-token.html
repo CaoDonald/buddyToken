@@ -292,7 +292,7 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
   background:linear-gradient(90deg,var(--accent),var(--accent2))}
 .acct-warn{color:#c2410c;font-weight:600}
 /* 预计可用天数（按近期消耗节奏的估算）：悬停给出推算依据 */
-.acct-est{color:#5b6b8c;font-weight:600;cursor:help}
+.acct-est{color:#5b6b8c;font-weight:600;cursor:help;white-space:nowrap}
 /* 跨账号到期提醒：把各账号的到期时间放在一起比，直接给出先用哪个的结论 */
 .acct-tip{padding:12px 18px;border-color:#f0c9a8;background:linear-gradient(180deg,#fff8f2,#fffdfb)}
 .acct-tip-main{font-size:13px;line-height:1.7}
@@ -327,18 +327,18 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
   background:var(--card);border:1px solid var(--line);border-radius:14px;
   padding:16px 18px 14px;box-shadow:var(--shadow);min-width:0;
 }
-.card h3{margin:0 0 12px;font-size:14px;font-weight:700;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card h3{margin:0 0 12px;font-size:14px;font-weight:700;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .card h3 .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
 .card h3 .tag{font-weight:500;font-size:11px;color:var(--muted);background:#f2f5fc;
   padding:1px 8px;border-radius:6px}
-.login-badges{margin-left:auto;display:inline-flex;gap:5px;flex-wrap:wrap}
-.lg-ico{position:relative;display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 4px;border-radius:6px;border:none;font-size:10px;font-weight:700;cursor:default;font-family:inherit}
+.login-badges{margin-left:auto;display:inline-flex;gap:4px;flex-wrap:wrap}
+.lg-ico{position:relative;display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 3px;border-radius:6px;border:none;font-size:10px;font-weight:700;cursor:default;font-family:inherit}
 .lg-cur{background:#e8f6ee;color:#0a7d43}
 .lg-switch{background:#eef2fb;color:#3d5a9e;cursor:pointer;transition:background .15s,color .15s}
 .lg-switch:hover{background:#dde7fa;color:#1d3f85}
 .lg-dim{background:#f2f4f8;color:#b6c0d4}
 .lg-mark{position:absolute;top:-5px;right:-5px;width:12px;height:12px;border-radius:50%;background:#0a7d43;color:#fff;font-size:8px;font-style:normal;font-weight:700;display:inline-flex;align-items:center;justify-content:center}
-.st-chip{position:relative;font-size:12px;line-height:1;padding:3px 6px;border-radius:6px;font-weight:500;background:#f2f5fc;color:#8b98b3;white-space:nowrap;cursor:default}
+.st-chip{position:relative;font-size:12px;line-height:1;padding:3px 5px;border-radius:6px;font-weight:500;background:#f2f5fc;color:#8b98b3;white-space:nowrap;cursor:default}
 .st-chip.ok{background:#e8f6ee}
 .st-chip.warn{background:#fff4e0}
 .st-chip.bad{background:#fdeceb}
@@ -1852,7 +1852,7 @@ function renderAccounts(){
     }else if(warn){
       expiry = `<span class="acct-warn">⚠ 最近到期 ${fmtDate(new Date(a.soonestExpireAt))}` +
         `（${days} 天后）` +
-        (a.expiringSoon ? ` · ${SOON_DAYS} 天内到期部分 ${fmt0(a.expiringSoonRemaining)} 积分</span>` : '</span>');
+        (a.expiringSoon ? ` · ${SOON_DAYS} 天内到期 ${fmt0(a.expiringSoonRemaining)}</span>` : '</span>');
     }else{
       expiry = `最近到期 ${fmtDate(new Date(a.soonestExpireAt))}（${days} 天后）`;
     }
@@ -1879,7 +1879,7 @@ function renderAccounts(){
         estHtml = tip('样本太少或几乎没有消耗，暂不估算', '样本不足', 'acct-est');
       }else if(est.limitedByExpiry){
         estHtml = tip(`按此节奏可用约 ${fmt0(est.estDays)} 天，但 ${days} 天后积分就到期了——到期前用不完`,
-          '到期前用不完', 'acct-est acct-warn');
+          '用不完', 'acct-est acct-warn');
       }else{
         estHtml = tip(`剩余 ${fmt0(a.remaining)} ÷ 日均 ${avgTxt} ≈ ${fmt0(est.estDays)} 天`,
           est.usableDays > 0 ? `预计可用 ${est.usableDays} 天` : '不足 1 天', 'acct-est');
