@@ -1826,6 +1826,11 @@ function renderAccounts(){
   // 不限「7 天内到期」——那太苛刻，平时没有任何账号会命中，星标就永远不出现
   const priorityUid = (ordered.find(a => (a.remaining > 0) || soonExpireAt(a, now) !== null) || {}).uid || null;
 
+  // 卡片列宽随数量走：3 个一行三张（c4）；4 个拆成两排、每排两张（c6）；
+  // 1~2 个保持半宽；5 个及以上按一行三张往下排
+  const cnt = ordered.length;
+  const cardSpan = (cnt === 4 || cnt <= 2) ? 'c6' : 'c4';
+
   const cards = ordered.map(a => {
     const usedPct = a.total ? (a.used / a.total * 100) : 0;
     const days = a.soonestExpireAt ? Math.ceil((a.soonestExpireAt - now) / 86400000) : null;
@@ -1882,7 +1887,7 @@ function renderAccounts(){
     }
 
     return `
-      <div class="card c6">
+      <div class="card ${cardSpan}">
         <h3>
           <span class="dot"></span>${esc(a.name)}
           <span class="tag" title="账号 uid：${esc(a.uid)}">${esc(String(a.uid).slice(0, 8))}…</span>
