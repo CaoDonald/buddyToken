@@ -329,6 +329,8 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 }
 .card h3{margin:0 0 12px;font-size:14px;font-weight:700;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .card h3 .dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+.card h3 .acct-name{cursor:help;border-bottom:1px dotted transparent}
+.card h3 .acct-name:hover{border-bottom-color:var(--muted)}
 .card h3 .tag{font-weight:500;font-size:11px;color:var(--muted);background:#f2f5fc;
   padding:1px 8px;border-radius:6px}
 .login-badges{margin-left:auto;display:inline-flex;gap:4px;flex-wrap:wrap}
@@ -1889,8 +1891,7 @@ function renderAccounts(){
     return `
       <div class="card ${cardSpan}">
         <h3>
-          <span class="dot"></span>${esc(a.name)}
-          <span class="tag" title="账号 uid：${esc(a.uid)}">${esc(String(a.uid).slice(0, 8))}…</span>
+          <span class="dot"></span><span class="acct-name" title="账号 uid：${esc(a.uid)}">${esc(a.name)}</span>
           ${renderStatusChips(a, a.uid, a.uid === priorityUid)}
           ${renderAppBadges(a)}
         </h3>

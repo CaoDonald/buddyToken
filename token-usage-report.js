@@ -699,12 +699,15 @@ async function fetchOfficial(days, onlyUid) {
  *   · bill 按 RequestID 去重，历史行先入表、本次同名行覆盖它（本次为准）
  *   · uids 是账号下标表，行里只存下标，所以必须重排：本次账号保持原顺序在前，
  *     历史行用到的旧账号按需追加到后面，否则历史行的账号归属会指错人
- *   · acct（余额）是当前快照、不是累加量，直接取本次结果
+ *   · acct（余额）是当前快照、不是累加量：本次刷到的账号取本次值；本次没刷到
+ *     但仍有账单的账号（登录态丢失/积分查询失败）沿用旧快照——见下方详细说明
  *
  * canMerge=false（--no-merge）时退回纯覆盖，用于明确要丢弃历史重开的场景。
  *
  * partialUid 是「只刷一个账号」：此时 fresh 只含该账号的数据，acct 必须按 uid
- * 覆盖到旧快照上——直接取本次结果会把其余账号的余额卡片整块抹掉。
+ * 覆盖到旧快照上——直接取本次结果会把其余账号的余额卡片整块抹掉。全量刷新
+ * 同理：某账号本次缺席（快照被切换覆盖、积分接口失败）时旧快照也要保住，
+ * 否则它的卡片消失而账单/hist 仍在，看板统计与卡片会分裂（2026-10-12 实测）。
  */
 function mergeOfficialData(prev, fresh, canMerge, partialUid) {
   const freshBill = Array.isArray(fresh.bill) ? fresh.bill : [];
@@ -744,19 +747,33 @@ function mergeOfficialData(prev, fresh, canMerge, partialUid) {
   const bill = [...byId.values()].sort((a, b) => (a[4] || 0) - (b[4] || 0));
   const keptRows = bill.length - added;
 
-  // 余额快照：整体刷新直接取本次；只刷一个账号时按 uid 覆盖，其余账号沿用旧快照
+  // 余额快照：以旧快照为底、本次结果覆盖。
+  //
+  // 全量刷新时，本次没刷到的账号（登录态丢失、积分查询失败）只要仍有账单
+  // （uid 在合并后的下标表里），旧快照就保留——直接取本次结果会把它的余额
+  // 卡片整块抹掉，而它的账单与 hist 都按增量合并留着，看板会出现「统计里
+  // 有它、卡片没它」的分裂。2026-10-12 实测：用户切换账号导致第三个账号的
+  // 登录快照被覆盖丢失，261 条当日账单仍在、卡片消失。
+  // 彻底没有账单的旧账号（uids 里没有）才淘汰，避免陈名片无限堆积。
+  // 只刷一个账号（partialUid）时同理：其余账号全部沿用旧快照。
   let accounts = fresh.accounts;
   let accountCount = fresh.meta && fresh.meta.accountCount;
-  if (partialUid) {
+  if (canMerge && prev && Array.isArray(prev.acct)) {
     const byUid = new Map();
-    for (const a of (canMerge && prev && Array.isArray(prev.acct)) ? prev.acct : []) {
-      if (a && a.uid) byUid.set(a.uid, a);
+    for (const a of prev.acct) {
+      if (!a || !a.uid) continue;
+      if (!partialUid && !uids.includes(a.uid)) continue;
+      byUid.set(a.uid, a);
     }
     for (const a of fresh.accounts) byUid.set(a.uid, a);
     accounts = [...byUid.values()];
-    // 账号总数描述的是「本机一共有几个账号」，单账号刷新时不该被改成 1
-    accountCount = (prev && prev.official && prev.official.accountCount) || accounts.length;
+    if (partialUid) {
+      // 账号总数描述的是「本机一共有几个账号」，单账号刷新时不该被改成 1
+      accountCount = (prev && prev.official && prev.official.accountCount) || accounts.length;
+    }
   }
+  // 「几个账号」与卡片数保持同源：合并后账单涉及的账号总数
+  if (accountCount == null || accountCount < accounts.length) accountCount = accounts.length;
 
   return {
     accounts,

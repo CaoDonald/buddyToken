@@ -11,9 +11,17 @@
  *   · 恢复时刻：直接采用日志原文 `将在 <时间> UTC+8 重置`（官方值，不自建窗口模型）。
  *   · 模型归因：429 行尾 `(convId/sessionId)` 的 sessionId 对应同文件
  *     `sessionId=<uuid>, resolved model=<m>` 行；归因不到显示「未知模型」，不猜。
- *   · 账号归因：CLI 日志取文件内 `[AuthDoInitProbe] … uid=<uuid>` 最新一条；
- *     桌面端日志的 sessionId 对应 workbuddy.db 的 sessions 表（buddyToken 主脚本
- *     已有该映射）；都拿不到时兜底当前登录账号。
+ *   · 账号归因（按精度排序，前一级拿不到才降级）：
+ *     1. 行内 `[pid=N]` → 同窗口全部日志文件的 `[AuthDoInitProbe] … uid=` 表
+ *        （进程级：一个进程从启动到退出登录态不变，切换账号 = 重启新进程。
+ *         2026-10-12 实测：CLI 日志按项目分文件、跨账号切换后仍共用同一文件，
+ *         原先「取文件内最新 uid 行」会把切换前的 429 错归给切换后的账号）；
+ *     2. sessionId → 调用方传入的 resolveSession 回调（会话级：本地 jsonl 的
+ *        conversationRequestId 命中官方账单 requestId，覆盖进程探测行不在
+ *        扫描窗口内的情况）；
+ *     3. 文件内最新 uid 行（旧行为）；
+ *     4. 都拿不到时兜底当前登录账号（桌面端日志的 sessionId 对应 workbuddy.db
+ *        的 sessions 表，buddyToken 主脚本已有该映射；此处兜当前登录者）。
  *
  * 不发任何网络请求。扫描有 60 秒内存缓存（日志不是实时关键数据，看板 60s 轮询
  * 全部命中缓存）。已过恢复时刻的条目在返回前过滤——恢复是官方承诺，到期即视为可用。
@@ -51,6 +59,19 @@ const REQUEST_MODEL_RE = /requestId=([0-9a-f]{16,})[^,\]]*?(?:,|\])?\s*$/;
 
 /** CLI 鉴权行的 uid 字段：`[AuthDoInitProbe] … uid=<uuid>`。 */
 const UID_RE = /\[AuthDoInitProbe\][^\n]*?uid=([0-9a-f][0-9a-f-]{35})/g;
+
+/**
+ * 带进程标识的鉴权行：`[pid=78076] … [AuthDoInitProbe] … uid=<uuid>`。
+ * CLI/桌面端每个日志行都带 pid；探测行在进程启动时打一次，同 pid 的登录态
+ * 从启动到退出不变——按 pid 归因即进程级归因。
+ */
+const PROBE_UID_RE = /\[pid=(\d+)\][^\n]*?\[AuthDoInitProbe\][^\n]*?uid=([0-9a-f][0-9a-f-]{35})/;
+
+/** 日志行的进程标识：`[pid=78076]`。 */
+const PID_RE = /\[pid=(\d+)\]/;
+
+/** 探测行粗筛标记（与 UID_RE 同源，Buffer.includes 用）。 */
+const PROBE_MARKER = 'AuthDoInitProbe';
 
 /** `YYYY-MM-DD` 形态的目录名（logs 下还有 sdk、Crash-Log 等非日期目录）。 */
 const DATE_DIR_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -104,7 +125,10 @@ function collectLogFiles(root, cutoffMs, now) {
  * 大文件先做 Buffer 级粗筛；命中后**按行序单遍扫描**——模型映射随行序更新，
  * 429 行用它之前积累的映射归因（会话中途换模型时才不会错归）。
  *
- * 归因链（对齐 workbuddySwitch limits.rs 的 workbuddy_attribution）：
+ * 只有 429 或账号探测行至少其一的文件才值得读全文——纯请求日志对归因没有
+ * 增量信息，跳过能省掉大部分大文件的解码开销。
+ *
+ * 模型归因链（对齐 workbuddySwitch limits.rs 的 workbuddy_attribution）：
  *   1. 行尾 `(requestId/sessionId)` 的 requestId → `[ModelProvider] Sending request`
  *      行里的 `requestId=…, model=…`（本次请求的真实模型，最准）；
  *   2. 退而求其次 sessionId → `resolved model=` 行（会话当前模型）；
@@ -117,14 +141,19 @@ function scanLogFile(file) {
   } catch {
     return null;
   }
-  const hit = QUOTA_MARKERS.some((m) => buf.includes(m));
-  if (!hit) return null;
+  const hasQuota = QUOTA_MARKERS.some((m) => buf.includes(m));
+  const hasProbe = buf.includes(PROBE_MARKER);
+  if (!hasQuota && !hasProbe) return null;
 
   const text = buf.toString('utf8');
   buf = null;   // 尽早释放
 
   let uid = null;
   for (const m of text.matchAll(UID_RE)) uid = m[1];   // 取最新一条
+
+  // pid → uid：该文件里各进程的登录态（进程启动时的探测行）。
+  // 一个文件可跨多个进程/多个账号——按项目分文件、切换账号不换文件。
+  const pidUid = new Map();
 
   // 按行序累积的模型映射（事件行只看它之前的状态）
   const requestModels = new Map();   // requestId → model（本次请求的真实模型）
@@ -136,6 +165,10 @@ function scanLogFile(file) {
     // 回显行过滤：桌面端会把工具输出/命令回显整段塞进日志，其中可能带着
     // 别处日志的 429 原文，按原样解析会产出假事件
     if (/^\[[^\]]*SandboxShell/.test(line) || /^\[[^\]]*\]\s*(ProcessOutput|sandbox attempt output)/.test(line)) continue;
+
+    // 账号探测行（顺序不敏感：进程启动即打，一定早于同进程的 429）
+    const probe = line.match(PROBE_UID_RE);
+    if (probe) pidUid.set(probe[1], probe[2]);
 
     // 模型映射维护（顺序敏感）
     const reqM = line.match(/requestId=([0-9a-f]{16,})/);
@@ -169,9 +202,10 @@ function scanLogFile(file) {
       || (sessionId && sessionModels.get(sessionId))
       || null;
 
-    events.push({ resetAt, sessionId, model, lineUid: uid });
+    const pidM = line.match(PID_RE);
+    events.push({ resetAt, sessionId, model, pid: pidM ? pidM[1] : null, file });
   }
-  return { uid, events };
+  return { uid, pidUid, events };
 }
 
 /**
@@ -180,50 +214,91 @@ function scanLogFile(file) {
  * opts.currentUid：归因兜底——桌面端日志里没有 uid 行、CLI 日志查不到 uid 时，
  * 兜给当前登录账号（只有当前登录者能发起请求）。由 server.js 从
  * workbuddy-api.listSwitchableAccounts() 取好后传入，本模块不依赖官方 api 文件。
+ * opts.resolveSession(sessionId) → uid|null：会话级归因回调（第二层），
+ * 进程探测行不在扫描窗口内时启用。由 server.js 用「本地 jsonl 会话文件的
+ * conversationRequestId → 官方账单 requestId」实现，本模块不发网络请求。
  *
  * 返回 `{ scannedAt, windowDays, accounts }`，accounts 只含有受限模型的账号，
  * 每条 `{ uid, limits: [{ model, resetAt }] }`（resetAt 升序，最早恢复的在前）。
  */
-function scanRateLimits({ currentUid = null } = {}) {
+function scanRateLimits({ currentUid = null, resolveSession = null } = {}) {
   const now = Date.now();
   const cutoffMs = now - WINDOW_DAYS * 86400000;
 
-  // 聚合键：uid|model|resetAt —— 同一次 429 的多行日志天然合并
+  // 聚合键：file|pid|resetAt —— 官方一次限流会在业务日志里写多行（实测 5–14 行），
+  // 有的行带 sessionId、有的不带，有的行归因不到模型；同 key 即同一次事件。
+  // 账号归因放到聚合后按组做（行级 pid 需要整份文件的探测表，见下）。
   const byKey = new Map();
+  // 跨文件合并的 pid → uid 表：探测行只写在启动进程当时所在项目的日志文件里，
+  // 与 429 所在文件不一定是同一个（2026-10-12 实测 pid 18120 即属此列）。
+  const pidUidAll = new Map();
+  // file → 文件内最新 uid 行（第三层兜底）
+  const fileUidOf = new Map();
 
   for (const src of SOURCES) {
     for (const file of collectLogFiles(src.root, cutoffMs, now)) {
       const r = scanLogFile(file);
-      if (!r || !r.events.length) continue;
+      if (!r) continue;
+      fileUidOf.set(file, r.uid);
+      for (const [p, u] of r.pidUid) pidUidAll.set(p, u);
       for (const ev of r.events) {
-        const key = `${ev.lineUid || '?'}|${ev.model || '?'}|${ev.resetAt}`;
-        const prev = byKey.get(key);
-        if (prev) { prev.hits++; continue; }
-        byKey.set(key, {
-          uid: ev.lineUid || null,
-          model: ev.model || null,
-          resetAt: ev.resetAt,
-          source: src.name,
-          hits: 1,
-        });
+        const key = `${file}|${ev.pid || '?'}|${ev.resetAt}`;
+        let g = byKey.get(key);
+        if (!g) {
+          g = {
+            resetAt: ev.resetAt,
+            source: src.name,
+            hits: 0,
+            pid: ev.pid || null,
+            sessionId: null,
+            file,
+            models: new Set(),
+          };
+          byKey.set(key, g);
+        }
+        g.hits++;
+        // 同组的第一条 sessionId 即该事件的会话（组内其余行多半不带）
+        if (ev.sessionId && !g.sessionId) g.sessionId = ev.sessionId;
+        if (ev.model) g.models.add(ev.model);
       }
     }
   }
 
-  // 账号归因：CLI 日志取文件内 uid 行；桌面端日志没有 uid 行，sessionId 需要
-  // sessions 表映射（为免依赖官方 api 文件，这里直接兜当前登录账号）。
+  // 账号归因（按精度降级，按组判定、组内共享）：
+  //   1. 行 pid → 跨文件的 AuthDoInitProbe 表（进程级登录态，最准）
+  //   2. sessionId → resolveSession 回调（会话级，覆盖探测行不在窗口内的情况）
+  //   3. 文件内最新 uid 行（旧行为）
+  //   4. currentUid 兜底（桌面端日志没有 uid 行）
   const byUid = new Map();
-  for (const ev of byKey.values()) {
-    if (ev.resetAt <= Date.now()) continue;   // 已过官方恢复时刻，视为已恢复
-    const uid = ev.uid || currentUid;
+  for (const g of byKey.values()) {
+    if (g.resetAt <= Date.now()) continue;   // 已过官方恢复时刻，视为已恢复
+    let uid = (g.pid && pidUidAll.get(g.pid)) || null;
+    if (!uid && resolveSession && g.sessionId) {
+      try { uid = resolveSession(g.sessionId) || null; } catch { /* 降级继续 */ }
+    }
+    if (!uid) uid = fileUidOf.get(g.file) || null;
+    if (!uid) uid = currentUid;
     if (!uid) continue;
     if (!byUid.has(uid)) byUid.set(uid, []);
-    byUid.get(uid).push({ model: ev.model, resetAt: ev.resetAt, source: ev.source, hits: ev.hits });
+    // 同组多行可能归因出多个模型（官方一次限流按模型分别计），逐模型各出一条；
+    // 全组都没解析出模型时才留「未知模型」。
+    const models = g.models.size ? [...g.models] : [null];
+    for (const model of models) {
+      // 同账号 + 同模型 + 同恢复时刻 = 同一次限流：官方限流是「账号×模型」维度，
+      // 多个进程/会话同时被打中时恢复时刻必然相同（2026-10-13 实测：两个 pid
+      // 同时中 deepseek 限流、resetAt 都是 09:06:51，是一次事件不是两次）。
+      // 归因分组按 pid 拆开了，这里按 uid|model|resetAt 合回去，避免卡片上
+      // 同一模型出现多条。
+      const list = byUid.get(uid);
+      const dup = list.find((l) => l.model === model && Math.abs(l.resetAt - g.resetAt) < 1000);
+      if (dup) { dup.hits += g.hits; continue; }
+      list.push({ model, resetAt: g.resetAt, source: g.source, hits: g.hits });
+    }
   }
 
   const accounts = [...byUid.entries()].map(([uid, limits]) => {
-    // 同一次 429 可能部分行归因不到模型（model=null）：若已有同 resetAt 的
-    // 已知模型条目，null 条目就是同一次事件，吸收掉，避免卡片显示「未知模型」。
+    // 双保险：不同组（不同 pid）的同 resetAt 事件里若仍有 null 模型条目，
+    // 且同账号已有同 resetAt 的已知模型条目，吸收掉，避免卡片显示「未知模型」。
     const known = limits.filter((l) => l.model);
     const merged = limits.filter(
       (l) => l.model || !known.some((k) => Math.abs(k.resetAt - l.resetAt) < 1000),
@@ -245,9 +320,9 @@ let _cache = null;
  * 带缓存的扫描入口（服务端轮询用）。cacheMs 内重复调用直接返回上次结果。
  * force=true 时绕过缓存强制重扫（手动刷新用）。
  */
-function getRateLimits({ cacheMs = 60000, force = false, currentUid = null } = {}) {
+function getRateLimits({ cacheMs = 60000, force = false, currentUid = null, resolveSession = null } = {}) {
   if (!force && _cache && Date.now() - _cache.scannedAt < cacheMs) return _cache;
-  _cache = scanRateLimits({ currentUid });
+  _cache = scanRateLimits({ currentUid, resolveSession });
   return _cache;
 }
 
