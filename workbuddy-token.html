@@ -303,6 +303,9 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .acct-pkg:first-child{border-top:0}
 .acct-pkg span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .acct-pkg b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+/* 账号卡等高：套餐行数少时由套餐区吸收多余空间，签到行与操作按钮贴底对齐 */
+.acct-card{display:flex;flex-direction:column}
+.acct-pkgs{margin-top:10px;flex-grow:1}
 .acct-ops{display:flex;gap:8px;margin-top:12px;padding-top:10px;border-top:1px dashed var(--line)}
 .acct-btn{flex:1;padding:6px 10px;font-size:12px;border:1px solid var(--line);border-radius:8px;
   background:#f7f9fd;color:var(--text);cursor:pointer;font-family:inherit;transition:.15s}
@@ -1889,7 +1892,7 @@ function renderAccounts(){
     }
 
     return `
-      <div class="card ${cardSpan}">
+      <div class="card ${cardSpan} acct-card">
         <h3>
           <span class="dot"></span><span class="acct-name" title="账号 uid：${esc(a.uid)}">${esc(a.name)}</span>
           ${renderStatusChips(a, a.uid, a.uid === priorityUid)}
@@ -1903,7 +1906,7 @@ function renderAccounts(){
         <div class="acct-bar"><i style="width:${Math.min(100, usedPct).toFixed(1)}%"></i></div>
         <div class="kpi-sub">${expiry}${estHtml}${
           a.expired ? ` · <span class="acct-warn">已过期 ${fmt0(a.expiredRemaining)}</span>` : ''}</div>
-        <div style="margin-top:10px">${pkgs}${more}</div>
+        <div class="acct-pkgs">${pkgs}${more}</div>
         ${renderCheckinStrip(a.uid, spendHtml)}
         <div class="acct-ops">
           <button class="acct-btn" data-act="checkin" data-uid="${esc(a.uid)}"
