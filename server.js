@@ -98,11 +98,17 @@ try {
   rateLimits = require('./rate-limits');
 } catch { /* 文件缺失时 429 状态不可用，不影响其它功能 */ }
 
-/** 会话 → 账号归属（限流归因第二层；见 makeSessionResolver）。 */
+/** 会话 → 账号归属（限流归因权威层；见 session-resolver.js）。 */
 let resolveSession = null;
 try {
-  resolveSession = makeSessionResolver();
+  resolveSession = require('./session-resolver').makeSessionResolver(ROOT);
 } catch { /* 初始化失败时限流归因少一层会话级兜底 */ }
+
+/** 时刻 → 登录账号（限流归因第二层；见 login-timeline.js）。 */
+let loginAt = null;
+try {
+  loginAt = require('./login-timeline').makeLoginTimeline(ROOT);
+} catch { /* 初始化失败时该层缺席，归因继续降级 */ }
 
 /** 官方接口封装。签到/旅行这两类操作直接在服务进程内调用，不走子进程。 */
 let wbApi = null;
@@ -509,79 +515,6 @@ async function handleSwitch(req, res) {
   }
 }
 
-/**
- * 会话 → 账号归属解析器（限流归因的第二层，进程 pid 查不到时启用）。
- *
- * 链路：本地 jsonl 会话文件（文件名即 sessionId）里的 conversationRequestId
- * → 官方账单 requestId → 账号 uid。账单是账号维度的权威归属，比日志里的
- * 行级线索都准；pid 探测行不在扫描窗口内时（CLI 日志按项目分文件，切换账号
- * 前的进程探测行可能不在任何窗口文件里），这条链是唯一还能归因对的路。
- *
- * 两级缓存：requestId → uid 表跟数据文件 60s；单个 session 的结果永久缓存
- * （会话文件的请求集合不会变）。解析失败（无数据文件/会话文件已删）返回
- * null，由调用方继续降级，不抛异常。
- */
-function makeSessionResolver() {
-  const sessionCache = new Map();   // sessionId → uid|null
-  let billByRid = null;             // requestId(小写) → uid
-  let billLoadedAt = 0;
-
-  function billTable() {
-    if (billByRid && Date.now() - billLoadedAt < 60000) return billByRid;
-    billByRid = new Map();
-    billLoadedAt = Date.now();
-    try {
-      const text = fs.readFileSync(path.join(ROOT, 'token-usage-data.js'), 'utf8');
-      const m = text.match(/window\.__TOKEN_DATA__=(\{[\s\S]*\});?\s*$/);
-      if (!m) return billByRid;
-      const d = JSON.parse(m[1]);
-      const uids = Array.isArray(d.uids) ? d.uids : [];
-      for (const r of d.bill || []) {
-        if (Array.isArray(r) && r[0] && r[5] >= 0 && uids[r[5]]) {
-          billByRid.set(String(r[0]).toLowerCase(), uids[r[5]]);
-        }
-      }
-    } catch { /* 读不到就没有会话归因，退回 pid / 文件 uid 行 */ }
-    return billByRid;
-  }
-
-  function sessionFile(sid) {
-    for (const root of [path.join(os.homedir(), '.codebuddy', 'projects'),
-                        path.join(os.homedir(), '.workbuddy', 'projects')]) {
-      let dirs;
-      try { dirs = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
-      for (const e of dirs) {
-        if (!e.isDirectory()) continue;
-        const f = path.join(root, e.name, sid + '.jsonl');
-        try { if (fs.statSync(f).isFile()) return f; } catch { /* 不在这个项目目录 */ }
-      }
-    }
-    return null;
-  }
-
-  return function resolveSession(sid) {
-    if (!sid) return null;
-    if (sessionCache.has(sid)) return sessionCache.get(sid);
-    let uid = null;
-    try {
-      const f = sessionFile(sid);
-      if (f) {
-        const tbl = billTable();
-        const text = fs.readFileSync(f, 'utf8');
-        for (const line of text.split('\n')) {
-          if (!line.includes('conversationRequestId')) continue;
-          let o;
-          try { o = JSON.parse(line); } catch { continue; }
-          const cr = o.providerData && o.providerData.conversationRequestId;
-          if (cr && tbl.has(String(cr).toLowerCase())) { uid = tbl.get(String(cr).toLowerCase()); break; }
-        }
-      }
-    } catch { /* 单个会话归因失败不影响其他 */ }
-    sessionCache.set(sid, uid);
-    return uid;
-  };
-}
-
 /** 模型限流台账（本机日志扫描，60s 缓存在模块内）。 */
 function handleLimits(req, res) {
   if (!rateLimits) {
@@ -593,7 +526,7 @@ function handleLimits(req, res) {
     if (wbApi && wbApi.listSwitchableAccounts) currentUid = wbApi.listSwitchableAccounts().current;
   } catch { /* 取不到就少了归因兜底 */ }
   const force = new URL(req.url, 'http://x').searchParams.get('force') === '1';
-  json(res, 200, { ok: true, ...rateLimits.getRateLimits({ force, currentUid, resolveSession }) });
+  json(res, 200, { ok: true, ...rateLimits.getRateLimits({ force, currentUid, resolveSession, loginAt }) });
 }
 
 function handleStatus(req, res) {

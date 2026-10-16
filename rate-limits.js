@@ -12,15 +12,19 @@
  *   · 模型归因：429 行尾 `(convId/sessionId)` 的 sessionId 对应同文件
  *     `sessionId=<uuid>, resolved model=<m>` 行；归因不到显示「未知模型」，不猜。
  *   · 账号归因（按精度排序，前一级拿不到才降级）：
- *     1. 行内 `[pid=N]` → 同窗口全部日志文件的 `[AuthDoInitProbe] … uid=` 表
- *        （进程级：一个进程从启动到退出登录态不变，切换账号 = 重启新进程。
- *         2026-10-12 实测：CLI 日志按项目分文件、跨账号切换后仍共用同一文件，
- *         原先「取文件内最新 uid 行」会把切换前的 429 错归给切换后的账号）；
- *     2. sessionId → 调用方传入的 resolveSession 回调（会话级：本地 jsonl 的
- *        conversationRequestId 命中官方账单 requestId，覆盖进程探测行不在
- *        扫描窗口内的情况）；
- *     3. 文件内最新 uid 行（旧行为）；
- *     4. 都拿不到时兜底当前登录账号（桌面端日志的 sessionId 对应 workbuddy.db
+ *     1. 429 行尾 `(requestId/sessionId)` → 调用方传入的 resolveSession 回调
+ *        （请求级 + 会话级：jsonl 里那条失败记录 → 回合 → 官方账单 uid。
+ *         账单是账号维度的权威归属）；
+ *     2. 429 行首时刻 → 调用方传入的 loginAt 回调（切换历史回放：把
+ *        项目 switch-backups/ 的备份链拼成「时刻 → 登录账号」区间表，
+ *         见 login-timeline.js。CLI 热切换账号（无需重启进程、每次请求重读
+ *         登录态）会让 pid 探测行过时，这层正是为它兜底：2026-10-16 实测
+ *         09:52 启动的进程 09:53 被切到另一账号，10:25 的 429 只有这层能归对）；
+ *     3. 行内 `[pid=N]` → 同窗口全部日志文件的 `[AuthDoInitProbe] … uid=` 表
+ *        （进程级：探测行 = 进程启动时刻的登录快照。桌面端切换账号要重启、
+ *         该假设成立；CLI 侧会过时，仅作前两层都拿不到时的近似）；
+ *     4. 文件内最新 uid 行（旧行为）；
+ *     5. 都拿不到时兜底当前登录账号（桌面端日志的 sessionId 对应 workbuddy.db
  *        的 sessions 表，buddyToken 主脚本已有该映射；此处兜当前登录者）。
  *
  * 不发任何网络请求。扫描有 60 秒内存缓存（日志不是实时关键数据，看板 60s 轮询
@@ -33,10 +37,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-/** 日志来源：目录名即展示名。 */
+/** 日志来源：目录名即展示名；app 对应 auth 侧的登录文件名前缀（login-timeline 用）。 */
 const SOURCES = [
-  { name: 'WorkBuddy', root: path.join(os.homedir(), '.workbuddy', 'logs') },
-  { name: 'CodeBuddyCLI', root: path.join(os.homedir(), '.codebuddy', 'logs') },
+  { name: 'WorkBuddy', app: 'workbuddy-desktop', root: path.join(os.homedir(), '.workbuddy', 'logs') },
+  { name: 'CodeBuddyCLI', app: 'codebuddy-cli', root: path.join(os.homedir(), '.codebuddy', 'logs') },
 ];
 
 /** 扫描窗口（天）：mtime 与目录名双重收窗。 */
@@ -62,13 +66,16 @@ const UID_RE = /\[AuthDoInitProbe\][^\n]*?uid=([0-9a-f][0-9a-f-]{35})/g;
 
 /**
  * 带进程标识的鉴权行：`[pid=78076] … [AuthDoInitProbe] … uid=<uuid>`。
- * CLI/桌面端每个日志行都带 pid；探测行在进程启动时打一次，同 pid 的登录态
- * 从启动到退出不变——按 pid 归因即进程级归因。
+ * 探测行在进程启动时打一次，是「启动时刻」的登录快照——CLI 支持热切换账号，
+ * 进程活着时登录态可能已经变了（2026-10-16 实测），因此这层只作近似。
  */
 const PROBE_UID_RE = /\[pid=(\d+)\][^\n]*?\[AuthDoInitProbe\][^\n]*?uid=([0-9a-f][0-9a-f-]{35})/;
 
 /** 日志行的进程标识：`[pid=78076]`。 */
 const PID_RE = /\[pid=(\d+)\]/;
+
+/** 日志行的行首时刻：`[2026/10/15 19:01:47.976]`（本机本地时间）。 */
+const LINE_TS_RE = /^\[(\d{4})\/(\d{2})\/(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{3})\]/;
 
 /** 探测行粗筛标记（与 UID_RE 同源，Buffer.includes 用）。 */
 const PROBE_MARKER = 'AuthDoInitProbe';
@@ -85,6 +92,18 @@ const DATE_DIR_RE = /^\d{4}-\d{2}-\d{2}$/;
 function parseResetAt(m) {
   const iso = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}+08:00`;
   const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/**
+ * 日志行首时刻 `[2026/10/15 19:01:47.976]` → 毫秒时间戳。
+ * 日志写的是本机本地时间，用本地时区构造，与 jsonl 记录的 timestamp 同基准。
+ * 拿不到行首时刻返回 0（调用方按「无时间锚」降级）。
+ */
+function parseLineTs(line) {
+  const m = line.match(LINE_TS_RE);
+  if (!m) return 0;
+  const ms = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], +m[7]).getTime();
   return Number.isFinite(ms) ? ms : 0;
 }
 
@@ -203,7 +222,8 @@ function scanLogFile(file) {
       || null;
 
     const pidM = line.match(PID_RE);
-    events.push({ resetAt, sessionId, model, pid: pidM ? pidM[1] : null, file });
+    // ts = 该行写入时刻（时间锚：resolveSession 拿它筛「429 之前」的计费记录）
+    events.push({ resetAt, sessionId, requestId, model, pid: pidM ? pidM[1] : null, ts: parseLineTs(line), file });
   }
   return { uid, pidUid, events };
 }
@@ -214,14 +234,17 @@ function scanLogFile(file) {
  * opts.currentUid：归因兜底——桌面端日志里没有 uid 行、CLI 日志查不到 uid 时，
  * 兜给当前登录账号（只有当前登录者能发起请求）。由 server.js 从
  * workbuddy-api.listSwitchableAccounts() 取好后传入，本模块不依赖官方 api 文件。
- * opts.resolveSession(sessionId) → uid|null：会话级归因回调（第二层），
- * 进程探测行不在扫描窗口内时启用。由 server.js 用「本地 jsonl 会话文件的
- * conversationRequestId → 官方账单 requestId」实现，本模块不发网络请求。
+ * opts.resolveSession(sessionId, requestId, atTs) → uid|null：会话/请求级归因
+ * 回调（第一层，最权威），pid 探测行可能过时时由它兜住。由 server.js 用
+ * 「本地 jsonl 失败记录 → 回合 → 官方账单 uid」实现，本模块不发网络请求。
+ * opts.loginAt(ts, app) → uid|null：时刻级归因回调（第二层）——429 发生那一刻
+ * 该 app 登录的是谁。由 server.js 用「switch-backups 备份链 + 当前登录文件」
+ * 实现（见 login-timeline.js），同样零网络请求。
  *
  * 返回 `{ scannedAt, windowDays, accounts }`，accounts 只含有受限模型的账号，
  * 每条 `{ uid, limits: [{ model, resetAt }] }`（resetAt 升序，最早恢复的在前）。
  */
-function scanRateLimits({ currentUid = null, resolveSession = null } = {}) {
+function scanRateLimits({ currentUid = null, resolveSession = null, loginAt = null } = {}) {
   const now = Date.now();
   const cutoffMs = now - WINDOW_DAYS * 86400000;
 
@@ -248,34 +271,53 @@ function scanRateLimits({ currentUid = null, resolveSession = null } = {}) {
           g = {
             resetAt: ev.resetAt,
             source: src.name,
+            app: src.app,
             hits: 0,
             pid: ev.pid || null,
-            sessionId: null,
+            refs: [],         // [sid, rid] 对：归因第一层用（组内可能有多个会话）
+            ts: 0,            // 组内第一条带时刻的行（时间锚）
             file,
             models: new Set(),
           };
           byKey.set(key, g);
         }
         g.hits++;
-        // 同组的第一条 sessionId 即该事件的会话（组内其余行多半不带）
-        if (ev.sessionId && !g.sessionId) g.sessionId = ev.sessionId;
+        // 组内每行的 (requestId/sessionId) 都留：同一次限流可能同时打中多个会话、
+        // 或同会话的多个请求，逐个尝试精确归因，哪个先命中账单用哪个
+        if (ev.sessionId) {
+          const rid = ev.requestId || null;
+          if (!g.refs.some(([s, r]) => s === ev.sessionId && r === rid)) {
+            g.refs.push([ev.sessionId, rid]);
+          }
+        }
+        if (!g.ts && ev.ts) g.ts = ev.ts;
         if (ev.model) g.models.add(ev.model);
       }
     }
   }
 
   // 账号归因（按精度降级，按组判定、组内共享）：
-  //   1. 行 pid → 跨文件的 AuthDoInitProbe 表（进程级登录态，最准）
-  //   2. sessionId → resolveSession 回调（会话级，覆盖探测行不在窗口内的情况）
-  //   3. 文件内最新 uid 行（旧行为）
-  //   4. currentUid 兜底（桌面端日志没有 uid 行）
+  //   1. (requestId, sessionId, ts) → resolveSession 回调（请求/会话级；失败记录
+  //      挂在哪个回合、回合算谁的账，官方账单是账号维度的权威归属）
+  //   2. (ts, app) → loginAt 回调（时刻级；切换历史回放，CLI 热切换账号时
+  //      进程启动快照已过时，这层是唯一还准的本地线索）
+  //   3. 行 pid → 跨文件的 AuthDoInitProbe 表（进程级；仅作前两层拿不到时的近似）
+  //   4. 文件内最新 uid 行（旧行为）
+  //   5. currentUid 兜底（桌面端日志没有 uid 行）
   const byUid = new Map();
   for (const g of byKey.values()) {
     if (g.resetAt <= Date.now()) continue;   // 已过官方恢复时刻，视为已恢复
-    let uid = (g.pid && pidUidAll.get(g.pid)) || null;
-    if (!uid && resolveSession && g.sessionId) {
-      try { uid = resolveSession(g.sessionId) || null; } catch { /* 降级继续 */ }
+    let uid = null;
+    if (resolveSession) {
+      for (const [sid, rid] of g.refs) {
+        try { uid = resolveSession(sid, rid, g.ts) || null; } catch { uid = null; }
+        if (uid) break;
+      }
     }
+    if (!uid && loginAt && g.ts) {
+      try { uid = loginAt(g.ts, g.app) || null; } catch { uid = null; }
+    }
+    if (!uid && g.pid) uid = pidUidAll.get(g.pid) || null;
     if (!uid) uid = fileUidOf.get(g.file) || null;
     if (!uid) uid = currentUid;
     if (!uid) continue;
@@ -320,9 +362,9 @@ let _cache = null;
  * 带缓存的扫描入口（服务端轮询用）。cacheMs 内重复调用直接返回上次结果。
  * force=true 时绕过缓存强制重扫（手动刷新用）。
  */
-function getRateLimits({ cacheMs = 60000, force = false, currentUid = null, resolveSession = null } = {}) {
+function getRateLimits({ cacheMs = 60000, force = false, currentUid = null, resolveSession = null, loginAt = null } = {}) {
   if (!force && _cache && Date.now() - _cache.scannedAt < cacheMs) return _cache;
-  _cache = scanRateLimits({ currentUid, resolveSession });
+  _cache = scanRateLimits({ currentUid, resolveSession, loginAt });
   return _cache;
 }
 
