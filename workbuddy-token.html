@@ -1995,6 +1995,22 @@ async function loadCheckinStatus(){
 }
 
 /**
+ * 签到 / 领奖拿到积分后，把该账号的余额与账单拉新（复用「🔄 刷新」走的单账号
+ * credits 同步）。后台静默执行、不占按钮；失败只留一条状态提示不打扰——积分
+ * 并没有丢，展示滞后会在下次同步（手动刷新或后端 30min 周期任务）时补上。
+ */
+async function refreshCreditsQuietly(uid){
+  setSaveState('saving', '正在刷新积分…');
+  const r = await ServerSync.run('credits', uid);
+  if(r && r.ok){
+    await syncTokens({});            // 重载数据文件，卡片上的积分随之更新
+    setSaveState('saved', '积分已更新');
+    return;
+  }
+  setSaveState('saved', r && r.busy ? '积分刷新推迟：已有同步进行中' : '积分未刷新，下次同步会补上');
+}
+
+/**
  * 账号卡片上的操作按钮（刷新 / 签到 / 派猫猫）。
  *
  * 签到与派猫猫会真的改动服务端状态，刷新只读；但三者都需要读取本地登录凭证，
@@ -2096,9 +2112,11 @@ async function onAcctAction(btn){
       ? `${one.name || '账号'}：今日已签到 · 连续 ${one.streakDays} 天 · 累计 ${fmt0(one.totalCredits)} 积分`
       : `${one.name || '账号'}：签到成功 · 连续 ${one.streakDays} 天 · 今日 +${fmt0(one.todayCredit)} 积分`);
     loadCheckinStatus();   // 刷新签到日历
+    if(!one.already) refreshCreditsQuietly(uid);            // 真签上拿了积分：余额/账单拉新
   }else{
     toast(`${one.name || '账号'}：${one.message || '已处理'}`);
     loadCheckinStatus();   // 刷新旅行状态
+    if(one.action === 'claim' && !one.already) refreshCreditsQuietly(uid);   // 领到奖励积分到账：拉新
   }
 }
 
