@@ -5287,9 +5287,41 @@ async function tryRestore(){
  */
 async function mergeOfficialBill(){
   const off = OfficialBill.rows();
-  if(!off.length) return false;
 
   const res = mergeByRequestId(state.all, off);
+  // 无官方账单的本地回合也成行：custom-local 等直达模型不经官方计费，账单里
+  // 永远没有，只靠这里的回合表数据呈现（token 维度，积分记 0）。id 用
+  // conversationRequestId，与账单 RequestID 同源；已存在于数据集里的跳过，
+  // 避免「手工导入/快照已含」时重复成行。机器归属从回合上带下来，云同步后
+  // 跨机也能按机器筛到这些行。
+  const td = TokenData.get();
+  if(td && td.t && typeof td.t === 'object'){
+    const have = new Set(res.rows.map(x => (x.id || '').toLowerCase()).filter(Boolean));
+    for(const [key, v] of Object.entries(td.t)){
+      if(!v || typeof v !== 'object') continue;
+      if(have.has(key.toLowerCase())) continue;
+      const ms = Number(v.t0) || Number(v.t1) || 0;
+      if(!ms) continue;
+      const time = new Date(ms);
+      if(isNaN(time.getTime())) continue;
+      const row = {
+        id: key,
+        points: 0,
+        model: v.m || '未知模型',
+        client: '本地直达',
+        time,
+        date: fmtDate(time),
+        hour: time.getHours(),
+        min: time.getMinutes(),
+        acct: '',
+        // 机器归属（云同步）：回合带 mch 就用它；没有就归「未标注」
+        mch: v.mch || ''
+      };
+      row.token = v;
+      res.rows.push(row);
+    }
+  }
+
   applyDataset(res.rows, state.sheetName, state.fileName || '官方账单（自动同步）');
 
   const m = OfficialBill.meta();
