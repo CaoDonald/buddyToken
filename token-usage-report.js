@@ -91,7 +91,6 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const readline = require('readline');
 const { parseArgs } = require('util');
 
 // console 输出同步落盘到 logs/buddytoken-YYYYMMDD.log（见 app-logger.js）
@@ -112,37 +111,14 @@ const SOURCES = [
 ];
 
 // ---------------------------------------------------------------- 工具函数
+//
+// toDate / pick / validLatency / walk / scanFile 与扫描 worker 共用，
+// 实现在 scan-core.js（见文件注释）。这里只做别名引用，保证主线程与
+// worker 跑的是同一份扫描逻辑。
 
-function toDate(ts) {
-  if (ts === null || ts === undefined) return null;
-  if (typeof ts === 'number') {
-    const v = ts > 1e11 ? ts : ts * 1000;
-    const d = new Date(v);
-    return isNaN(d.getTime()) ? null : d;
-  }
-  if (typeof ts === 'string') {
-    const d = new Date(ts.replace('Z', '+00:00'));
-    return isNaN(d.getTime()) ? null : d;
-  }
-  return null;
-}
-
-function pick(obj, ...keys) {
-  for (const k of keys) {
-    const v = obj[k];
-    if (v) return v;
-  }
-  return null;
-}
-
-/**
- * 响应耗时有效性窗口。
- *   < 0.5s 多半是记录异常或没有可用起点；> 1h 多半是会话被中断后残留。
- * 落在窗口外的记为 0（无效），由消费方当作「无数据」处理。
- */
-function validLatency(ms) {
-  return ms > 500 && ms < 3600000 ? ms : 0;
-}
+const {
+  toDate, pick, validLatency, walk, scanFile,
+} = require('./scan-core');
 
 function fmtTime(d) {
   if (!d) return '';
@@ -171,163 +147,78 @@ function esc(v) {
   return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
-/** 递归收集目录下所有 .jsonl */
-function walk(dir, out = []) {
-  let ents;
-  try {
-    ents = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return out;
-  }
-  for (const e of ents) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) walk(p, out);
-    else if (e.name.endsWith('.jsonl')) out.push(p);
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------- 解析单个会话文件
+// ---------------------------------------------------------------- 汇总收集
 
 /**
- * 会话标题记录的行首特征。用锚定正则而不是 includes('ai-title')：工具输出
- * 正文里完全可能出现这两个词，那种行里往往还带着 usage，误判会丢记录。
+ * 决定并行扫描的 worker 数。
+ *
+ * - 单文件/极少文件不值得开 worker：进程启动成本反而超过收益（实测
+ *   worker_threads 单 worker 冷启动约 30-60ms，只有文件足够多才划算）。
+ * - Worker 需要内存加载扫描逻辑副本，大量 worker 对 1GB 级数据并不更划算，取
+ *   核心数一半封顶 6（解析是 CPU 密集 + 少量冷读，超过 6 个实测不再提速）。
  */
-const TITLE_LINE_RE = /^\uFEFF?\{(?:"id":"[^"]*",)?"timestamp":\d+,"type":"ai-title"/;
-
-async function scanFile(file, source) {
-  const reqs = [];
-  const turns = [];
-  const titles = new Map();   // sessionId → 客户端生成的会话标题
-  const fname = path.basename(file, '.jsonl');
-  const projdir = path.basename(path.dirname(file));
-
-  const rl = readline.createInterface({
-    input: fs.createReadStream(file, { encoding: 'utf8' }),
-    crlfDelay: Infinity,
-  });
-
-  // ---- 响应耗时推算状态（口径详见文件头）----
-  // agent 循环是严格串行的：模型响应 → 工具执行 → 下一次模型响应。
-  //   function_call 记录的时间戳    = 该次模型响应完成的时刻
-  //   function_call_result 的时间戳 = 该次工具执行完成的时刻
-  // 所以「本次响应完成 - 上一次工具完成」就是纯粹的模型侧耗时，工具执行被排除。
-  // 回合内首个请求以用户消息的时间戳为起点。
-  let anchor = 0;         // 最近一次「等待起点」；0 表示尚无可用起点
-  const seen = new Map(); // messageId → 已产出的请求，用于合并同一次响应的流式分片
-
-  for await (let line of rl) {
-    // 会话标题：客户端在首轮对话后写入的独立记录，不带 usage，得单独收下
-    if (TITLE_LINE_RE.test(line)) {
-      const raw = line.charCodeAt(0) === 0xfeff ? line.slice(1) : line;
-      try {
-        const d = JSON.parse(raw.trim());
-        if (d.type === 'ai-title' && d.sessionId && d.aiTitle && !titles.has(d.sessionId)) {
-          titles.set(d.sessionId, String(d.aiTitle));
-        }
-      } catch { /* 坏行忽略 */ }
-      continue;
-    }
-
-    const hasUsage = line.includes('"usage"');
-    const hasDelta = line.includes('"tokenDelta"');
-    if (!hasUsage && !hasDelta &&
-        !line.includes('"function_call_result"') && !line.includes('"role":"user"')) continue;
-
-    if (line.charCodeAt(0) === 0xfeff) line = line.slice(1);
-    line = line.trim();
-    if (!line) continue;
-
-    // 工具结果 / 用户消息：只用来推进响应起点。这类记录可能内含几十 KB 的工具
-    // 输出，整行 JSON.parse 既慢又没必要——timestamp 一定在行首，正则取即可。
-    if (!hasUsage && !hasDelta) {
-      const tm = /"timestamp":\s*(\d+)/.exec(line.slice(0, 300));
-      if (tm) anchor = Number(tm[1]);
-      continue;
-    }
-
-    let d;
-    try {
-      d = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
-    // ---- 回合指标 ----
-    if (d.type === 'turn-metrics') {
-      turns.push({
-        time: toDate(d.timestamp),
-        source,
-        session: d.sessionId || fname,
-        cwd: d.cwd || projdir,
-        durationMs: d.durationMs || 0,
-        tokenDelta: d.tokenDelta || 0,
-      });
-      continue;
-    }
-
-    // ---- 单次请求 ----
-    const m = d.message;
-    if (!m || typeof m !== 'object' || Array.isArray(m)) continue;
-    const u = m.usage;
-    if (!u || typeof u !== 'object' || Array.isArray(u)) continue;
-
-    const pd = d.providerData && typeof d.providerData === 'object' ? d.providerData : {};
-    const ms = typeof d.timestamp === 'number' ? d.timestamp : 0;
-    const key = pick(pd, 'messageId') || m.id || d.id || '';
-
-    // 同一次响应可能分多条写入（reasoning / 正文 / 工具调用）。token 取首条
-    // （与既有的 messageId 去重口径一致），但完成时刻要取最晚的那条，
-    // 否则会把耗时算到第一个分片为止，系统性低估。
-    const dup = key ? seen.get(key) : null;
-    if (dup) {
-      if (ms && ms > dup._ms) {
-        dup._ms = ms;
-        dup.time = toDate(ms);
-        dup.latencyMs = dup.anchorMs ? validLatency(ms - dup.anchorMs) : 0;
-      }
-      continue;
-    }
-
-    const inp = u.input_tokens || 0;
-    const out = u.output_tokens || 0;
-
-    const r = {
-      time: toDate(ms),
-      source,
-      model: pick(pd, 'model') || m.model || 'unknown',
-      project: d.cwd || projdir,
-      session: d.sessionId || fname,
-      requestId: key,
-      // 回合 ID：粒度比 messageId 粗，一次用户提问对应一个回合（内含多次 API 请求）
-      conversationRequestId: pd.conversationRequestId || '',
-      kind: d.type || '',
-      tool: d.name || '',
-      inputTokens: inp,
-      outputTokens: out,
-      cacheReadTokens: u.cache_read_input_tokens || 0,
-      cacheCreationTokens: u.cache_creation_input_tokens || 0,
-      totalTokens: u.total_tokens || (inp + out),
-      // 本次响应的纯模型耗时（已排除工具执行）；0 = 无法推算
-      latencyMs: anchor && ms ? validLatency(ms - anchor) : 0,
-      // 该次等待的起点（用户提交或上一次工具完成）。单个请求用不到它，
-      // 但回合级「用户等了多久」要靠 min(anchorMs) → max(anchorMs + latencyMs)
-      // 才算得准：只取首末响应时间戳会漏掉首个请求自身的耗时。
-      anchorMs: anchor,
-      _ms: ms,
-    };
-    if (key) seen.set(key, r);
-    reqs.push(r);
-    if (ms) anchor = ms;
-  }
-
-  // 内部分片合并字段不对外暴露
-  for (const r of reqs) delete r._ms;
-
-  return { reqs, turns, titles };
+function pickWorkerCount(fileCount) {
+  if (fileCount < 16) return 0;                       // 不值得并行
+  const cpus = (require('os').cpus() || []).length;
+  return Math.max(1, Math.min(Math.floor(cpus / 2), 6));
 }
 
-// ---------------------------------------------------------------- 汇总收集
+/**
+ * 用 worker 池并行扫描一批会话文件（worker_threads）。
+ *
+ * files: [{ path, source }, ...]；返回 { reqs, turns, titles }（与串行 scanFile
+ * 汇总口径一致）。worker_threads 不可用（被禁用/受限环境）时回落串行，行为与
+ * 此前完全一致，绝不因并行改造影响产出。
+ *
+ * 实现：按文件数均分给 count 个 worker，每个 worker 顺序扫自己那份文件后整批
+ * 回传；任何一个 worker 失败都不阻塞——单文件失败在 worker 内已跳过，与串行
+ * 路径的 try/catch 语义等价。
+ */
+async function scanFilesParallel(files, count) {
+  if (count <= 0 || files.length <= 1 || process.env.BT_SCAN_SERIAL === '1') {
+    // 串行兜底：与改造前完全一致
+    const all = { reqs: [], turns: [], titles: new Map() };
+    for (const f of files) {
+      try {
+        const r = await scanFile(f.path, f.source);
+        all.reqs.push(...r.reqs);
+        all.turns.push(...r.turns);
+        for (const [k, v] of r.titles) if (!all.titles.has(k)) all.titles.set(k, v);
+      } catch { /* 单文件失败跳过（原语义） */ }
+    }
+    return all;
+  }
+
+  const { Worker } = require('worker_threads');
+  const chunks = [];
+  const per = Math.ceil(files.length / count);
+  for (let i = 0; i < files.length; i += per) chunks.push(files.slice(i, i + per));
+
+  return new Promise((resolve) => {
+    const all = { reqs: [], turns: [], titles: new Map() };
+    let pending = chunks.length;
+    let failed = 0;
+
+    for (const chunk of chunks) {
+      const w = new Worker(path.join(__dirname, 'scan-worker.js'), { workerData: { files: chunk } });
+      w.on('message', (res) => {
+        if (res && res.reqs) all.reqs.push(...res.reqs);
+        if (res && res.turns) all.turns.push(...res.turns);
+        if (res && Array.isArray(res.titles)) {
+          for (const [k, v] of res.titles) if (!all.titles.has(k)) all.titles.set(k, v);
+        }
+      });
+      w.on('error', () => { failed++; });
+      w.on('exit', () => {
+        pending--;
+        if (pending === 0) {
+          if (failed) console.warn(`  [并行扫描] ${failed} 个 worker 异常退出，已按串行语义跳过对应文件`);
+          resolve(all);
+        }
+      });
+    }
+  });
+}
 
 async function collect(since) {
   const allReqs = [];
@@ -335,14 +226,11 @@ async function collect(since) {
   const allTitles = new Map();   // sessionId → 会话标题（不受 --since 影响）
   const stats = [];
 
+  const needs = [];
   for (const s of SOURCES) {
     if (!fs.existsSync(s.base)) continue;
-
     const files = walk(s.base);
     let nbytes = 0;
-    const breqs = [];
-    const bturns = [];
-
     for (const f of files) {
       let sz = 0;
       try {
@@ -352,16 +240,27 @@ async function collect(since) {
       }
       nbytes += sz;
       if (sz === 0) continue;
-      const { reqs, turns, titles } = await scanFile(f, s.name);
-      breqs.push(...reqs);
-      bturns.push(...turns);
-      for (const [k, v] of titles) if (!allTitles.has(k)) allTitles.set(k, v);
+      needs.push({ path: f, source: s.name });
     }
+    stats.push({ name: s.name, base: s.base, files: files.length, bytes: nbytes, reqs: 0 });
+  }
 
-    // 去重（同一请求在会话内可能被写多条）
+  // 并行扫描（文件够多时），失败自动降级串行
+  const count = pickWorkerCount(needs.length);
+  const scanned = await scanFilesParallel(needs, count);
+
+  // 按来源分组做去重（同一请求在会话内可能被写多条）——去重必须以「来源+会话」
+  // 为界：不同来源（WorkBuddy / CodeBuddyCLI）即使出现相同 sessionId 也不该互相
+  // 去重，这与改造前「每个 SOURCES 各自维护 seen set」的行为保持一致。
+  const bySource = new Map();
+  for (const r of scanned.reqs) {
+    const list = bySource.get(r.source) || (bySource.set(r.source, []), bySource.get(r.source));
+    list.push(r);
+  }
+  const uniq = [];
+  for (const [src, list] of bySource) {
     const seen = new Set();
-    const uniq = [];
-    for (const r of breqs) {
+    for (const r of list) {
       if (r.requestId) {
         const key = r.session + '\u0000' + r.requestId;
         if (seen.has(key)) continue;
@@ -370,10 +269,15 @@ async function collect(since) {
       if (since && r.time && r.time < since) continue;
       uniq.push(r);
     }
+  }
 
-    allReqs.push(...uniq);
-    allTurns.push(...bturns);
-    stats.push({ name: s.name, base: s.base, files: files.length, bytes: nbytes, reqs: uniq.length });
+  allReqs.push(...uniq);
+  allTurns.push(...scanned.turns);
+  for (const [k, v] of scanned.titles) if (!allTitles.has(k)) allTitles.set(k, v);
+
+  // 回填每个来源的请求数（此前已压入 stats，但 reqs 还是 0）
+  for (const st of stats) {
+    st.reqs = uniq.filter((r) => r.source === st.name).length;
   }
 
   return { allReqs, allTurns, stats, titles: allTitles };
