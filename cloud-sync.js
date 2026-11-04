@@ -57,7 +57,7 @@ const CONFIG_DEFAULTS = {
   enabled: false,             // 总开关：false 时整条链路静默跳过
   url: '',                    // 如 https://xxxx.supabase.co（也可填自建反代地址）
   anonKey: '',                // Supabase 项目的 anon public key
-  proxy: '',                  // HTTP 代理，如 http://127.0.0.1:10235；留空则直连
+  proxy: '',                  // HTTP 代理，按需临时填；留空则直连（默认）
   machineName: '',            // 看板上显示的机器名，留空用主机名
   intervalMinutes: 30,        // 后台同步周期
   resyncWindowDays: 7,        // 重推窗口：这么多天内变动过的回合每轮都重推一遍
@@ -132,14 +132,14 @@ function ensureConfigTemplate() {
       '多台机器如何配：',
       '  url / anonKey  —— 所有机器填同一个（连的是同一个项目）',
       '  machineName    —— 每台取不同的名字，看板靠它区分是哪台（如「台式机」「笔记本」）',
-      '  proxy          —— 填这台机器自己的代理端口，各机可能不同；先留空试直连',
+      '  proxy          —— 默认留空直连；仅直连不通且本机有代理时才临时填',
       '',
       '字段说明：',
       '  enabled           总开关。false 时整条链路静默跳过，看板行为与纯本地完全一致',
       '  url               Supabase 项目地址，形如 https://xxxx.supabase.co（也可填自建反代）',
       '  anonKey           项目的 anon public key。只存本机，切勿提交、切勿贴给别人',
-      '  proxy             HTTP 代理，如 http://127.0.0.1:10235；留空则直连。',
-      '                    *.supabase.co 走 Cloudflare，国内直连常被 TLS 重置，不通时必须填',
+      '  proxy             HTTP 代理，按需临时填；留空则直连（默认）。',
+      '                    不要写死地址（代理软件不一定开着）；不通且本机有代理时才填',
       '  machineName       看板上显示的机器名，留空则用主机名',
       '  intervalMinutes   后台同步周期，单位 分钟',
       '  resyncWindowDays  重推窗口（天）：这么多天内变动过的回合每轮都重推一遍，防漏推',
