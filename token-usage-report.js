@@ -347,7 +347,7 @@ function buildTokenDataJs(reqs, light, titles, cloud) {
     let t = turns.get(key);
     if (!t) {
       t = { n: 0, in: 0, out: 0, cr: 0, cc: 0, tot: 0, t0: 0, t1: 0,
-            m: '', s: r.session, src: r.source, p: r.project, best: -1, d: [],
+            m: '', rm: '', s: r.session, src: r.source, p: r.project, best: -1, d: [],
             // 模型侧耗时：lat 为有效之和、latn 为有效条数。不依赖步骤明细，
             // 所以 --light 下依然可用（只是少了逐请求分布）。
             lat: 0, latn: 0,
@@ -369,7 +369,11 @@ function buildTokenDataJs(reqs, light, titles, cloud) {
       if (ms > t.t1) t.t1 = ms;
     }
     // 回合代表模型：取消耗最大的那次请求，比取第一次更贴近成本归因
-    if (r.totalTokens > t.best) { t.best = r.totalTokens; t.m = r.model; }
+    if (r.totalTokens > t.best) {
+      t.best = r.totalTokens;
+      t.m = r.model;
+      t.rm = r.requestModelId || '';
+    }
     if (!light) {
       // 第 6 位是本次请求的模型耗时 ms（0 = 无法推算）。旧数据只有 5 位，
       // 消费方读下标 5 时要做「undefined 即无数据」的兼容。
@@ -385,6 +389,9 @@ function buildTokenDataJs(reqs, light, titles, cloud) {
                 lat: t.lat, latn: t.latn };
     // 机器标识只在有值时写：未启用云同步就不该让每个回合多挂一个空字段
     if (t.mch) o.mch = t.mch;
+    // 模型来源标识（requestModelId）：custom-local: 前缀 = 自定义配置，其余为内置。
+    // 同样只在有值时写——旧数据没有这一位，读成 undefined 按「未知来源」处理。
+    if (t.rm) o.rm = t.rm;
     if (!light) o.d = t.d.sort((a, b) => a[0] - b[0]);
     out[k] = o;
   }

@@ -174,6 +174,11 @@ async function scanFile(file, source) {
       time: toDate(ms),
       source,
       model: pick(pd, 'model') || m.model || 'unknown',
+      // 请求侧的模型标识：自定义配置（~/.codebuddy/models.json）发出来的一律带
+      // `custom-local:` 前缀，内置模型没有。model 字段是**服务端返回**的型号名，
+      // 自定义与内置可能同名（如 deepseek-v4-flash），只有这一位能区分来源。
+      // 旧记录没有这个字段，读成空串按「未知」处理。
+      requestModelId: pick(pd, 'requestModelId') || '',
       project: d.cwd || projdir,
       session: d.sessionId || fname,
       requestId: key,

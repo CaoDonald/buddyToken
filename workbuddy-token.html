@@ -405,6 +405,15 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
   display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;
   background:#e7f8f1;color:#0b8a63;
 }
+/* 模型来源徽标：贴在模型名后面，一个字（官/自）加颜色就够辨认。
+   不换行——模型名长时让名字省略，徽标必须始终可见 */
+.src-tag{
+  display:inline-block;margin-left:4px;padding:0 4px;border-radius:4px;
+  font-size:10px;font-weight:700;line-height:14px;vertical-align:1px;white-space:nowrap;
+}
+.src-builtin{background:#eef2fd;color:#4a63c9}
+.src-custom {background:#f3edff;color:#7048d6}
+.src-unknown{background:#f0f2f6;color:#93a0b8}
 /* 单元格内嵌走势：数字在上、走势线在下撑满格子，hover 出分桶说明。
    线用 viewBox 100×18 横向拉伸到列宽，vector-effect 保证线宽不随拉伸变形 */
 .cellwrap{display:flex;flex-direction:column;align-items:flex-end;gap:2px;width:100%}
@@ -481,7 +490,8 @@ tr.expand-row>td{background:#f7f9fd;padding:0 !important;border-bottom:1px solid
   background:#f5f7fd;padding:2px 9px;border-radius:6px;font-variant-numeric:tabular-nums;
 }
 .cal-scroll{overflow-x:auto;padding-bottom:6px}
-table.cal{border-collapse:separate;border-spacing:3px;font-size:10.5px}
+table.cal{border-collapse:separate;border-spacing:3px;font-size:10.5px;
+  width:max-content;table-layout:fixed}
 table.cal th.month{
   font-weight:700;color:#7c88a3;font-size:10.5px;text-align:left;
   padding:0 0 5px 0;white-space:nowrap;
@@ -641,6 +651,7 @@ table.cal td.cal-cell.has:hover{
         </span>
       </div>
       <div class="fgroup" id="modelGroup"><label>模型</label><div class="chips" id="modelChips"></div></div>
+      <div class="fgroup" id="sourceGroup"><label>来源</label><div class="chips" id="sourceChips"></div></div>
       <div class="fgroup"><label>客户端</label><div class="chips" id="clientChips"></div></div>
       <div class="fgroup" id="machineGroup"><label>机器</label><div class="chips" id="machineChips"></div></div>
       <div class="fgroup" id="acctGroup"><label>账号</label><div class="chips" id="acctChips"></div></div>
@@ -989,7 +1000,9 @@ function parseSheetRows(rows){
       id: id || '-', points,
       model:  model  || '未知模型',
       client: client || '未知客户端',
-      time, date: fmtDate(time), hour: time.getHours(), min: time.getMinutes()
+      time, date: fmtDate(time), hour: time.getHours(), min: time.getMinutes(),
+      // 手工导入的账单同样走过官方计费，来源可推定官方（见 rowSource）
+      billed: true
     });
   }
   return out;
@@ -1054,11 +1067,87 @@ function mergeByRequestId(oldRows, newRows){
 }
 
 /* =========================================================
+ *  1.6 模型来源（官方内置 / 自定义配置）
+ *
+ * 两个模型可能同名：服务端返回的型号名（model）对「官方内置的 deepseek-v4-flash」
+ * 与「自己配的 deepseek-v4-flash」是同一个字符串，只看它分不开。真正能区分的是
+ * jsonl 里的 providerData.requestModelId——自定义配置（~/.codebuddy/models.json）
+ * 发出来的请求一律带 `custom-local:` 前缀，内置模型没有。
+ *
+ * 因此行的来源 = requestModelId 前缀；拿不到该字段的（旧产物、手工导入的 Excel、
+ * 官方账单未关联到本地回合）一律归「未知」，不猜。
+ * =======================================================*/
+const MODEL_SOURCE = {
+  custom: { key: 'custom', label: '自定义', short: '自', title: '来自本机 ~/.codebuddy/models.json 的自定义模型配置' },
+  builtin:{ key: 'builtin', label: '官方',   short: '官', title: 'CodeBuddy 内置模型（走官方计费）' },
+  unknown:{ key: 'unknown', label: '未知',   short: '?',  title: '没有来源标识：旧产物、手工导入的 Excel，或未关联到本地会话的账单行' },
+};
+
+/** requestModelId → 来源键。空值即未知，不做推测。 */
+function modelSourceOf(rm){
+  const s = String(rm || '').trim();
+  if(!s) return 'unknown';
+  return /^custom-local:/i.test(s) ? 'custom' : 'builtin';
+}
+
+/**
+ * 行的来源键（优先行上带下来的 rm，退回关联回合的 rm）。
+ *
+ * 拿不到 rm 但有官方计费记录（billed）的，可推定是官方内置模型：自定义配置
+ * 走本地直达、不经官方计费，账单里永远不会有它——2026-11-20 实测 20827 条账单
+ * 行中能反查到 rm 的 7007 条里 custom-local 为 0 条，这条互斥关系成立。
+ * 这个推定能覆盖绝大部分历史账单行（老产物没有 rm 字段），比一律标「未知」有用。
+ */
+function rowSource(x){
+  const rm = x.rm || (x.token && x.token.rm);
+  if(String(rm || '').trim()) return modelSourceOf(rm);
+  if(x.billed) return 'builtin';
+  return 'unknown';
+}
+
+/**
+ * 聚合/筛选用的模型键 = 展示名（模型名 + 来源后缀）。
+ *
+ * 同名模型的官方版与自定义版必须分成两组，否则「每积分 Token」这类比率会被
+ * 两边混在一起算（自定义走本地直达、积分恒为 0，混进去就成了免费模型）。
+ * 让键本身就是展示名，各渲染处直接当模型名用，不必各自翻译一次。
+ * 来源未知时退回原名，与历史数据保持可比。
+ *
+ * 名字先去首尾空白：jsonl 里的 model 偶有尾随空格（实测见过 `hy3 `），
+ * 不归一化会让同一个模型分成两个键、后缀也挂着空格。
+ */
+const rowModelKey = x => {
+  const name = String(x.model || '').trim();
+  const src = rowSource(x);
+  return src === 'unknown' ? name : `${name}（${MODEL_SOURCE[src].label}）`;
+};
+
+/** 来源小徽标（表格里用的紧凑形态）。src 是 MODEL_SOURCE 的键。 */
+function sourceTag(src){
+  const m = MODEL_SOURCE[src] || MODEL_SOURCE.unknown;
+  return `<span class="src-tag src-${src}" title="${esc(m.title)}">${m.short}</span>`;
+}
+
+/**
+ * 模型名 + 来源徽标。key 是聚合键（含「（官方）/（自定义）」后缀），
+ * 后缀即来源，剥掉后用徽标代替——一列里既有名字又有一眼可辨的来源，
+ * 不用把后缀文字重复念一遍。未知来源不挂徽标。
+ */
+function modelPill(key){
+  const name = String(key || '').trim();
+  const src = /（自定义）$/.test(name) ? 'custom'
+            : /（官方）$/.test(name)   ? 'builtin' : 'unknown';
+  if(src === 'unknown') return `<span class="pill">${esc(name)}</span>`;
+  const base = name.replace(/\s*（(?:自定义|官方)）$/, '');
+  return `<span class="pill">${esc(base)}${sourceTag(src)}</span>`;
+}
+
+/* =========================================================
  *  2. 状态
  * =======================================================*/
 const state = {
   all: [], fileName: '', sheetName: '',
-  filters: { from:'', to:'', fromTs:0, toTs:0, models:new Set(), clients:new Set(), accounts:new Set(), machines:new Set() },
+  filters: { from:'', to:'', fromTs:0, toTs:0, models:new Set(), sources:new Set(), clients:new Set(), accounts:new Set(), machines:new Set() },
   charts: {},
   tokenLoaded: false,   // token-usage-data.js 是否成功加载
   tokenMatch: null,     // { hit, miss, noId, total, rate } —— 基于全量 state.all，不随筛选变化
@@ -1115,7 +1204,9 @@ function getFiltered(range){
       if(f.fromTs && ts < f.fromTs) return false;
       if(f.toTs   && ts > f.toTs)   return false;
     }
-    if(f.models.size   && !f.models.has(x.model))       return false;
+    if(f.models.size   && !f.models.has(rowModelKey(x))) return false;
+    // 模型来源：官方内置 / 自定义配置 / 未知（拿不到 requestModelId 的行）
+    if(f.sources.size  && !f.sources.has(rowSource(x)))  return false;
     if(f.clients.size  && !f.clients.has(x.client))     return false;
     // 账号：空串代表「未知」（手工导入的 Excel 行没有账号归属）
     if(f.accounts.size && !f.accounts.has(x.acct || '')) return false;
@@ -1269,8 +1360,11 @@ function buildBuckets(d, f){
       b.tkOut += x.token.out;
       b.tkCr  += x.token.cr;
     }
-    let cell = matrix.get(x.model);
-    if(!cell){ cell = { pts:new Array(n).fill(0), cnt:new Array(n).fill(0) }; matrix.set(x.model, cell); }
+    // 矩阵按「模型 + 来源」分组，与 byModel 的键一致，否则同名的官方/自定义
+    // 会被叠成一根柱、长尾「其他」也点不出各自的名字
+    const mk = rowModelKey(x);
+    let cell = matrix.get(mk);
+    if(!cell){ cell = { pts:new Array(n).fill(0), cnt:new Array(n).fill(0) }; matrix.set(mk, cell); }
     cell.pts[bi] += x.points;
     cell.cnt[bi] += 1;
   }
@@ -1290,7 +1384,15 @@ function buildBuckets(d, f){
 function computeStats(d){
   const total = d.reduce((s,x) => s + x.points, 0);
   const count = d.length;
-  const byModel  = agg(d, x => x.model);
+  const byModel  = agg(d, rowModelKey);
+
+  // 模型键 → 来源。键里已经带了「（官方）/（自定义）」后缀，同键来源必然唯一，
+  // 这里只是把它取出来供渲染来源徽标用。
+  const srcByKey = new Map();
+  for(const x of d){
+    const k = rowModelKey(x);
+    if(!srcByKey.has(k)) srcByKey.set(k, rowSource(x));
+  }
   const byClient = agg(d, x => x.client);
   const byDate   = agg(d, x => x.date);
   const byHour   = agg(d, x => x.hour);
@@ -1395,8 +1497,9 @@ function computeStats(d){
     const det = t && t.d;
     if(!det || !det.length) continue;
 
-    let g = latMap.get(x.model);
-    if(!g){ g = { key:x.model, pairs:[] }; latMap.set(x.model, g); }
+    const mk = rowModelKey(x);
+    let g = latMap.get(mk);
+    if(!g){ g = { key:mk, pairs:[] }; latMap.set(mk, g); }
 
     let start = 0, end = 0, tLat = 0, tN = 0;
     for(const st of det){
@@ -1518,7 +1621,7 @@ function renderKPIs(d){
        ? `半数记录落在 <b>${fmt2(s.perReqP25)}</b> ~ <b>${fmt2(s.perReqP75)}</b> 积分`
        : `${s.count} 次请求`},
     {label:'单次最高',   value: s.max ? fmt2(s.max) : '0',
-     sub: s.maxReq ? `${esc(s.maxReq.model)} · ${s.maxReq.time.getHours()}:${pad(s.maxReq.time.getMinutes())}` : '-'},
+     sub: s.maxReq ? `${esc(rowModelKey(s.maxReq))} · ${s.maxReq.time.getHours()}:${pad(s.maxReq.time.getMinutes())}` : '-'},
     {label:'主力模型', value: mainModel ? esc(mainModel.key) : '-', small:true,
      sub: mainModel ? `占 <b>${pct(mainModel.sum, s.total)}</b> · ${mainModel.count} 次` : '-'},
     {label:'主力客户端', value: mainClient ? esc(mainClient.key) : '-', small:true,
@@ -2467,7 +2570,7 @@ function renderHeatmap(d){
   const matrix = new Map();
   for(const m of models) matrix.set(m, new Array(nCols).fill(0));
   for(const x of d){
-    const row = matrix.get(x.model);
+    const row = matrix.get(rowModelKey(x));
     if(row) row[colIdx(x)] += x.points;
   }
 
@@ -2691,7 +2794,7 @@ function renderTables(d){
       <tr>
         <td style="color:#a8b3c8;font-weight:700">${i+1}</td>
         <td class="mono" title="${esc(x.id)}">${esc(x.id.length > 20 ? x.id.slice(0,18)+'…' : x.id)}</td>
-        <td><span class="pill">${esc(x.model)}</span></td>
+        <td>${modelPill(rowModelKey(x))}</td>
         <td style="color:#6b7891">${esc(x.client)}</td>
         <td class="mono">${x.date} ${pad(x.hour)}:${pad(x.min)}</td>
         <td class="num">${fmt2(x.points)}</td>
@@ -2723,7 +2826,7 @@ function renderTables(d){
   // 每行先摊平成可比较的字段，再交给统一的表头排序处理。
   // 日期用 YYYY-MM-DD 字符串，字典序即时间序。
   const dayRows = s.byDate.map(day => {
-    const mm = agg(d.filter(x => x.date === day.key), x => x.model)[0];
+    const mm = agg(d.filter(x => x.date === day.key), rowModelKey)[0];
     return { date: day.key, sum: day.sum, tk: day.tk, count: day.count,
              avg: day.sum / day.count, model: mm ? mm.key : '' };
   });
@@ -2855,7 +2958,7 @@ function renderModelDelta(byModel){
     return;
   }
 
-  const pMap = new Map(agg(dPrev, x => x.model).map(o => [o.key, o]));
+  const pMap = new Map(agg(dPrev, rowModelKey).map(o => [o.key, o]));
   const cMap = new Map(byModel.map(o => [o.key, o]));
 
   // 本期∪上期：上期用过、本期已停用的模型也要露出来（那正是「省下来了」）
@@ -2953,10 +3056,12 @@ function buildModelSeries(d, f){
   for(const x of d){
     const ts = x.time.getTime();
     if(ts < s0 || ts > end) continue;
-    let arr = acc.get(x.model);
+    // 与模型数据表同键（含来源后缀），否则同名的官方/自定义会共用一条走势线
+    const key = rowModelKey(x);
+    let arr = acc.get(key);
     if(!arr){
       arr = Array.from({length:n}, () => ({count:0, pts:0, tk:0, tkIn:0, tkCr:0, lats:[], pairs:[]}));
-      acc.set(x.model, arr);
+      acc.set(key, arr);
     }
     const b = arr[Math.min(n - 1, Math.max(0, Math.floor((ts - s0) / unitMs)))];
     b.count++;
@@ -3124,8 +3229,11 @@ function renderModelRank(d){
 
   const rows = list.map(m => {
     const sr = ms.series.get(m.key);
+    // 「请求数」为 0 而 token 有值 = 这些回合没有官方计费记录（自定义模型走本地
+    // 直达，账单里永远没有）。给个说明，免得被当成数据错误。
+    const noBill = m.count > 0 && m.pts === 0 && m.tk > 0;
     return `<tr>
-      <td><span class="pill">${esc(m.key)}</span></td>
+      <td title="${esc(m.key)}">${modelPill(m.key)}</td>
       ${sparkTd(`<span style="color:#6b7891">${fmt0(m.count)}</span>`, sr, 'count')}
       ${sparkTd(fmt2(m.pts), sr, 'pts')}
       ${sparkTd(fmtTok(m.tk), sr, 'tk')}
@@ -3237,7 +3345,9 @@ function getDetailList(){
   if(f.mode === 'miss') list = list.filter(x => !x.token);
   if(q) list = list.filter(x =>
     String(x.id).toLowerCase().includes(q) ||
-    String(x.model).toLowerCase().includes(q) ||
+    rowModelKey(x).toLowerCase().includes(q) ||
+    x.model.toLowerCase().includes(q) ||          // 不写来源后缀也能搜到
+    MODEL_SOURCE[rowSource(x)].label.includes(q) ||
     String(x.client).toLowerCase().includes(q));
   return [...list].sort((a, b) => b.time - a.time);   // 最新的在前
 }
@@ -3323,7 +3433,7 @@ function renderDetail(d){
       const main = `<tr>
         <td><span class="stat-mark ${t ? 'stat-hit' : 'stat-miss'}">${t ? '已关联' : '未关联'}</span></td>
         <td class="mono" title="${esc(x.id)}">${esc(x.id.length > 22 ? x.id.slice(0, 20) + '…' : x.id)}</td>
-        <td><span class="pill">${esc(x.model)}</span></td>
+        <td>${modelPill(rowModelKey(x))}</td>
         <td style="color:#6b7891">${esc(x.client)}</td>
         <td class="mono">${x.date} ${pad(x.hour)}:${pad(x.min)}</td>
         <td class="num">${fmt2(x.points)}</td>
@@ -3592,7 +3702,7 @@ function buildMarkdown(d){
   L.push(`| # | RequestID | 模型 | 客户端 | 时间 | 积分 | Token |`);
   L.push(`|--:|:--|:--|:--|:--|--:|--:|`);
   s.top.forEach((x,i) => L.push(
-    `| ${i+1} | \`${x.id}\` | ${x.model} | ${x.client} | ${x.date} ${pad(x.hour)}:${pad(x.min)} | ${fmt2(x.points)} | ${x.token ? fmtTok(x.token.tot) : '—'} |`));
+    `| ${i+1} | \`${x.id}\` | ${rowModelKey(x)} | ${x.client} | ${x.date} ${pad(x.hour)}:${pad(x.min)} | ${fmt2(x.points)} | ${x.token ? fmtTok(x.token.tot) : '—'} |`));
   L.push('');
   // 六章之后是条件章节，编号交给计数器，避免跳过时出现「五 → 七」这种断号
   const CN = ['','一','二','三','四','五','六','七','八','九','十'];
@@ -3843,7 +3953,9 @@ const OfficialBill = (() => {
         // 账号归属只可能来自账单侧：本地 jsonl 里没有账号标识
         acct: uids[r[5]] || '',
         // 机器归属（云同步）：第 7 位。旧数据没有这一位，读成 undefined 归为空串
-        mch: r[6] || ''
+        mch: r[6] || '',
+        // 有账单记录 = 走的是官方计费；自定义配置不经这里，所以来源可推定官方
+        billed: true
       });
     }
     return out;
@@ -4468,7 +4580,7 @@ const LocalScan = (() => {
 
       let t = acc[key];
       if(!t) t = acc[key] = { n:0, in:0, out:0, cr:0, cc:0, tot:0, t0:0, t1:0,
-                              m:'', s:d.sessionId || '', src:'本地目录', p:d.cwd || '',
+                              m:'', rm:'', s:d.sessionId || '', src:'本地目录', p:d.cwd || '',
                               best:-1, d:[], lat:0, latn:0 };
       if(!t.d) t.d = [];
       if(!t.lat){ t.lat = 0; }
@@ -4483,7 +4595,7 @@ const LocalScan = (() => {
       if(lat > 0){ t.lat += lat; t.latn++; }
 
       if(ms){ if(!t.t0 || ms < t.t0) t.t0 = ms; if(ms > t.t1) t.t1 = ms; }
-      if(tot > t.best){ t.best = tot; t.m = pd.model || 'unknown'; }
+      if(tot > t.best){ t.best = tot; t.m = pd.model || 'unknown'; t.rm = pd.requestModelId || ''; }
 
       const idx = t.d.length;
       // 第 6 位是本次请求的模型耗时 ms（0 = 无法推算）
@@ -4554,6 +4666,9 @@ function attachTokens(rows){
       // 机器归属的双保险：账单行没有第 7 位时（旧产物 / 手工导入的 Excel），
       // 用关联到的回合补上，免得按机器筛选时这一行被当成「未标注」
       if(!r.mch && t.mch) r.mch = t.mch;
+      // 模型来源同理：账单接口只给服务端型号名，不带 requestModelId，
+      // 唯一线索就是同源的本地回合
+      if(!r.rm && t.rm) r.rm = t.rm;
     }
     else { r.token = null; miss++; }
   }
@@ -4774,7 +4889,8 @@ const chipHtml = (type, val, label, on) =>
   `<button class="chip${on ? ' on' : ''}" data-type="${type}" data-val="${esc(val)}">${esc(label)}</button>`;
 
 function renderChips(){
-  const models  = [...new Set(state.all.map(x => x.model))].sort();
+  const models  = [...new Set(state.all.map(rowModelKey))].sort();
+  const sources = [...new Set(state.all.map(x => rowSource(x)))].sort();
   const clients = [...new Set(state.all.map(x => x.client))].sort();
   const accts   = [...new Set(state.all.map(x => x.acct || ''))].sort();
   const machines = [...new Set(state.all.map(x => x.mch || ''))].sort();
@@ -4799,6 +4915,16 @@ function renderChips(){
 
   $('modelChips').innerHTML =
     (shown.map(m => chipHtml('model', m, m, state.filters.models.has(m))).join('') + more) || empty;
+
+  // 来源 chip：只有「数据里真能区分来源」时才出现（老数据全是未知，铺一个孤零零的
+  // 「未知」按钮只会让人困惑）。顺序固定为 官方 → 自定义 → 未知，便于扫读。
+  const srcOrder = ['builtin', 'custom', 'unknown'];
+  const srcs = srcOrder.filter(k => sources.includes(k));
+  $('sourceChips').innerHTML = srcs.length > 1
+    ? srcs.map(k => chipHtml('source', k, MODEL_SOURCE[k].label, state.filters.sources.has(k))).join('')
+    : '';
+  const sGroup = $('sourceChips').closest('.fgroup');
+  if(sGroup) sGroup.hidden = srcs.length <= 1;
 
   $('clientChips').innerHTML = clients.map(c =>
     chipHtml('client', c, c, state.filters.clients.has(c))
@@ -4827,6 +4953,7 @@ function renderChips(){
     if(g) g.classList.toggle('grp-empty', !has);
   };
   markEmpty('modelChips',  state.filters.models.size  > 0);
+  markEmpty('sourceChips', state.filters.sources.size > 0);
   markEmpty('clientChips', state.filters.clients.size > 0);
   markEmpty('acctChips',   state.filters.accounts.size > 0);
   markEmpty('machineChips', state.filters.machines.size > 0);
@@ -4983,6 +5110,7 @@ function bindChips(){
 
     const {type, val} = b.dataset;
     const set = type === 'model'   ? state.filters.models
+              : type === 'source'  ? state.filters.sources
               : type === 'acct'    ? state.filters.accounts
               : type === 'machine' ? state.filters.machines
               : state.filters.clients;
@@ -4991,6 +5119,7 @@ function bindChips(){
     render();
   };
   $('modelChips').addEventListener('click', handler);
+  $('sourceChips').addEventListener('click', handler);
   $('clientChips').addEventListener('click', handler);
   $('acctChips').addEventListener('click', handler);
   $('machineChips').addEventListener('click', handler);
@@ -5076,12 +5205,16 @@ const Persist = (() => {
   const get   = id   => tx('readonly',  s => s.get(id));
 
   const serialize = rows => rows.map(r => ({
-    i: r.id, p: r.points, m: r.model, c: r.client, t: r.time.getTime()
+    i: r.id, p: r.points, m: r.model, c: r.client, t: r.time.getTime(),
+    // 模型来源标识：不存就会在恢复快照后丢掉，同名模型又被合并成一行
+    rm: r.rm || '',
+    // 是否走过官方计费：来源推定要用它（有账单 = 官方内置）
+    b: r.billed ? 1 : 0
   }));
   const deserialize = raw => raw.map(r => {
     const time = new Date(r.t);
-    return { id:r.i, points:r.p, model:r.m, client:r.c, time,
-             date: fmtDate(time), hour: time.getHours(), min: time.getMinutes() };
+    return { id:r.i, points:r.p, model:r.m, client:r.c, time, rm:r.rm || '',
+             billed: !!r.b, date: fmtDate(time), hour: time.getHours(), min: time.getMinutes() };
   });
 
   /* 自动槽：固定 id，覆盖式 —— 合并后的完整数据集 */
@@ -5184,8 +5317,9 @@ function persistFilters(){
     Persist.saveMeta({
       filters: {
         // 日期范围刻意不存：看板每次打开都回到 DEFAULT_RECENT_DAYS 的默认窗口，
-        // 只有模型 / 客户端 / 机器筛选沿用上次
+        // 只有模型 / 来源 / 客户端 / 机器筛选沿用上次
         models:  [...state.filters.models],
+        sources: [...state.filters.sources],
         clients: [...state.filters.clients],
         machines: [...state.filters.machines]
       }
@@ -5210,11 +5344,13 @@ function applyDataset(rows, sheet, fileName){
   $('srcName').textContent = state.fileName ? `· ${state.fileName}` : '';
 
   // 只清理已不存在的筛选项，保留用户当前选择
-  const validModels  = new Set(rows.map(x => x.model));
+  const validModels  = new Set(rows.map(rowModelKey));
+  const validSources = new Set(rows.map(x => rowSource(x)));
   const validClients = new Set(rows.map(x => x.client));
   const validAccts   = new Set(rows.map(x => x.acct || ''));
   const validMachines = new Set(rows.map(x => x.mch || ''));
   state.filters.models   = new Set([...state.filters.models  ].filter(m => validModels.has(m)));
+  state.filters.sources  = new Set([...state.filters.sources ].filter(s => validSources.has(s)));
   state.filters.clients  = new Set([...state.filters.clients ].filter(c => validClients.has(c)));
   state.filters.accounts = new Set([...state.filters.accounts].filter(a => validAccts.has(a)));
   state.filters.machines = new Set([...state.filters.machines].filter(m => validMachines.has(m)));
@@ -5263,6 +5399,7 @@ async function tryRestore(){
       // 日期范围不在此列（见 persistFilters）：留着 applyDataset 给的默认窗口，
       // 让看板每次都从「近 N 天」开始，而不是停在上次调过的范围
       (f.models  || []).forEach(m => state.filters.models.add(m));
+      (f.sources || []).forEach(s => state.filters.sources.add(s));
       (f.clients || []).forEach(c => state.filters.clients.add(c));
       (f.machines || []).forEach(m => state.filters.machines.add(m));
       render();
@@ -5315,7 +5452,11 @@ async function mergeOfficialBill(){
         min: time.getMinutes(),
         acct: '',
         // 机器归属（云同步）：回合带 mch 就用它；没有就归「未标注」
-        mch: v.mch || ''
+        mch: v.mch || '',
+        // 模型来源：这些行天生就是「回合有、账单无」，来源标识直接取回合上的
+        rm: v.rm || '',
+        // 没被官方计费 = 走的是本地直达，来源只能取回合上的 rm（缺则未知）
+        billed: false
       };
       row.token = v;
       res.rows.push(row);
