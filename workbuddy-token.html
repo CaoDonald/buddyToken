@@ -405,15 +405,6 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
   display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;
   background:#e7f8f1;color:#0b8a63;
 }
-/* 模型来源徽标：贴在模型名后面，一个字（官/自）加颜色就够辨认。
-   不换行——模型名长时让名字省略，徽标必须始终可见 */
-.src-tag{
-  display:inline-block;margin-left:4px;padding:0 4px;border-radius:4px;
-  font-size:10px;font-weight:700;line-height:14px;vertical-align:1px;white-space:nowrap;
-}
-.src-builtin{background:#eef2fd;color:#4a63c9}
-.src-custom {background:#f3edff;color:#7048d6}
-.src-unknown{background:#f0f2f6;color:#93a0b8}
 /* 单元格内嵌走势：数字在上、走势线在下撑满格子，hover 出分桶说明。
    线用 viewBox 100×18 横向拉伸到列宽，vector-effect 保证线宽不随拉伸变形 */
 .cellwrap{display:flex;flex-direction:column;align-items:flex-end;gap:2px;width:100%}
@@ -1000,9 +991,7 @@ function parseSheetRows(rows){
       id: id || '-', points,
       model:  model  || '未知模型',
       client: client || '未知客户端',
-      time, date: fmtDate(time), hour: time.getHours(), min: time.getMinutes(),
-      // 手工导入的账单同样走过官方计费，来源可推定官方（见 rowSource）
-      billed: true
+      time, date: fmtDate(time), hour: time.getHours(), min: time.getMinutes()
     });
   }
   return out;
@@ -1078,68 +1067,44 @@ function mergeByRequestId(oldRows, newRows){
  * 官方账单未关联到本地回合）一律归「未知」，不猜。
  * =======================================================*/
 const MODEL_SOURCE = {
-  custom: { key: 'custom', label: '自定义', short: '自', title: '来自本机 ~/.codebuddy/models.json 的自定义模型配置' },
-  builtin:{ key: 'builtin', label: '官方',   short: '官', title: 'CodeBuddy 内置模型（走官方计费）' },
-  unknown:{ key: 'unknown', label: '未知',   short: '?',  title: '没有来源标识：旧产物、手工导入的 Excel，或未关联到本地会话的账单行' },
+  custom: { key: 'custom',  label: '自定义', title: '来自本机 ~/.codebuddy/models.json 的自定义模型配置' },
+  builtin:{ key: 'builtin', label: '官方',   title: 'CodeBuddy 内置模型（走官方计费）' },
 };
 
-/** requestModelId → 来源键。空值即未知，不做推测。 */
-function modelSourceOf(rm){
-  const s = String(rm || '').trim();
-  if(!s) return 'unknown';
-  return /^custom-local:/i.test(s) ? 'custom' : 'builtin';
-}
-
 /**
- * 行的来源键（优先行上带下来的 rm，退回关联回合的 rm）。
+ * 行的来源键：只有两种。自定义配置发出的请求带 `custom-local:` 前缀，
+ * 其余一律算官方——内置是默认情况，没标识不等于「未知」。
  *
- * 拿不到 rm 但有官方计费记录（billed）的，可推定是官方内置模型：自定义配置
- * 走本地直达、不经官方计费，账单里永远不会有它——2026-11-20 实测 20827 条账单
- * 行中能反查到 rm 的 7007 条里 custom-local 为 0 条，这条互斥关系成立。
- * 这个推定能覆盖绝大部分历史账单行（老产物没有 rm 字段），比一律标「未知」有用。
+ * 历史记录缺 rm（老产物没这个字段）时也归官方，与「默认不加后缀」一致。
  */
 function rowSource(x){
   const rm = x.rm || (x.token && x.token.rm);
-  if(String(rm || '').trim()) return modelSourceOf(rm);
-  if(x.billed) return 'builtin';
-  return 'unknown';
+  return /^custom-local:/i.test(String(rm || '').trim()) ? 'custom' : 'builtin';
 }
 
 /**
- * 聚合/筛选用的模型键 = 展示名（模型名 + 来源后缀）。
+ * 聚合/筛选用的模型键 = 展示名。
  *
- * 同名模型的官方版与自定义版必须分成两组，否则「每积分 Token」这类比率会被
- * 两边混在一起算（自定义走本地直达、积分恒为 0，混进去就成了免费模型）。
- * 让键本身就是展示名，各渲染处直接当模型名用，不必各自翻译一次。
- * 来源未知时退回原名，与历史数据保持可比。
+ * 官方内置是默认情况，不加任何后缀；只有自定义才标「（自定义）」——
+ * 两个同名模型因此仍分成两组（「deepseek-v4-flash」与
+ * 「deepseek-v4-flash（自定义）」），但日常看得最多的官方名字不会被拉长。
  *
  * 名字先去首尾空白：jsonl 里的 model 偶有尾随空格（实测见过 `hy3 `），
- * 不归一化会让同一个模型分成两个键、后缀也挂着空格。
+ * 不归一化会让同一个模型分成两个键。
  */
 const rowModelKey = x => {
   const name = String(x.model || '').trim();
-  const src = rowSource(x);
-  return src === 'unknown' ? name : `${name}（${MODEL_SOURCE[src].label}）`;
+  return rowSource(x) === 'custom' ? `${name}（自定义）` : name;
 };
 
-/** 来源小徽标（表格里用的紧凑形态）。src 是 MODEL_SOURCE 的键。 */
-function sourceTag(src){
-  const m = MODEL_SOURCE[src] || MODEL_SOURCE.unknown;
-  return `<span class="src-tag src-${src}" title="${esc(m.title)}">${m.short}</span>`;
-}
-
 /**
- * 模型名 + 来源徽标。key 是聚合键（含「（官方）/（自定义）」后缀），
- * 后缀即来源，剥掉后用徽标代替——一列里既有名字又有一眼可辨的来源，
- * 不用把后缀文字重复念一遍。未知来源不挂徽标。
+ * 模型名渲染成 pill。自定义用紫色，与官方的蓝色一眼可分——名字里已经写了
+ * 「（自定义）」，不再额外挂徽标。
  */
 function modelPill(key){
   const name = String(key || '').trim();
-  const src = /（自定义）$/.test(name) ? 'custom'
-            : /（官方）$/.test(name)   ? 'builtin' : 'unknown';
-  if(src === 'unknown') return `<span class="pill">${esc(name)}</span>`;
-  const base = name.replace(/\s*（(?:自定义|官方)）$/, '');
-  return `<span class="pill">${esc(base)}${sourceTag(src)}</span>`;
+  const custom = /（自定义）$/.test(name);
+  return `<span class="pill${custom ? ' p' : ''}">${esc(name)}</span>`;
 }
 
 /* =========================================================
@@ -1386,13 +1351,6 @@ function computeStats(d){
   const count = d.length;
   const byModel  = agg(d, rowModelKey);
 
-  // 模型键 → 来源。键里已经带了「（官方）/（自定义）」后缀，同键来源必然唯一，
-  // 这里只是把它取出来供渲染来源徽标用。
-  const srcByKey = new Map();
-  for(const x of d){
-    const k = rowModelKey(x);
-    if(!srcByKey.has(k)) srcByKey.set(k, rowSource(x));
-  }
   const byClient = agg(d, x => x.client);
   const byDate   = agg(d, x => x.date);
   const byHour   = agg(d, x => x.hour);
@@ -3953,9 +3911,7 @@ const OfficialBill = (() => {
         // 账号归属只可能来自账单侧：本地 jsonl 里没有账号标识
         acct: uids[r[5]] || '',
         // 机器归属（云同步）：第 7 位。旧数据没有这一位，读成 undefined 归为空串
-        mch: r[6] || '',
-        // 有账单记录 = 走的是官方计费；自定义配置不经这里，所以来源可推定官方
-        billed: true
+        mch: r[6] || ''
       });
     }
     return out;
@@ -4897,29 +4853,57 @@ function renderChips(){
 
   const empty = '<span style="color:#a8b3c8;font-size:12px">—</span>';
 
-  // 模型动辄十几个，全铺开会折行——点「+N」铺开：先填满当前行、装不下的下一行。
-  // 默认只留一行的量，但「已选中」的必须始终露在外面——否则用户看不到自己选了
-  // 什么，再点一下就莫名取消了。
-  const LIMIT = 8;
-  let shown = models;
-  if(!modelsOpen && models.length > LIMIT){
-    const picked = models.filter(m => state.filters.models.has(m));
-    const rest   = models.filter(m => !state.filters.models.has(m));
-    shown = [...picked, ...rest.slice(0, Math.max(0, LIMIT - picked.length))];
+// 模型动辄几十个，全铺开会折行——默认只填满**当前一行**，其余收进「+N」，
+// 点开才铺成多行。已选中的必须始终露在外面，否则用户看不到自己选了什么，
+// 再点一下就莫名取消了。
+//
+// 判断「装得下几个」按实际宽度累加，不能写死条数：模型名长短差别极大
+// （`hy3` 与 `deepseek-v4-flash-0731-0112zuiixin（自定义）` 差十倍），
+// 固定条数必然要么留大片空白、要么折成两行。
+const box = $('modelChips');
+const avail = box && box.clientWidth ? box.clientWidth : 0;
+// 估算单个 chip 的渲染宽度：内边距 12px×2 + 边框 1px×2，再加文字宽度
+// （中文按字号计、ASCII 约 0.55 倍字号；实测 12px 字体下这个比例够准）
+const chipWidth = label => {
+  let w = 26;
+  for(const ch of String(label)){
+    w += /[\u4e00-\u9fa5\uff08\uff09]/.test(ch) ? 12 : 6.6;
   }
+  return w;
+};
+const gap = 6;
+let shown = models;
+if(!modelsOpen && models.length > 1){
+  const picked = models.filter(m => state.filters.models.has(m));
+  const rest   = models.filter(m => !state.filters.models.has(m));
+  const order  = [...picked, ...rest];   // 已选的排前面，优先露出
+  const fits = [];
+  let used = 0;
+  // 「+N」按钮本身要占位，先按最宽的两位数字预留
+  const moreW = chipWidth('+99') + gap;
+  for(let i = 0; i < order.length; i++){
+    const w = chipWidth(order[i]) + (fits.length ? gap : 0);
+    // 留出「+N」的位置：若装不下全部，后面的都要进 +N
+    const isLast = i === order.length - 1;
+    if(avail && used + w + (isLast ? 0 : moreW) > avail) break;
+    fits.push(order[i]);
+    used += w;
+  }
+  // 容器宽度拿不到（尚未布局）或一个都装不下时，退回固定条数兜底
+  shown = fits.length ? fits : order.slice(0, 8);
+}
   const hiddenCnt = models.length - shown.length;
   const more = hiddenCnt > 0
     ? `<button class="chip chip-more" data-chips="more" title="展开其余 ${hiddenCnt} 个模型">+${hiddenCnt}</button>`
-    : (modelsOpen && models.length > LIMIT
+    : (modelsOpen && models.length > 1
         ? '<button class="chip chip-more" data-chips="less" title="收起模型列表">收起</button>' : '');
 
   $('modelChips').innerHTML =
     (shown.map(m => chipHtml('model', m, m, state.filters.models.has(m))).join('') + more) || empty;
 
-  // 来源 chip：只有「数据里真能区分来源」时才出现（老数据全是未知，铺一个孤零零的
-  // 「未知」按钮只会让人困惑）。顺序固定为 官方 → 自定义 → 未知，便于扫读。
-  const srcOrder = ['builtin', 'custom', 'unknown'];
-  const srcs = srcOrder.filter(k => sources.includes(k));
+  // 来源 chip：只有「两种来源都真的出现过」时才有意义（全是官方时铺一个
+// 孤零零的「官方」按钮只是噪音）。顺序固定 官方 → 自定义。
+  const srcs = ['builtin', 'custom'].filter(k => sources.includes(k));
   $('sourceChips').innerHTML = srcs.length > 1
     ? srcs.map(k => chipHtml('source', k, MODEL_SOURCE[k].label, state.filters.sources.has(k))).join('')
     : '';
@@ -5207,14 +5191,12 @@ const Persist = (() => {
   const serialize = rows => rows.map(r => ({
     i: r.id, p: r.points, m: r.model, c: r.client, t: r.time.getTime(),
     // 模型来源标识：不存就会在恢复快照后丢掉，同名模型又被合并成一行
-    rm: r.rm || '',
-    // 是否走过官方计费：来源推定要用它（有账单 = 官方内置）
-    b: r.billed ? 1 : 0
+    rm: r.rm || ''
   }));
   const deserialize = raw => raw.map(r => {
     const time = new Date(r.t);
     return { id:r.i, points:r.p, model:r.m, client:r.c, time, rm:r.rm || '',
-             billed: !!r.b, date: fmtDate(time), hour: time.getHours(), min: time.getMinutes() };
+             date: fmtDate(time), hour: time.getHours(), min: time.getMinutes() };
   });
 
   /* 自动槽：固定 id，覆盖式 —— 合并后的完整数据集 */
@@ -5454,9 +5436,7 @@ async function mergeOfficialBill(){
         // 机器归属（云同步）：回合带 mch 就用它；没有就归「未标注」
         mch: v.mch || '',
         // 模型来源：这些行天生就是「回合有、账单无」，来源标识直接取回合上的
-        rm: v.rm || '',
-        // 没被官方计费 = 走的是本地直达，来源只能取回合上的 rm（缺则未知）
-        billed: false
+        rm: v.rm || ''
       };
       row.token = v;
       res.rows.push(row);
