@@ -283,6 +283,10 @@ async function handleSync(req, res) {
   }
   // 用户主动操作的痕迹：云同步定时器会避开这段时间（见 USER_GRACE_MS）
   lastUserSyncAt = Date.now();
+  // 计时起点必须在这里取，不能放进 runSync：下面可能要先等云同步让出锁，
+  // 那段等待同样是用户实打实的等待时间。放在 runSync 内部会让 toast 上的
+  // 秒数只反映子进程耗时，用户体感 20 秒、界面显示 2 秒（2026-11-24 踩过）。
+  const requestStartedAt = Date.now();
 
   // body 可选：{ uid } 表示只刷新该账号（看板账号卡片上的「刷新」按钮）。
   // 读出与校验放在抢锁之前——它们不碰数据文件，失败时也不白占锁
@@ -298,14 +302,15 @@ async function handleSync(req, res) {
   }
 
   if (syncing) {
-    // 云同步是后台任务，晚一轮毫无影响——排队等它让出锁，不让用户看到失败；
-    // 只有在跑的是另一个「手动同步」时才直接拒绝（连点场景，等也等不出结果）
-    if (!cloudRunning) {
-      json(res, 409, { ok: false, error: '已有同步进行中，请稍候' });
-      return;
+    // 云同步是后台任务，用户优先：直接掐掉它，而不是让用户排在后面等。
+    // 云同步是幂等增量合并，掐掉只损失已发出的流量，下一轮周期会补上。
+    if (cloudRunning) {
+      abortCloudSync();
+      await waitSyncLockFree(3000);   // 等它真正退出，通常毫秒级
     }
-    if (!(await waitSyncLockFree(SYNC_LOCK_WAIT_MS))) {
-      json(res, 409, { ok: false, error: '已有同步进行中，请稍候再试' });
+    // 掐完还没放锁，说明跑的是另一个「手动同步」（连点场景），直接拒绝
+    if (syncing) {
+      json(res, 409, { ok: false, error: '已有同步进行中，请稍候' });
       return;
     }
   }
@@ -315,6 +320,8 @@ async function handleSync(req, res) {
   let syncOk = false;
   try {
     const result = await runSync(part === 'all' ? undefined : part, uid);
+    // 覆盖成「从用户点下去」的真实耗时，包含前面等锁的时间
+    result.elapsedMs = Date.now() - requestStartedAt;
     syncOk = result.ok;
     json(res, result.ok ? 200 : 500, result);
   } catch (e) {
@@ -919,9 +926,21 @@ const CLOUD_SYNC_TIMEOUT_MS = 10 * 60 * 1000;
  * 主进程里改 process.env 已经太晚（实测运行时设了照样 ECONNRESET）。
  * 顺带也与 /api/sync 跑 report 的方式一致。
  */
+/**
+ * 云同步子进程句柄：用户点同步时要能立刻掐掉它。
+ *
+ * 云同步每轮 10-40 秒且占着同一把 syncing 锁。早先的策略是「用户请求排队等它
+ * 让出」，等锁时间最多 60 秒，而 toast 上的秒数只统计子进程——用户体感 20 秒、
+ * 界面显示 2 秒，看着像在骗人（2026-11-24 实测确认）。
+ *
+ * 现在的策略：用户一发起同步就 abort 掉在跑的云同步。云同步是幂等的增量合并，
+ * 中途被掐只损失已发出的那部分流量，下一轮（15 分钟周期）会重推补齐，没有副作用。
+ */
+let cloudChild = null;
+
 function runCloudSyncProcess(cfg) {
   return new Promise((resolve) => {
-    execFile(
+    const child = execFile(
       process.execPath,
       [path.join(ROOT, 'cloud-sync.js')],
       {
@@ -930,9 +949,26 @@ function runCloudSyncProcess(cfg) {
         maxBuffer: 4 * 1024 * 1024,
         env: (cfg && cfg.proxy) ? cloudSync.proxyEnv(cfg) : process.env,
       },
-      (err, stdout, stderr) => resolve({ err, stdout: stdout || '', stderr: stderr || '' })
+      (err, stdout, stderr) => {
+        cloudChild = null;
+        resolve({ err, stdout: stdout || '', stderr: stderr || '' });
+      }
     );
+    cloudChild = child;
   });
+}
+
+/**
+ * 掐掉正在跑的云同步（用户发起手动同步时调用）。
+ * 没在跑就什么都不做。返回是否真的掐了一个。
+ */
+function abortCloudSync() {
+  if (!cloudChild) return false;
+  try {
+    cloudChild.kill();
+  } catch { /* 已经退出，忽略 */ }
+  cloudChild = null;
+  return true;
 }
 
 /**
@@ -956,10 +992,14 @@ async function runCloudTask() {
 
     // 子进程把结果写在自己维护的 sync-state.json 里（含本轮新增条数与时间）
     const st = cloudSync.loadState();
-    if (err) {
+    if (err && err.killed) {
+      // 被用户的手动同步掐掉了，不是故障。不记 lastRunAt：下一轮周期会照常补推。
+      cloudState.lastResult = '已让路（用户手动同步打断，下轮补推）';
+      console.log('[cloud] \u21bb ' + cloudState.lastResult);
+    } else if (err) {
       const lastErr = (stderr || '').trim().split(/\r?\n/).filter(Boolean).pop() || '';
       cloudState.lastRunAt = Date.now();   // 失败也等一个完整周期再试，免得每 30 秒刷屏
-      cloudState.lastResult = 'failed: ' + (err.killed ? '同步超时' : (lastErr || err.message));
+      cloudState.lastResult = 'failed: ' + (lastErr || err.message);
       console.warn('[cloud] \u2717 ' + cloudState.lastResult);
     } else {
       cloudState.lastRunAt = st.lastRunAt || Date.now();

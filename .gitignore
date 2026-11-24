@@ -4,6 +4,7 @@ token-usage-detail.csv
 token-usage-summary.md
 credit-history.json
 checkin-history.json
+scan-state.json
 
 # 自动化开关配置（四个自动任务的开关状态，纯布尔偏好，不入库）
 auto-config.json
@@ -35,6 +36,13 @@ _timerange.js
 _verify*.py
 _analyze*.py
 _timematch.py
+_perf*.js
+_perf_out/
+
+# 改动前的本地备份（带日期后缀）
+*.bak
+*.bak[0-9]*
+vendor_tmp/
 
 # 浏览器调试工具产物
 .playwright-cli/

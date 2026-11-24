@@ -4,8 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>积分消耗看板</title>
-<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<!-- 第三方库改走本地 vendor/：jsDelivr 在公司网络下被 TLS 阻断，浏览器每个脚本
+     要各自等 ~15 秒超时，首屏因此卡 30 秒。本地文件没有网络依赖，断网也能用。 -->
+<script src="vendor/xlsx.full.min.js"></script>
+<script src="vendor/chart.umd.js"></script>
 <style>
 :root{
   --bg:#f4f6fb; --card:#fff; --text:#182135; --muted:#6b7891;
@@ -4764,38 +4766,31 @@ async function runServerSyncAll(btn){
   }
 
   btn.disabled = true;
-  const steps = [
-    { part:'credits', name:'积分',  txt:'⏳ 积分…' },
-    { part:'tokens',  name:'Token', txt:'⏳ Token…' },
-  ];
-  const done = [];
+  // 一次请求跑完：服务端以 part=all 走主流程，一次扫描同时产出 Token 与账单。
+  // 早先是「先 credits 再 tokens」两发，而 --only=credits 本身就会顺带重扫本地，
+  // 于是本地那 1700+ 个会话文件被完整读了两遍——实测 8.3s + 4.6s，后 4.6s 纯属白扫。
+  btn.textContent = '⏳ 同步中…';
+  setSaveState('saving', '正在同步积分与 Token…');
 
-  for(const s of steps){
-    btn.textContent = s.txt;
-    setSaveState('saving', `正在同步${s.name}…`);
-    const r = await ServerSync.run(s.part);
-    if(!r.ok){
-      btn.disabled = false;
-      btn.textContent = label;
-      toast(r.busy ? '已有同步正在进行，请稍候再试'
-                   : `${s.name}同步失败：` + (r.error || '未知错误'));
-      setSaveState('saved', r.busy ? '其他同步进行中，稍候再试' : `${s.name}同步失败，数据未更新`);
-      return;                    // 前一步失败就不跑下一步，避免半套数据
-    }
-    done.push(r);
-  }
-
+  const r = await ServerSync.run();
   btn.disabled = false;
   btn.textContent = label;
 
+  if(!r.ok){
+    toast(r.busy ? '已有同步正在进行，请稍候再试'
+                 : '同步失败：' + (r.error || '未知错误'));
+    setSaveState('saved', r.busy ? '其他同步进行中，稍候再试' : '同步失败，数据未更新');
+    return;
+  }
+
   await syncTokens({});          // 重新加载刚生成的数据文件
 
-  const secs = (done.reduce((a, r) => a + (r.elapsedMs || 0), 0) / 1000).toFixed(1);
-  const cm = done[0].meta || {}, tm = done[1].meta || {};
-  toast(`一键同步完成 · 累计账单 ${fmt0(cm.billRows || 0)} 条 / ` +
-    `${cm.accountCount || cm.accounts} 个账号 · ` +
-    `本地回合 ${fmt0(tm.turns)} · 耗时 ${secs}s` +
-    ((cm.errors && cm.errors.length) ? `（${cm.errors.length} 个账号拉取失败）` : ''));
+  const secs = ((r.elapsedMs || 0) / 1000).toFixed(1);
+  const m = r.meta || {};
+  toast(`一键同步完成 · 累计账单 ${fmt0(m.billRows || 0)} 条 / ` +
+    `${m.accountCount || m.accounts} 个账号 · ` +
+    `本地回合 ${fmt0(m.turns)} · 耗时 ${secs}s` +
+    ((m.errors && m.errors.length) ? `（${m.errors.length} 个账号拉取失败）` : ''));
   setSaveState('saved', `一键同步完成 · ${secs}s`);
 }
 

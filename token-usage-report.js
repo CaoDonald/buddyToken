@@ -46,8 +46,9 @@
  *
  * 清空数据（--reset）
  *   删除本脚本产出的全部数据文件，回到「从未同步过」的状态：
- *     token-usage-data.js / token-usage-detail.csv / token-usage-summary.md
+ *     token-usage-data.js / token-usage-summary.md
  *     credit-history.json（余额趋势）/ checkin-history.json（签到纪录）
+ *     token-usage-detail.csv —— 已停止生成，清单里保留它是为了能清掉历史遗留
  *   只按这份固定清单删除，不使用通配符。以下内容不受影响：
  *     · switch-backups/ —— 账号切换的凭证备份，删了就没法回滚
  *     · 手工导入的 *.xlsx 账单、项目里其它任何文件
@@ -141,12 +142,6 @@ function hbar(v, vmax, width = 28) {
   return '#'.repeat(Math.max(k, v > 0 ? 1 : 0));
 }
 
-/** CSV 字段转义：含逗号 / 引号 / 换行的字段加双引号 */
-function esc(v) {
-  const s = v === null || v === undefined ? '' : String(v);
-  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-}
-
 // ---------------------------------------------------------------- 汇总收集
 
 /**
@@ -220,29 +215,96 @@ async function scanFilesParallel(files, count) {
   });
 }
 
-async function collect(since) {
+/**
+ * 增量扫描基准：本机上一次同步时记下的「扫描截止时刻」。
+ *
+ * 为什么需要它：会话目录里有 1700+ 个 jsonl、合计 1 GB 以上，但绝大多数是
+ * 几周前就不再变动的老会话。每轮同步把它们全部重读一遍纯属浪费——实测
+ * 全量扫 4.6 秒、按 mtime 跳过老文件后不到 1 秒。
+ *
+ * 安全边界（这是整块改造的关键）：
+ *   · 老文件不会被「追加写入」。客户端一个会话写一个 .jsonl，会话结束就不再
+ *     碰它；因此 mtime 早于上次同步的文件，内容一定没变，跳过它不会丢数据。
+ *   · 基准取「上次同步的开始时刻 - 安全余量」，而不是「此刻 - N 天」：
+ *     隔了三天才同步一次也不会漏掉中间那两天的会话。余量用来兜住
+ *     「文件在扫描过程中被写入」的边界情况。
+ *   · 拿不到基准（首次运行、状态文件被删、时钟回拨）时退回全量扫描，
+ *     行为与改造前完全一致，绝不因为增量而少扫。
+ */
+const SCAN_STATE_FILE = 'scan-state.json';
+/** 安全余量：把基准往前多推 10 分钟，覆盖扫描本身耗时与文件系统时间精度。 */
+const SCAN_SAFETY_MS = 10 * 60 * 1000;
+/** 增量基准的最长有效期（天）。超过它就不再信任 mtime，强制全量对账一次。 */
+const SCAN_BASE_MAX_DAYS = 30;
+
+function scanStatePath(outdir) {
+  return path.join(outdir, SCAN_STATE_FILE);
+}
+
+/**
+ * 读出上次扫描截止时刻（毫秒）。拿不到或不可信时返回 0（= 走全量）。
+ * outdir 为空（--only=credits 之类不落盘扫描状态的路径）同样返回 0。
+ */
+function loadScanBase(outdir) {
+  if (!outdir) return 0;
+  let st;
+  try {
+    st = JSON.parse(fs.readFileSync(scanStatePath(outdir), 'utf8'));
+  } catch {
+    return 0;
+  }
+  const base = Number(st && st.lastScanEnd) || 0;
+  if (!base) return 0;
+  // 时钟回拨（基准在未来）不可信；搁置太久也不可信——期间可能整目录被搬动过
+  if (base > Date.now()) return 0;
+  if (Date.now() - base > SCAN_BASE_MAX_DAYS * 86400000) return 0;
+  return base;
+}
+
+function saveScanBase(outdir, value) {
+  if (!outdir) return;
+  try {
+    fs.writeFileSync(scanStatePath(outdir), JSON.stringify({
+      lastScanEnd: value,
+      updatedAt: new Date(value).toISOString(),
+    }, null, 2), 'utf8');
+  } catch { /* 写不了就算了，下一轮退回全量，不影响正确性 */ }
+}
+
+async function collect(since, opts) {
   const allReqs = [];
   const allTurns = [];
   const allTitles = new Map();   // sessionId → 会话标题（不受 --since 影响）
   const stats = [];
 
+  // 增量基准：只重扫 mtime 晚于它的文件。0 = 全量（首次 / 状态不可信）。
+  // opts.full / opts.noCache 可用命令行强制全量，排障时用得上。
+  const scanBase = (opts && (opts.full || opts.noCache)) ? 0 : loadScanBase(opts && opts.outdir);
+
   const needs = [];
+  let skipped = 0;
   for (const s of SOURCES) {
     if (!fs.existsSync(s.base)) continue;
     const files = walk(s.base);
     let nbytes = 0;
     for (const f of files) {
-      let sz = 0;
+      let st;
       try {
-        sz = fs.statSync(f).size;
+        st = fs.statSync(f);
       } catch {
         continue;
       }
-      nbytes += sz;
-      if (sz === 0) continue;
+      nbytes += st.size;
+      if (st.size === 0) continue;
+      // 增量：mtime 早于上次扫描截止时刻的老文件，内容不会再变，直接跳过
+      if (scanBase && st.mtimeMs < scanBase) { skipped++; continue; }
       needs.push({ path: f, source: s.name });
     }
     stats.push({ name: s.name, base: s.base, files: files.length, bytes: nbytes, reqs: 0 });
+  }
+  if (scanBase) {
+    console.log(`  [本地] 增量扫描：待扫 ${needs.length} 个文件` +
+      (skipped ? `，跳过 ${skipped} 个未变动的老文件` : ''));
   }
 
   // 并行扫描（文件够多时），失败自动降级串行
@@ -280,7 +342,7 @@ async function collect(since) {
     st.reqs = uniq.filter((r) => r.source === st.name).length;
   }
 
-  return { allReqs, allTurns, stats, titles: allTitles };
+  return { allReqs, allTurns, stats, titles: allTitles, scanBase, skipped };
 }
 
 // ------------------------------------------------ 看板数据（按回合聚合）
@@ -719,6 +781,20 @@ function mergeOfficialData(prev, fresh, canMerge, partialUid) {
 const FULL_HISTORY_DAYS = 365;
 
 /**
+ * 常规同步的官方拉取窗口（天）。
+ *
+ * 取 2 而不是 7：账单是「拉回来就增量合并」的，窗口只需要覆盖「上次同步之后
+ * 又产生的新记录」，不需要覆盖一整周。实测 7 天窗口单账号 1.5 秒 × 3 个账号，
+ * 2 天窗口单账号约 0.5 秒，直接省掉三分之二。
+ *
+ * 为什么 2 天够用：schedule 是每 5-15 分钟一轮（intervalMinutes），正常情况
+ * 窗口内只有几十分钟的新数据；留 2 天是给「隔了一个周末没开电脑」留余量。
+ * 万一真有更长的空档，看板的「数据 X 小时前生成」会显示出来，用
+ * --official-days 显式补一次即可（拉回来的行会被增量合并永久保留）。
+ */
+const DEFAULT_OFFICIAL_DAYS = 2;
+
+/**
  * 官方数据拉取窗口：优先显式参数；账单还是空的（初始化）时取全量窗口；
  * 否则跟随本地扫描范围，最后兜底 7 天。
  *
@@ -729,7 +805,7 @@ function resolveOfficialDays(args, days, prevData) {
   if (args['official-days']) return parseInt(args['official-days'], 10);
   const prevBill = prevData && Array.isArray(prevData.bill) ? prevData.bill : [];
   if (!prevBill.length) return FULL_HISTORY_DAYS;
-  return days > 0 ? days : 7;
+  return days > 0 ? days : DEFAULT_OFFICIAL_DAYS;
 }
 
 /**
@@ -789,9 +865,11 @@ async function syncCreditsOnly({ outdir, jsOut, args, days, noMerge, uid, light 
   // 同名回合以本次扫描为准，本地已清理但历史同步过的回合原样保留。
   // 扫描失败不影响官方数据落盘（降级为只更新积分，回到旧行为）。
   let keptTurns = 0;
+  let scanStartAt = 0;
   try {
     const since = days > 0 ? new Date(Date.now() - days * 86400000) : null;
-    const { allReqs, titles } = await collect(since);
+    scanStartAt = Date.now();
+    const { allReqs, titles } = await collect(since, { outdir, full: !!args['full-scan'] });
     const local = buildTokenDataJs(allReqs, light, titles, cloud);
     if (noMerge) {
       data.t = local.t;
@@ -870,10 +948,14 @@ function resetDataFiles(outdir, jsOut) {
   const jsName = jsOut || 'token-usage-data.js';
   const targets = [
     path.isAbsolute(jsName) ? jsName : path.join(outdir, jsName),
+    // CSV 已停止生成，但历史版本留下的大文件仍要能清掉，故保留在清单里
     path.join(outdir, 'token-usage-detail.csv'),
     path.join(outdir, 'token-usage-summary.md'),
     path.join(outdir, 'credit-history.json'),
     path.join(outdir, 'checkin-history.json'),
+    // 增量扫描的基准：清空数据后必须一起清，否则下一轮会以为「老文件都扫过了」，
+    // 只增量补最近变动的几个文件，看板就只剩一小撮数据。
+    path.join(outdir, SCAN_STATE_FILE),
   ];
 
   const removed = [], missing = [];
@@ -931,6 +1013,7 @@ async function main() {
         only: { type: 'string' },
         uid: { type: 'string' },
         reset: { type: 'boolean' },
+        'full-scan': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
       },
     }).values;
@@ -1003,26 +1086,17 @@ async function main() {
     since = new Date(now.getTime() - days * 86400000);
   }
 
-  const { allReqs: reqs, allTurns: turns, stats, titles } = await collect(since);
+  // 记下「开始扫描」的时刻：下一轮增量以它为界。必须在 collect 之前取，
+  // 扫描期间新写入的文件其 mtime 可能早于结束时刻、晚于开始时刻，
+  // 用开始时刻当界能让它们下一轮必定被重扫，不会漏。
+  const scanStartAt = Date.now();
 
-  // ---------------------------------------------------------- 明细 CSV
+  const { allReqs: reqs, allTurns: turns, stats, titles } =
+    await collect(since, { outdir, full: !!args['full-scan'] });
+
+  // 明细 CSV 已取消：看板有「完整明细」卡片的导出按钮，能按当前筛选直接导出，
+  // 不必再往磁盘落一份 16 MB 的全量快照。reqs 仍需按时间排序，下面汇总报告要用。
   reqs.sort((a, b) => (a.time ? a.time.getTime() : 0) - (b.time ? b.time.getTime() : 0));
-
-  const csvPath = path.join(outdir, 'token-usage-detail.csv');
-  const lines = [];
-  lines.push(['时间', '来源', '模型', '项目目录', '会话ID', '回合ID', '请求ID', '类型', '工具',
-              '输入token', '输出token', '缓存读token', '缓存写token', '合计token',
-              '响应耗时ms'].join(','));
-  for (const r of reqs) {
-    lines.push([
-      fmtTime(r.time), r.source, r.model, r.project, r.session,
-      r.conversationRequestId, r.requestId,
-      r.kind, r.tool, r.inputTokens, r.outputTokens, r.cacheReadTokens,
-      r.cacheCreationTokens, r.totalTokens, r.latencyMs || '',
-    ].map(esc).join(','));
-  }
-  // \uFEFF = UTF-8 BOM，保证 Excel 双击打开中文不乱码
-  fs.writeFileSync(csvPath, '\uFEFF' + lines.join('\r\n') + '\r\n', 'utf8');
 
   // ---------------------------------------------------------- 看板数据（积分关联用）
   let jsPath = null;
@@ -1086,6 +1160,17 @@ async function main() {
           if (h && h.byUid) data.hist = h.byUid;
         } catch { /* 无历史时省略该字段 */ }
       }
+    } else if (prev) {
+      // 跳过官方同步（--no-official 离线跑、或 wbApi 缺失）时，必须把旧文件里的
+      // 官方字段原样带回。data 是「本次只含本地扫描结果」的新对象，不带回就等于
+      // 把历史账单整块抹掉——2026-11-24 实测踩过：`--no-official` 跑一次，
+      // 20841 条账单归零，看板的积分维度全空。
+      if (prev.acct)     data.acct = prev.acct;
+      if (prev.uids)     data.uids = prev.uids;
+      if (prev.bill)     data.bill = prev.bill;
+      if (prev.official) data.official = prev.official;
+      if (prev.su)       data.su = prev.su;
+      if (prev.hist)     data.hist = prev.hist;
     }
 
     // 增量合并：把历次同步过、但本次本地 jsonl 里已不存在的回合保留下来，
@@ -1381,9 +1466,10 @@ async function main() {
     W();
   }
 
-  W('## 十、明细文件');
+  W('## 十、明细数据');
   W();
-  W(`- \`${path.basename(csvPath)}\`  （逐条请求，可用 Excel 打开做透视）`);
+  W('逐条请求明细不再落盘。需要时在看板「完整明细」卡片点「⬇ 导出当前结果」，');
+  W('会按当前筛选条件导出，比全量 CSV 更小、更贴合当下要看的口径。');
   W();
 
   const mdPath = path.join(outdir, 'token-usage-summary.md');
@@ -1410,9 +1496,13 @@ async function main() {
     console.log(`    ${k.padEnd(24)} ${fmt(c.tot)}`);
   }
   console.log(bar);
-  console.log('明细 CSV : ' + csvPath);
   console.log('汇总报告 : ' + mdPath);
   if (jsPath) console.log('看板数据 : ' + jsPath);
+
+  // 全部落盘之后再记扫描截止时刻：中途失败就不该让下一轮以为「这段已经扫过」。
+  // 取开始时刻而非结束时刻——扫描期间被写入的文件（mtime 落在两者之间）
+  // 下一轮会被重扫，宁可多扫一次也不漏。
+  saveScanBase(outdir, scanStartAt);
 }
 
 main().catch((e) => {

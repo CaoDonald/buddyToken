@@ -1,3 +1,6 @@
 # Windows 批处理文件必须保持 CRLF，否则 cmd 的 for / if 块会解析出错
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# 第三方库：压缩过的单行大文件，绝不能做换行转换（会改动内容、破坏 sourcemap 对应）
+vendor/** -text
