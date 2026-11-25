@@ -1565,6 +1565,7 @@ function computeStats(d){
     modelRank,
     bySession,
     tokenPerPoint:   tokenPts > 0 ? tokenTot / tokenPts : 0,        // 每 1 积分产出多少 token
+    tokenDailyAvg:   byDate.length ? tokenTot / byDate.length : 0,  // 日均 token：总量按账单覆盖天数均摊，与积分日均同口径
     pointsPerMToken: tokenTot > 0 ? tokenPts / tokenTot * 1e6  : 0, // 每 M token 花多少积分
     cacheHitRate:    tokenIn  > 0 ? tokenCr / tokenIn : 0,
     stepsPerTurn:    tkRows.length ? tokenReq / tkRows.length : 0,
@@ -1606,6 +1607,8 @@ function renderKPIs(d){
     items.push(
       {label:'Token 总量', value: fmtTok(s.tokenTot),
        sub:`输入 ${fmtTok(s.tokenIn)} · 输出 ${fmtTok(s.tokenOut)}`},
+      {label:'日均 Token', value: fmtTok(s.tokenDailyAvg), small:true,
+       sub:`总量 ÷ <b>${s.days}</b> 天 · 与积分日均同口径`},
       {label:'缓存命中率', value:`${(s.cacheHitRate*100).toFixed(1)}%`,
        sub:`缓存读 ${fmtTok(s.tokenCr)} / 输入 ${fmtTok(s.tokenIn)}`},
       {label:'每积分 Token', value: fmtTok(s.tokenPerPoint), small:true,
