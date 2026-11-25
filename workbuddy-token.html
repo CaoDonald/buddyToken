@@ -486,6 +486,9 @@ tr.expand-row>td{background:#f7f9fd;padding:0 !important;border-bottom:1px solid
 table.cal{border-collapse:separate;border-spacing:3px;font-size:10.5px;
   width:max-content;table-layout:fixed}
 table.cal th.month{
+  /* 月名默认按内容撑宽（「10月」比「8月」宽），fixed 布局会把这份宽度分给整列，
+     导致带月名的列比其它列宽。固定成格宽，让月名溢出显示但不撑列。 */
+  width:15px;
   font-weight:700;color:#7c88a3;font-size:10.5px;text-align:left;
   padding:0 0 5px 0;white-space:nowrap;
 }
@@ -749,6 +752,16 @@ table.cal td.cal-cell.has:hover{
         <div class="chart-box tall"><canvas id="cTokTrend"></canvas></div>
       </div>
 
+      <div class="card c12" id="modelTokTrendCard" hidden>
+        <h3><span class="dot"></span>各模型 Token 趋势 <span class="tag" id="mTokGranTag"></span></h3>
+        <div class="chart-box tall"><canvas id="cModelTokTrend"></canvas></div>
+      </div>
+
+      <div class="card c12" id="stackCard">
+        <h3><span class="dot"></span>各模型积分 <span class="tag">堆叠</span></h3>
+        <div class="chart-box tall"><canvas id="cStack"></canvas></div>
+      </div>
+
       <div class="card c7" id="tokenTopCard" hidden>
         <h3><span class="dot"></span>Token 消耗 Top 10 回合 <span class="tag">按回合汇总</span></h3>
         <div class="tbl-scroll"><table class="tbl" id="tblTokTop"></table></div>
@@ -757,11 +770,6 @@ table.cal td.cal-cell.has:hover{
       <div class="card c5" id="toolCard" hidden>
         <h3><span class="dot"></span>工具 Token 消耗 <span class="tag">区间内</span></h3>
         <div class="tbl-scroll"><table class="tbl" id="tblTool"></table></div>
-      </div>
-
-      <div class="card c12" id="stackCard">
-        <h3><span class="dot"></span>各模型积分 <span class="tag">堆叠</span></h3>
-        <div class="chart-box tall"><canvas id="cStack"></canvas></div>
       </div>
 
       <div class="card c12" id="latCard" hidden>
@@ -878,8 +886,11 @@ const parseDs = s => new Date(s.replace(/-/g,'/'));
  * <0.5s 多半是记录异常或没有可用起点，>1h 多半是会话中断后残留，一律记为 0（无数据）。
  */
 const validLat = ms => (ms > 500 && ms < 3600000) ? ms : 0;
-const PALETTE = ['#4f6ef7','#7c5cff','#12b886','#f59f00','#f0475f','#3bb2e8',
-                 '#9b8cff','#5ad1a0','#ff8a65','#26c6da','#ab47bc','#8d9bb5'];
+// 分类色板：色相环等距取色，相邻色差异最大化（堆叠图/环形图相邻块好分辨）。
+// 前三色是主力模型常驻位，务必拉开色相：靛蓝 / 青绿 / 琥珀。
+const PALETTE = ['#4F6EF7','#12A89D','#E8890B','#D6467F',
+                 '#7C5CFF','#2E9E58','#F2603C','#2C8FD6',
+                 '#9B5BC4','#9AA61E','#00838F','#78869E'];
 
 function parseTime(v){
   if(v == null || v === '') return null;
@@ -1331,9 +1342,11 @@ function buildBuckets(d, f){
     // 会被叠成一根柱、长尾「其他」也点不出各自的名字
     const mk = rowModelKey(x);
     let cell = matrix.get(mk);
-    if(!cell){ cell = { pts:new Array(n).fill(0), cnt:new Array(n).fill(0) }; matrix.set(mk, cell); }
+    // tk = 每桶该模型的 token 总量，供「各模型 Token 趋势」堆叠图取列
+    if(!cell){ cell = { pts:new Array(n).fill(0), cnt:new Array(n).fill(0), tk:new Array(n).fill(0) }; matrix.set(mk, cell); }
     cell.pts[bi] += x.points;
     cell.cnt[bi] += 1;
+    if(x.token) cell.tk[bi] += x.token.tot;
   }
   // label：单天内只显示时刻，跨天带上日期前缀，避免「两个 14:00 分不清是哪天」
   const daySet = new Set(buckets.map(b => fmtDate(new Date(b.t0))));
@@ -2366,6 +2379,81 @@ function renderCharts(d){
     });
   }
 
+  /* ---- 各模型 Token 趋势：分桶堆叠柱，按模型拆 token，看谁在哪个时段烧了多少 ----
+     数据源是 buildBuckets 一次遍历得出的 matrix（模型→每桶 token），
+     按 token 总量取 Top6，其余并成灰色「其他」。与上面的三段式趋势互补：
+     那个看 token 的构成（缓存/输出），这个看模型的构成。 */
+  const mTokCard = $('modelTokTrendCard');
+  if(mTokCard) mTokCard.hidden = !s.hasToken;
+  if(s.hasToken){
+    const mTokTag = $('mTokGranTag');
+    if(mTokTag) mTokTag.textContent = '按' + bk.label + ' · 堆叠';
+    // 按 token 总量排序（byModel 默认按积分排，这里要的是 token 口径）
+    const byTk = s.byModel.filter(x => x.tk > 0).sort((a,b) => b.tk - a.tk);
+    const topM = byTk.slice(0, 6).map(x => x.key);
+    const mDatasets = topM.map((m, i) => ({
+      label: m,
+      data: bk.buckets.map((_, bi) => Math.round(bk.matrix.get(m)?.tk?.[bi] || 0)),
+      backgroundColor: PALETTE[i % PALETTE.length],
+      borderRadius:3, barPercentage:.72
+    }));
+    const restM = byTk.slice(6);
+    const restNames = new Set(restM.map(x => x.key));
+    const restIdx = mDatasets.length;
+    if(restM.length){
+      mDatasets.push({
+        label: `其他 (${restM.length})`,
+        data: bk.buckets.map((_, bi) => {
+          let v = 0;
+          for(const m of restNames) v += bk.matrix.get(m)?.tk?.[bi] || 0;
+          return Math.round(v);
+        }),
+        backgroundColor:'#c8d1e2', borderRadius:3, barPercentage:.72
+      });
+    }
+    upsert('cModelTokTrend', {
+      type:'bar',
+      data:{ labels: dayLabels, datasets: mDatasets },
+      options:{
+        responsive:true, maintainAspectRatio:false,
+        interaction:{mode:'index', intersect:false},
+        plugins:{
+          legend:{position:'bottom', labels:{boxWidth:10, boxHeight:10,
+            usePointStyle:true, pointStyle:'circle', padding:10}},
+          tooltip:{filter:it => it.parsed.y > 0,
+            callbacks:{
+              label:c => ` ${c.dataset.label}：${fmtTok(c.parsed.y)}`,
+              footer(items){
+                const bi = items[0].dataIndex;
+                const lines = [];
+                const hit = items.find(x => x.datasetIndex === restIdx);
+                if(hit && hit.parsed.y > 0){
+                  const list = [];
+                  for(const m of restNames){
+                    const v = bk.matrix.get(m)?.tk?.[bi] || 0;
+                    if(v > 0) list.push([m, v]);
+                  }
+                  list.sort((a,b) => b[1] - a[1]);
+                  lines.push(`　└ 其他构成（${list.length} 个）：`);
+                  for(const [m,v] of list.slice(0, 8)) lines.push(`　　${m}：${fmtTok(v)}`);
+                }
+                let total = 0;
+                for(const ds of mDatasets) total += ds.data[bi] || 0;
+                lines.push(`合计 ${fmtTok(total)} token`);
+                return lines;
+              }
+            }}
+        },
+        scales:{
+          x:{stacked:true, grid:{display:false},
+             ticks:{maxTicksLimit:20, autoSkip:true, maxRotation:0}},
+          y:{stacked:true, beginAtZero:true, grid:{color:'#f0f3fa'},
+             ticks:{callback:v => fmtTok(v)}}
+        }
+      }
+    });
+  }
+
   const topModels = s.byModel.slice(0, 6).map(x => x.key);
   // 桶 × 模型的积分矩阵已在 buildBuckets 一次遍历得出，这里直接取列
   const datasets = topModels.map((m, i) => {
@@ -2654,7 +2742,10 @@ function renderCalendarUnit(cal, mode, color, title, unitLabel){
   const monthHead = new Array(cal.weeks.length).fill('');
   for(const m of cal.months) monthHead[m.col] = m.text;
 
-  let html = '<div class="cal-scroll"><table class="cal">';
+  // 显式定宽：table-layout:fixed 遇到 width:max-content 会退化成按内容算列宽，
+  // 月名文字（「10月」比「8月」宽）就把整列撑大。给出总宽后各列才严格回到 15px。
+  const tblW = 22 + cal.weeks.length * 18 + 6; // 行标签 22 + 每周 (15 格 + 3 间距) + 余量
+  let html = `<div class="cal-scroll"><table class="cal" style="width:${tblW}px">`;
   html += '<thead><tr><th class="rowlbl"></th>';
   html += monthHead.map(t => `<th class="month">${t}</th>`).join('');
   html += '</tr></thead><tbody>';
@@ -6066,9 +6157,10 @@ async function loadFile(file){
     ['calCard','日历热力图'],
     ['dailyCard','积分·Token·请求趋势'],
     ['tokTrendCard','Token 趋势'],
+    ['modelTokTrendCard','各模型 Token 趋势'],
+    ['stackCard','各模型积分'],
     ['tokenTopCard','Token Top 10'],
     ['toolCard','工具 Token'],
-    ['stackCard','各模型积分'],
     ['latCard','响应耗时'],
     ['heatCard','模型×时段'],
     ['topReqCard','高消耗请求'],
