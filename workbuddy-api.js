@@ -110,6 +110,17 @@ const AUTH_DIR = path.join(
   'CodeBuddyExtension', 'Data', 'Public', 'auth'
 );
 
+/**
+ * 切换备份目录：switchAppAccount 把「切换前的当前登录态」整份备份到这里。
+ *
+ * 关键：被切走的账号，其新鲜凭证往往只存在于这里——切走时 AUTH 目录的当前文件
+ * 被目标账号的旧快照覆盖，该账号在 AUTH 目录里只剩一份更早的带日期快照。若扫描
+ * 只读 AUTH 目录，切回这个账号时会拿到已过期的旧快照，签到/猫猫/账单同步全挂
+ * （用户视角：早上登录的账号，一切到别的账号就“没了”）。所以必须与 AUTH_DIR
+ * 一起扫描、按 mtime 取最新。
+ */
+const BACKUP_DIR = path.join(__dirname, 'switch-backups');
+
 /** 接口基址：账单与积分都在 web 域下（与 token 签发域一致）。 */
 const BASE = 'https://www.workbuddy.cn';
 
@@ -247,7 +258,31 @@ function atPath(obj, pathArr) {
 function appFromSnapshot(file) {
   if (/^workbuddy-desktop/i.test(file)) return 'workbuddy-desktop';
   if (/^tencent-cloud\.coding-copilot/i.test(file)) return 'codebuddy-cli';
+  // switch-backups 里的备份名形如 codebuddy-cli-2026-...info / workbuddy-desktop-2026-...info
+  if (/^codebuddy-cli[-.]/i.test(file)) return 'codebuddy-cli';
   return file.replace(/\.info$/i, '').split('.')[0] || 'unknown';
+}
+
+/**
+ * 枚举全部登录快照：官方 auth 目录 + 本项目 switch-backups 备份目录。
+ * 返回 [{ file, full, mtimeMs }]（file=文件名，full=绝对路径）。
+ *
+ * 两个目录必须一起读：切换时被顶下来的账号，新鲜凭证只留在 BACKUP_DIR；
+ * 只读 AUTH_DIR 会把刚登录过的账号误判成「只有过期快照」（详见 BACKUP_DIR 注释）。
+ */
+function listSnapshotFiles() {
+  const out = [];
+  for (const dir of [AUTH_DIR, BACKUP_DIR]) {
+    let files;
+    try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.info')); } catch { continue; }
+    for (const file of files) {
+      const full = path.join(dir, file);
+      let mtimeMs = 0;
+      try { mtimeMs = fs.statSync(full).mtimeMs; } catch { continue; }
+      out.push({ file, full, mtimeMs });
+    }
+  }
+  return out;
 }
 
 /**
@@ -262,16 +297,11 @@ function appFromSnapshot(file) {
  * （只有 app 名与凭证过期时间，绝不含 token）。
  */
 function discoverAccounts() {
-  let files;
-  try {
-    files = fs.readdirSync(AUTH_DIR).filter((f) => f.endsWith('.info'));
-  } catch {
-    return [];
-  }
+  const files = listSnapshotFiles();   // AUTH 目录 + switch-backups 备份目录
+  if (!files.length) return [];
 
   const byKey = new Map();   // uid|app → 该 app 最新快照
-  for (const file of files) {
-    const full = path.join(AUTH_DIR, file);
+  for (const { file, full, mtimeMs: mtime } of files) {
     let raw;
     try {
       raw = JSON.parse(fs.readFileSync(full, 'utf8'));
@@ -285,15 +315,17 @@ function discoverAccounts() {
     const accessToken = openWbEncryptedField(auth.accessToken ?? account.accessToken ?? raw.accessToken);
     if (!uid || !accessToken) continue;   // 缺 token 或信封解不开（密钥过期）都视为不可用快照
 
-    const mtime = fs.statSync(full).mtimeMs;
-    const key = uid + '|' + appFromSnapshot(file);
+    const app = appFromSnapshot(file);
+    if (!app || app === 'unknown') continue;   // 不认识的来源不参与
+    const key = uid + '|' + app;
     const prev = byKey.get(key);
     if (prev && prev._mtime >= mtime) continue;
 
     const nickname = openWbEncryptedField(account.nickname);
     byKey.set(key, {
       _mtime: mtime,
-      _app: appFromSnapshot(file),
+      _app: app,
+      _full: full,
       uid,
       /**
        * 展示名：昵称优先（明文或解密所得），缺失/解密失败时退化为 uid 前 8 位。
@@ -324,7 +356,7 @@ function discoverAccounts() {
       .filter((a) => a.uid === acc.uid)
       .sort((a, b) => b._mtime - a._mtime)
       .map((a) => ({ app: a._app, expiresAt: a.expiresAt }));
-    const { _mtime, _app, ...rest } = acc;
+    const { _mtime, _app, _full, ...rest } = acc;
     return { ...rest, apps };
   });
 }
@@ -1424,12 +1456,8 @@ const APP_AUTH_FILES = {
  * 账号在某 app「可切换」= snapshots[app] 存在；「当前登录」= currentByApp[app] === uid。
  */
 function listSwitchableAccounts() {
-  let files;
-  try {
-    files = fs.readdirSync(AUTH_DIR).filter((f) => f.endsWith('.info'));
-  } catch {
-    return { currentByApp: {}, accounts: [] };
-  }
+  let files = listSnapshotFiles();   // AUTH 目录 + switch-backups 备份目录
+  if (!files.length) return { currentByApp: {}, accounts: [] };
 
   // 各应用当前登录账号
   const currentByApp = {};
@@ -1451,33 +1479,33 @@ function listSwitchableAccounts() {
   }
 
   // 按 (uid, app) 分组，各取最新快照
-  const byKey = new Map();   // uid|app → { uid, name, mtime, expiresAt, source }
-  for (const file of files) {
+  const byKey = new Map();   // uid|app → { uid, name, mtime, expiresAt, source, full }
+  for (const { file, full, mtimeMs: mtime } of files) {
     const app = appFromSnapshot(file);
     if (!APP_AUTH_FILES[app]) continue;   // 不认识的 app 不参与
     let raw;
     try {
-      raw = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, file), 'utf8'));
+      raw = JSON.parse(fs.readFileSync(full, 'utf8'));
     } catch { continue; }
     const uid = (raw.account && raw.account.uid) || raw.uid;
     if (!uid) continue;
-    let mtime = 0;
-    try { mtime = fs.statSync(path.join(AUTH_DIR, file)).mtimeMs; } catch { continue; }
     const key = uid + '|' + app;
     const prev = byKey.get(key);
     if (prev && prev.mtime >= mtime) continue;
     byKey.set(key, {
       uid,
+      app,
       // nickname 在 5.6.2+ 是加密信封，同样走兼容 opener（解不开退 uid 前 8 位）
       name: (() => { const n = openWbEncryptedField(raw.account && raw.account.nickname);
         return (typeof n === 'string' && n.trim()) ? n : String(uid).slice(0, 8); })(),
       expiresAt: num(raw.auth && raw.auth.expiresAt) || 0,
       mtime,
       source: file,
+      full,   // 可能来自 switch-backups，切换时要按这个绝对路径读
     });
   }
 
-  // 按 uid 聚合：snapshots[app] = 该账号在该 app 的最新快照文件名
+  // 按 uid 聚合：snapshots[app] = 该账号在该 app 的最新快照的绝对路径
   const byUid = new Map();
   for (const rec of byKey.values()) {
     let acc = byUid.get(rec.uid);
@@ -1485,9 +1513,9 @@ function listSwitchableAccounts() {
       acc = { uid: rec.uid, name: rec.name, expiresAt: rec.expiresAt, snapshots: {} };
       byUid.set(rec.uid, acc);
     }
-    const app = appFromSnapshot(rec.source);
+    const app = rec.app;
     if (!acc.snapshots[app] || rec.mtime > acc._mtimes[app]) {
-      acc.snapshots[app] = rec.source;
+      acc.snapshots[app] = rec.full;
       if (!acc._mtimes) acc._mtimes = {};
       acc._mtimes[app] = rec.mtime;
       // 展示名/凭证有效期取最新一份快照
@@ -1656,7 +1684,9 @@ function switchAppAccount(app, uid, { restart = false } = {}) {
     }
 
     // 3. 写认证：目标快照整份原样写回 + 写后校验（按 accessToken 值比较）
-    const snapshot = fs.readFileSync(path.join(AUTH_DIR, snapFile), 'utf8');
+    // snapFile 现在是绝对路径（listSwitchableAccounts 带回了来源目录）；兼容旧的纯文件名。
+    const snapPath = path.isAbsolute(snapFile) ? snapFile : path.join(AUTH_DIR, snapFile);
+    const snapshot = fs.readFileSync(snapPath, 'utf8');
     const parsed = JSON.parse(snapshot);
     const expectToken = (parsed.auth && parsed.auth.accessToken)
       || (parsed.account && parsed.account.accessToken) || '';

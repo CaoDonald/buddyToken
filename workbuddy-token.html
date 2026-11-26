@@ -1769,6 +1769,24 @@ function renderStatusChips(a, uid, isPriority){
   const chips = [];
   const ck = state.checkins[uid];
 
+  // 登录凭证到期：chip 反映「主凭证」（a.login.app，即取数/签到实际用的那份快照）
+  // 的到期，悬浮逐行列出每个 app。不取最早到期——桌面端旧快照过期不代表账号不能签到，
+  // 签到/账单用的是最新那份（CLI 域 codebuddy.cn）。数据源 acct.login.apps，随同步刷新。
+  const appLabel = { 'workbuddy-desktop': '桌面端', 'codebuddy-cli': 'CLI', 'codebuddy-ide': 'IDE' };
+  const exps = ((a.login && a.login.apps) || []).filter(x => x.expiresAt)
+    .map(x => ({ app: x.app, ts: x.expiresAt }));
+  if(exps.length){
+    const main = exps.find(x => x.app === (a.login && a.login.app)) || exps[0];
+    const days = Math.ceil((main.ts - now) / 86400000);
+    const lines = exps.slice().sort((p, q) => p.ts - q.ts).map(x => {
+      const dd = Math.ceil((x.ts - now) / 86400000);
+      return `${appLabel[x.app] || x.app} · ${fmtDate(new Date(x.ts))}${
+        dd <= 0 ? '（已过期）' : `（还有 ${dd} 天）`}`;
+    });
+    const cls = days <= 0 ? 'bad' : (days <= 7 ? 'warn' : '');
+    chips.push(`<span class="st-chip ${cls}" title="登录凭证到期（本机快照，主用 ${esc(appLabel[main.app] || main.app)}）&#10;${esc(lines.join('\n'))}">🔑</span>`);
+  }
+
   // 签到：日历打勾（已签）/ 空日历（未签）
   if(ck && ck.ok !== false){
     chips.push(ck.checkedIn
@@ -1886,6 +1904,20 @@ const APP_BADGES = [
  * 所以它取决于 currentByApp 里有没有 codebuddy-ide 这个键：有键即可点亮当前账号，
  * 没有键（非 Windows / IDE 没装 / 解不开）就维持置灰。
  */
+/**
+ * 某账号在指定应用上的登录凭证到期提示（挂到应用图标 title，鼠标悬浮呈现）。
+ * 数据源是 acct.login.apps（app → expiresAt），随同步刷新、不含 token。
+ * IDE 无快照、不在该表里，返回空串。
+ */
+function loginExpiryTip(a, app){
+  const apps = (a.login && a.login.apps) || [];
+  const hit = apps.find(x => x.app === app);
+  if(!hit || !hit.expiresAt) return '';
+  const days = Math.ceil((hit.expiresAt - Date.now()) / 86400000);
+  const d = fmtDate(new Date(hit.expiresAt));
+  return ` · 登录凭证到期 ${d}${days <= 0 ? '（已过期）' : `（还有 ${days} 天）`}`;
+}
+
 function renderAppBadges(a){
   const sw = state.serverStatus && state.serverStatus.switchable;
   const cur = (sw && sw.currentByApp) || {};
@@ -1895,16 +1927,17 @@ function renderAppBadges(a){
     const supported = b.app !== 'codebuddy-ide' || Object.prototype.hasOwnProperty.call(cur, b.app);
     const isCurrent = supported && cur[b.app] === a.uid;
     const hasSnap = supported && !!(snapOf && snapOf.snapshots && snapOf.snapshots[b.app]);
+    const exp = loginExpiryTip(a, b.app);
     if (isCurrent) {
-      return `<span class="lg-ico lg-cur" title="${esc(b.label)} · 当前登录账号">${esc(b.icon)}<i class="lg-mark">✓</i></span>`;
+      return `<span class="lg-ico lg-cur" title="${esc(b.label)} · 当前登录账号${esc(exp)}">${esc(b.icon)}<i class="lg-mark">✓</i></span>`;
     }
     if (hasSnap) {
       return `<button class="lg-ico lg-switch" data-act="appswitch" data-app="${esc(b.app)}"
-                data-uid="${esc(a.uid)}" title="设为${esc(b.label)}的当前登录账号">${esc(b.icon)}</button>`;
+                data-uid="${esc(a.uid)}" title="设为${esc(b.label)}的当前登录账号${esc(exp)}">${esc(b.icon)}</button>`;
     }
     const why = !supported ? '暂不支持（本机未检测到登录数据源）'
       : (b.app === 'codebuddy-ide' ? '该账号当前未在此应用登录' : '该账号无此应用的登录快照');
-    return `<span class="lg-ico lg-dim" title="${esc(b.label)} · ${why}">${esc(b.icon)}</span>`;
+    return `<span class="lg-ico lg-dim" title="${esc(b.label)} · ${why}${esc(exp)}">${esc(b.icon)}</span>`;
   }).join('') + '</span>';
 }
 
