@@ -338,6 +338,17 @@ input[type=date]:focus{outline:none;border-color:var(--accent)}
 .card h3 .acct-name:hover{border-bottom-color:var(--muted)}
 .card h3 .tag{font-weight:500;font-size:11px;color:var(--muted);background:#f2f5fc;
   padding:1px 8px;border-radius:6px}
+/* ---------- 按公开单价折算费用 ---------- */
+.cost-sum{display:flex;gap:26px;flex-wrap:wrap;align-items:baseline;margin-bottom:12px;
+  padding:10px 14px;background:#f7f9fd;border:1px solid var(--line);border-radius:10px}
+.cost-sum .cs-item{display:flex;flex-direction:column;gap:2px}
+.cost-sum .cs-lab{font-size:11px;color:var(--muted)}
+.cost-sum .cs-val{font-size:20px;font-weight:800;letter-spacing:-.3px;font-variant-numeric:tabular-nums}
+.cost-sum .cs-val.main{color:var(--accent)}
+.cost-note{font-size:11px;color:var(--muted);line-height:1.8;margin:10px 0 0}
+.cost-note b{color:var(--text)}
+.cost-money{font-weight:700;font-variant-numeric:tabular-nums}
+.cost-free{color:#93a0b8}
 .login-badges{margin-left:auto;display:inline-flex;gap:4px;flex-wrap:wrap}
 .lg-ico{position:relative;display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 3px;border-radius:6px;border:none;font-size:10px;font-weight:700;cursor:default;font-family:inherit}
 .lg-cur{background:#e8f6ee;color:#0a7d43}
@@ -762,6 +773,11 @@ table.cal td.cal-cell.has:hover{
         <div class="chart-box tall"><canvas id="cStack"></canvas></div>
       </div>
 
+      <div class="card c12" id="costCard">
+        <h3><span class="dot"></span>按公开单价折算费用 <span class="tag">参考值 · 不是实际支出</span></h3>
+        <div id="costBody"></div>
+      </div>
+
       <div class="card c7" id="tokenTopCard" hidden>
         <h3><span class="dot"></span>Token 消耗 Top 10 回合 <span class="tag">按回合汇总</span></h3>
         <div class="tbl-scroll"><table class="tbl" id="tblTokTop"></table></div>
@@ -1135,6 +1151,7 @@ const state = {
   limits: { scannedAt: 0, byUid: {} },   // uid → 429 受限模型列表（服务模式异步拉取）
   serverStatus: null,     // /api/status 缓存（switchable 账号列表等）
   rank: { sort:'count', dir:'desc' },     // 模型数据卡的表头排序（默认请求数倒序）
+  cost: { sort:'yuan', dir:'desc' },    // 折算费用卡的表头排序（默认费用倒序，多的在前）
   sess: { sort:'pts', dir:'desc' },       // Session 消耗卡的表头排序
   day:  { sort:'date', dir:'desc' }       // 每日汇总卡的表头排序（默认时间倒序，最新在上）
 };
@@ -3245,6 +3262,219 @@ const RANK_COLS = [
   { k:'cacheRate', t:'缓存率',       num:1 },
 ];
 
+/* =========================================================
+ *  8.44 按公开单价折算费用（参考值，非实际支出）
+ * =======================================================*/
+/**
+ * 各家官方开放平台的按量单价：元 / 百万 token，格式 [未命中输入, 缓存命中, 输出]。
+ * 全部取自厂商官方定价页（2026-11-26 核对），不用第三方汇总：
+ *   DeepSeek  api-docs.deepseek.com/zh-cn/quick_start/pricing（官方中文页直接给人民币标价，峰时价、谷时半价）
+ *   腾讯混元  hunyuan.tencent.com/research/hy4-flash、cloud.tencent.com 混元词条
+ *   智谱 GLM   bigmodel.cn/pricing
+ *   Kimi       platform.moonshot.cn/docs/pricing
+ *   MiniMax    platform.minimax.cn/docs/guides/pricing-paygo
+ *   阶跃星辰   platform.stepfun.com/docs/zh/guides/pricing/details
+ *   Xiaomi MiMo platform.xiaomimimo.com/docs/zh-CN/price/pay-as-you-go
+ * 别名：space-bunny = MiniMax M3.1 Flash 早期版本（MiniMax 官方确认）；
+ *       kimi-k3-1 按 k3.1-pro、kimi-k2.8-preview 按 k2.7-code 官方价近似；
+ *       glm-5v-turbo 官方未单列缓存命中价，缓存读按输入价保守计。
+ */
+const COST_RULES = {
+  // DeepSeek 官方（峰时价，谷时 ×0.5）
+  'deepseek-flash':                     { p:[2,0.04,8], peak:true },
+  'deepseek-v4-flash':                  { p:[2,0.04,8], peak:true },
+  'deepseek-v4.1-flash':                { p:[2,0.04,8], peak:true },
+  'deepseek-v4.1-flash-1017':           { p:[2,0.04,8], peak:true },
+  'deepseek-v4-flash-0731-0112zuiixin': { p:[2,0.04,8], peak:true },
+  'deepseek-v4-pro':                    { p:[9,0.3,27], peak:true },
+  // 腾讯混元官方（刊例价；TokenHub 限时 5 折不体现在这里）
+  'hy4':            { p:[6,0.3,18] },
+  'hy4-free':       { p:[6,0.3,18] },
+  'hy4-preview':    { p:[6,0.3,18] },
+  'hy4-preview-f':  { p:[6,0.3,18] },
+  'hy4-flash':      { p:[0.5,0.02,2] },
+  'hy4-flash-free': { p:[0.5,0.02,2] },
+  'hy3':            { p:[1,0.25,4] },
+  'hy3-x':          { p:[1,0.25,4] },
+  // 智谱 GLM 官方
+  'glm-5.3':       { p:[8,2,28] },
+  'glm-5.2':       { p:[8,2,28] },
+  'glm-5.3-flash': { p:[0.8,0.23,2.8] },
+  'glm-5.1':       { p:[6,1.3,24] },
+  'glm-4.7':       { p:[2,0.4,8] },
+  'glm-5v-turbo':  { p:[5,5,22] },
+  // Kimi 官方
+  'kimi-k3.1-pro':      { p:[13,1.3,68] },
+  'kimi-k3-1':          { p:[13,1.3,68], alias:'按 k3.1-pro 价' },
+  'kimi-k2.7':          { p:[6.5,1.3,27] },
+  'kimi-k2.8-preview':  { p:[6.5,1.3,27], alias:'按 k2.7-code 价' },
+  'kimi-k2.6':          { p:[6.5,1.1,27] },
+  // MiniMax 官方（space-bunny 即 M3.1 Flash 早期版本）
+  'minimax-m3.1-flash': { p:[1,0.1,4] },
+  'space-bunny':        { p:[1,0.1,4], alias:'即 M3.1 Flash' },
+  'minimax-m3':         { p:[2.1,0.42,8.4] },
+  // 阶跃星辰 / 小米官方
+  'step-5-preview': { p:[7,0.7,20] },
+  'mimo-v2.6-pro':  { p:[3,0.025,6] },
+};
+const COST_COLS = [
+  { k:'model',  t:'模型' },
+  { k:'cr',     t:'缓存读',     num:1 },
+  { k:'miss',   t:'未命中输入', num:1 },
+  { k:'out',    t:'输出',       num:1 },
+  { k:'tk',     t:'总量',       num:1 },
+  { k:'inP',    t:'入价',       num:1 },
+  { k:'cacheP', t:'缓存价',     num:1 },
+  { k:'outP',   t:'出价',       num:1 },
+  { k:'yuan',   t:'折算费用',   num:1 },
+  { k:'avg',    t:'¥/M',        num:1 },
+  { k:'perPoint', t:'Token/积分', num:1 },
+  { k:'pts',    t:'积分',       num:1 },
+];
+/** DeepSeek 峰时：北京时间工作日 9–12、14–18 点；周末为谷时（前端无法识别法定节假日） */
+function costIsPeak(date){
+  const day = date.getDay();
+  if(day === 0 || day === 6) return false;
+  const h = date.getHours();
+  return (h >= 9 && h < 12) || (h >= 14 && h < 18);
+}
+
+function renderCost(d){
+  const card = $('costCard');
+  if(!card) return;
+  const priced = [];    // 有公开单价的模型
+  const unpriced = [];  // 无公开单价的模型
+  let matched = 0, unmatched = 0;
+  for(const x of d){
+    if(!x.token){ unmatched++; continue; }
+    matched++;
+    const model = x.model || '';
+    const rule = COST_RULES[model];
+    const t = x.token;
+    const cr = t.cr || 0;
+    const miss = Math.max(0, (t.in || 0) - cr);
+    const out = t.out || 0;
+    if(!rule){
+      let u = unpriced.find(u => u.model === model);
+      if(!u){ u = { model, tk:0, cr:0, miss:0, out:0, pts:0, n:0 }; unpriced.push(u); }
+      u.tk += t.tot || 0; u.cr += cr; u.miss += miss; u.out += out;
+      u.pts += x.points || 0; u.n++;
+      continue;
+    }
+    let p = priced.find(p => p.model === model);
+    if(!p){
+      p = { model, rule, yuan:0, tk:0, cr:0, miss:0, out:0, pts:0, n:0, peakN:0, offN:0 };
+      priced.push(p);
+    }
+    // 有峰谷价的模型按请求时刻分别计价：峰时全价、谷时半价
+    const peak = !!rule.peak && costIsPeak(x.time);
+    const factor = rule.peak && !peak ? 0.5 : 1;
+    p.yuan += (miss * rule.p[0] + cr * rule.p[1] + out * rule.p[2]) / 1e6 * factor;
+    p.tk += t.tot || 0; p.cr += cr; p.miss += miss; p.out += out;
+    p.pts += x.points || 0; p.n++;
+    if(rule.peak){ if(peak) p.peakN++; else p.offN++; }
+  }
+  card.hidden = !matched;
+  if(card.hidden) return;
+  // 点表头排序：默认按 token 总量倒序，同列再点切换方向
+  const { sort, dir } = state.cost;
+  const sign = dir === 'desc' ? -1 : 1;
+  const colVal = (o, k) => ({
+    model:o.model, cr:o.cr, miss:o.miss, out:o.out, tk:o.tk,
+    inP:o.rule ? o.rule.p[0] : -1, cacheP:o.rule ? o.rule.p[1] : -1, outP:o.rule ? o.rule.p[2] : -1,
+    yuan:o.yuan || 0, avg:o.tk ? (o.yuan || 0) / (o.tk / 1e6) : 0,
+    perPoint:o.pts > 0 ? o.tk / o.pts : null, pts:o.pts
+  })[k];
+  const cmp = (a,b) => {
+    const va = colVal(a, sort), vb = colVal(b, sort);
+    // 免费模型（0 积分）算不出「每积分 Token」，无论升降序都沉底
+    if(va == null || vb == null){
+      if(va == null && vb == null) return 0;
+      return va == null ? 1 : -1;
+    }
+    if(typeof va === 'string') return sign * va.localeCompare(vb);
+    return sign * ((va || 0) - (vb || 0));
+  };
+  priced.sort(cmp);
+  unpriced.sort(cmp);
+  const total = priced.reduce((s,p) => s + p.yuan, 0);
+  const fmtMoney = v => '¥' + (v >= 100 ? fmt0(v) : fmt2(v));
+  const fmtAvg = v => v == null ? '—' : v.toFixed(2);
+  // 有峰谷的模型在单价格里显示「峰价/谷价」，谷价即峰价半价
+  const fmtPrice = (v, peak) => peak ? `${v}/${Number((v/2).toFixed(2))}` : String(v);
+  const ptsAll = [...priced, ...unpriced].reduce((s,p) => s + p.pts, 0);
+  const tkAll = priced.reduce((s,p) => s + p.tk, 0);
+  const avgAll = tkAll > 0 ? total / (tkAll / 1e6) : 0;
+
+  const sum = `<div class="cost-sum">
+    <div class="cs-item"><span class="cs-lab">折算费用合计（公开价）</span><span class="cs-val main">${fmtMoney(total)}</span></div>
+    <div class="cs-item"><span class="cs-lab">平均每 M token</span><span class="cs-val">¥${fmtAvg(avgAll)}</span></div>
+    <div class="cs-item"><span class="cs-lab">对应积分消耗</span><span class="cs-val">${fmt2(ptsAll)}</span></div>
+    <div class="cs-item"><span class="cs-lab">已计价账单行</span><span class="cs-val">${fmt0(priced.reduce((s,p)=>s+p.n,0))} / ${fmt0(d.length)}</span></div>
+    <div class="cs-item"><span class="cs-lab">无公开单价模型</span><span class="cs-val">${unpriced.length}</span></div>
+  </div>`;
+
+  const head = `<thead><tr>${COST_COLS.map(c => {
+    const on = sort === c.k;
+    const tip = ['inP','cacheP','outP'].includes(c.k) ? '有峰谷的模型显示 峰价/谷价；'
+              : c.k === 'perPoint' ? 'Token 总量 ÷ 积分消耗；免费模型显示 —；' : '';
+    return `<th class="sortable${on ? ' on' : ''}${c.num ? ' num' : ''}" data-k="${c.k}"` +
+           ` title="${tip}点击排序">` +
+           `${c.t}${on ? (dir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`;
+  }).join('')}</tr></thead>`;
+  const rows = priced.map(p => {
+    // 峰谷分布与别名说明都收进悬浮提示，表格里不再单独占标签
+    const tips = [esc(p.model)];
+    if(p.rule.peak) tips.push(`峰时 ${p.peakN} 行 · 谷时 ${p.offN} 行（谷时按半价折算）`);
+    if(p.rule.alias) tips.push(esc(p.rule.alias));
+    return `<tr>
+      <td title="${tips.join('&#10;')}">${modelPill(p.model)}</td>
+      <td class="num">${fmtTok(p.cr)}</td>
+      <td class="num">${fmtTok(p.miss)}</td>
+      <td class="num">${fmtTok(p.out)}</td>
+      <td class="num"><b>${fmtTok(p.tk)}</b></td>
+      <td class="num" style="color:#93a0b8">${fmtPrice(p.rule.p[0], p.rule.peak)}</td>
+      <td class="num" style="color:#93a0b8">${fmtPrice(p.rule.p[1], p.rule.peak)}</td>
+      <td class="num" style="color:#93a0b8">${fmtPrice(p.rule.p[2], p.rule.peak)}</td>
+      <td class="num cost-money">${fmtMoney(p.yuan)}</td>
+      <td class="num" style="color:#6b7891">${fmtAvg(p.tk ? p.yuan / (p.tk / 1e6) : null)}</td>
+      <td class="num"${p.pts > 0 ? ` title="${fmt0(p.tk / p.pts)} token/积分"` : ''}>${p.pts > 0 ? fmtTok(p.tk / p.pts) : '<span class="cost-free">—</span>'}</td>
+      <td class="num" style="color:#93a0b8">${fmt2(p.pts)}</td>
+    </tr>`;
+  }).join('');
+  const unpricedRows = unpriced.map(u => `<tr>
+    <td title="${esc(u.model)}">${modelPill(u.model)}</td>
+    <td class="num">${fmtTok(u.cr)}</td>
+    <td class="num">${fmtTok(u.miss)}</td>
+    <td class="num">${fmtTok(u.out)}</td>
+    <td class="num"><b>${fmtTok(u.tk)}</b></td>
+    <td class="num cost-free" colspan="3">无公开单价</td>
+    <td class="num cost-free">—</td>
+    <td class="num cost-free">—</td>
+    <td class="num"${u.pts > 0 ? ` title="${fmt0(u.tk / u.pts)} token/积分"` : ''}>${u.pts > 0 ? fmtTok(u.tk / u.pts) : '<span class="cost-free">—</span>'}</td>
+    <td class="num" style="color:#93a0b8">${fmt2(u.pts)}</td>
+  </tr>`).join('');
+
+  $('costBody').innerHTML = sum
+    + `<div class="tbl-scroll"><table class="tbl" id="tblCost">${head}<tbody>${rows}${unpricedRows}</tbody></table></div>`
+    + `<p class="cost-note">
+      口径：<b>折算费用 = (未命中输入 × 入价 + 缓存读 × 缓存价 + 输出 × 出价) ÷ 100 万</b>，
+      其中 <b>未命中输入 = 输入总量 − 缓存读</b>。      <b>¥/M = 折算费用 ÷ 总量 × 100 万</b>，
+      是叠加缓存命中后的实际每百万 token 成本，与上方刊例单价口径不同。
+      <b>Token/积分 = 总量 ÷ 积分消耗</b>，与「模型数据」卡口径一致；免费模型（0 积分）无此值，显示 —。
+      DeepSeek 官方分峰谷价（工作日 9–12、14–18 点为峰时，谷时半价），按请求时刻分别计价；
+      有峰谷的模型单价格显示「峰价/谷价」，<b>排序按峰价</b>，各模型的峰 / 谷行数见模型名悬浮提示。
+      <b>单价全部取自各家官方开放平台定价页</b>：DeepSeek API 文档中文页（官方人民币标价）、
+      腾讯云混元 / TokenHub、智谱 BigModel、Kimi 开放平台、MiniMax 开放平台、阶跃星辰开放平台、
+      Xiaomi MiMo 开放平台；按<b>刊例价</b>折算，不叠加限时折扣（如混元 TokenHub 5 折、GLM Flash 限时五折）。
+      <b>这是按官方 API 单价折算的参考值，不是你实际支付的钱</b>——Buddy 系列按积分计费，
+      官方未公示积分与 token 的换算率。视频 / 图像生成按次计费而非 token，以及已下线、官方未开放 API 的型号
+      （如 glm-5.4、minimax-m2.7），标注「无公开单价」，不计入合计。
+      本地会话的 thinking token 未单独采集，输出量可能偏小，输出费用相应偏低。
+      覆盖 ${fmt0(matched)} 行有关联 token 的账单，其余 ${fmt0(unmatched)} 行无法折算。
+    </p>`;
+}
+
 function renderModelRank(d){
   const s = computeStats(d);
   const card = $('rankCard');
@@ -5216,6 +5446,7 @@ function render(){
   renderCharts(d);
   renderHeatmap(d);
   renderTables(d);
+  renderCost(d);
   renderModelRank(d);
   renderSessionRank(d);
   renderDetail(d);
@@ -5932,6 +6163,20 @@ async function loadFile(file){
     }, 200);
   });
 
+  /* ---- 折算费用：点表头排序（表格是动态生成的，委托到静态容器） ---- */
+  $('costBody').addEventListener('click', e => {
+    const th = e.target.closest('th.sortable');
+    if(!th) return;
+    const k = th.dataset.k;
+    if(state.cost.sort === k){
+      state.cost.dir = state.cost.dir === 'desc' ? 'asc' : 'desc';
+    }else{
+      state.cost.sort = k;
+      state.cost.dir = (k === 'model') ? 'asc' : 'desc';
+    }
+    renderCost(getFiltered());
+  });
+
   /* ---- 模型数据：点表头排序（同列再点切换升降序） ---- */
   $('tblRank').addEventListener('click', e => {
     const th = e.target.closest('th.sortable');
@@ -6162,6 +6407,7 @@ async function loadFile(file){
     ['tokTrendCard','Token 趋势'],
     ['modelTokTrendCard','各模型 Token 趋势'],
     ['stackCard','各模型积分'],
+    ['costCard','折算费用'],
     ['tokenTopCard','Token Top 10'],
     ['toolCard','工具 Token'],
     ['latCard','响应耗时'],
